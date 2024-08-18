@@ -3,7 +3,7 @@ This repository contains the source code and data for our CoBEVT OPV2V track. Th
 
 ## <div align="center">**Data Preparation**</div>
 1. Download OPV2V origin data and structure it as required. See [OpenCOOD data tutorial](https://opencood.readthedocs.io/en/latest/md_files/data_intro.html) for more detailed insructions.
-2. After organize the data folders, download the `additional.zip` from [this url](https://drive.google.com/drive/folders/1dkDeHlwOVbmgXcDazZvO6TFEZ6V_7WUu?usp=sharing). This file contains BEV semantic segmentation labels that origin OPV2V data does not include.
+2. After organize the data folders, download the `additional.zip` from [this url](https://ucla.app.box.com/v/UCLA-MobilityLab-OPV2V/file/1621920078208). This file contains BEV semantic segmentation labels that origin OPV2V data does not include.
 3. The `additional` folder has the same structure of original OPV2V dataset. So unzip `additional.zip` and merge them with original opv2v data.
 4. Remove scenario `opv2v/train/2021_09_09_13_20_58`, as this scenario has some bug for camera data.
 ## <div align="center">**Installation**</div>
@@ -52,7 +52,7 @@ CUDA_VISIBLE_DEVICES=0,1,2,3 python -m torch.distributed.launch --nproc_per_node
 ```
 
 ## <div align="center">**Inference**</div>
-To run pre-trained cobevt, please first download `cobevt` and `cobevt_static` pretrained weights from [this url](https://drive.google.com/drive/folders/1NLzyvMFxuv8Qy52q_OzcNsugTS5JacAT?usp=sharing) ,
+To run pre-trained cobevt, please first download `cobevt` and `cobevt_static` pretrained weights from [this url](https://ucla.app.box.com/v/UCLA-MobilityLab-OPV2V/folder/280139848287) ,
 and then put them under `opv2v/logs/`. 
 
 Please run the following command for dynamic BEV map segmentation 
