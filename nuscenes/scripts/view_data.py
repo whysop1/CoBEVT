@@ -7,21 +7,19 @@ from tqdm import tqdm
 
 from cross_view_transformer.common import setup_config, setup_data_module, setup_viz
 
-
 def setup(cfg):
     print('See training set by adding +split=train')
     print('Shuffle samples by adding +shuffle=false')
 
     cfg.loader.batch_size = 1
 
-    if 'split' not in cfg:
+    if not hasattr(cfg, 'split'):
         cfg.split = 'val'
 
-    if 'shuffle' not in cfg:
+    if not hasattr(cfg, 'shuffle'):
         cfg.shuffle = False
 
-
-@hydra.main(config_path=Path.cwd() / 'config', config_name='config.yaml')
+@hydra.main(version_base=None, config_path=str(Path.cwd() / 'config'), config_name='config')
 def main(cfg):
     setup_config(cfg, setup)
 
@@ -33,10 +31,8 @@ def main(cfg):
 
     for batch in tqdm(loader):
         img = np.vstack(viz(batch))
-
         cv2.imshow('debug', cv2.cvtColor(img, cv2.COLOR_RGB2BGR))
         cv2.waitKey(1)
-
 
 if __name__ == '__main__':
     main()
