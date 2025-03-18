@@ -1,3 +1,17 @@
+import sys
+from pathlib import Path
+
+# 현재 파일(view_data.py)의 상위 폴더를 경로에 추가
+sys.path.append(str(Path(__file__).resolve().parent.parent))
+
+import hydra
+import numpy as np
+import cv2
+
+from cross_view_transformer.common import setup_config, setup_data_module, setup_viz
+# 나머지 코드 계속...
+
+
 import hydra
 import numpy as np
 import cv2
@@ -7,19 +21,21 @@ from tqdm import tqdm
 
 from cross_view_transformer.common import setup_config, setup_data_module, setup_viz
 
+
 def setup(cfg):
     print('See training set by adding +split=train')
     print('Shuffle samples by adding +shuffle=false')
 
     cfg.loader.batch_size = 1
 
-    if not hasattr(cfg, 'split'):
+    if 'split' not in cfg:
         cfg.split = 'val'
 
-    if not hasattr(cfg, 'shuffle'):
+    if 'shuffle' not in cfg:
         cfg.shuffle = False
 
-@hydra.main(version_base=None, config_path=str(Path.cwd() / 'config'), config_name='config')
+
+@hydra.main(config_path=Path.cwd() / 'config', config_name='config.yaml')
 def main(cfg):
     setup_config(cfg, setup)
 
@@ -31,8 +47,10 @@ def main(cfg):
 
     for batch in tqdm(loader):
         img = np.vstack(viz(batch))
+
         cv2.imshow('debug', cv2.cvtColor(img, cv2.COLOR_RGB2BGR))
         cv2.waitKey(1)
+
 
 if __name__ == '__main__':
     main()
