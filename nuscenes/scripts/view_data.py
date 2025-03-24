@@ -1,15 +1,4 @@
-import sys
-from pathlib import Path
 
-# 현재 파일(view_data.py)의 상위 폴더를 경로에 추가
-sys.path.append(str(Path(__file__).resolve().parent.parent))
-
-import hydra
-import numpy as np
-import cv2
-
-from cross_view_transformer.common import setup_config, setup_data_module, setup_viz
-# 나머지 코드 계속...
 
 
 import hydra
