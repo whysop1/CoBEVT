@@ -24,7 +24,8 @@ def setup(cfg):
         cfg.shuffle = False
 
 
-@hydra.main(config_path= 'CoBEVT/nuscenes/config', config_name='config.yaml')
+@hydra.main(config_path=Path.cwd().parent / 'config', config_name='config.yaml')
+
 def main(cfg):
     setup_config(cfg, setup)
 
