@@ -15,7 +15,7 @@ from cross_view_transformer.callbacks.visualization_callback import Visualizatio
 
 log = logging.getLogger(__name__)
 
-CONFIG_PATH = /content/CoBEVT/nuscenes/config
+CONFIG_PATH = '/content/CoBEVT/nuscenes/config'
 CONFIG_NAME = 'config.yaml'
 
 
