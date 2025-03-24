@@ -1,9 +1,7 @@
-
-
-
 import hydra
 import numpy as np
 import cv2
+import matplotlib.pyplot as plt  # Matplotlib을 import
 
 from pathlib import Path
 from tqdm import tqdm
@@ -38,9 +36,16 @@ def main(cfg):
     for batch in tqdm(loader):
         img = np.vstack(viz(batch))
 
-        cv2.imshow('debug', cv2.cvtColor(img, cv2.COLOR_RGB2BGR))
-        cv2.waitKey(1)
+        # 기존 OpenCV로 이미지를 띄우는 코드 -> Matplotlib으로 수정
+        plt.figure(figsize=(10, 10))  # 이미지 크기 설정
+        plt.imshow(cv2.cvtColor(img, cv2.COLOR_RGB2BGR))  # 이미지를 Matplotlib에서 출력
+        plt.axis('off')  # 축 숨기기
+        plt.show()  # 이미지를 표시
+        plt.pause(0.1)  # 잠깐 멈추고 다음 이미지로 넘어감
 
 
 if __name__ == '__main__':
     main()
+
+
+
