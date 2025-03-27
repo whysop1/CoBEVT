@@ -11,7 +11,7 @@ from omegaconf import OmegaConf, DictConfig
 log = logging.getLogger(__name__)
 
 
-PROJECT_ROOT = '/CoBEVT/nuscenes'
+PROJECT_ROOT = Path("https://github.com/whysop1/CoBEVT.git")
 TEMPLATE = """
 ==================================================
 {diff}
