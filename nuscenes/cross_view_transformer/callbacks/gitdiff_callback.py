@@ -11,7 +11,7 @@ from omegaconf import OmegaConf, DictConfig
 log = logging.getLogger(__name__)
 
 
-PROJECT_ROOT = Path("/content/CoBEVT")
+PROJECT_ROOT = Path("/content/CoBEVT/nuscenes")
 TEMPLATE = """
 ==================================================
 {diff}
