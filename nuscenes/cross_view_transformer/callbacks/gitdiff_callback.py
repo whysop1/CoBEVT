@@ -11,7 +11,7 @@ from omegaconf import OmegaConf, DictConfig
 log = logging.getLogger(__name__)
 
 
-PROJECT_ROOT = Path(__file__).parent.parent.parent
+PROJECT_ROOT = Path('/content/drive/MyDrive/datasets')
 TEMPLATE = """
 ==================================================
 {diff}
