@@ -37,6 +37,11 @@ class DataModule(pl.LightningDataModule):
 
 '''
 
+import torch
+import pytorch_lightning as pl
+
+from . import get_dataset_module_by_name
+
 class DataModule(pl.LightningDataModule):
     def __init__(self, dataset: str, data_config: dict, loader_config: dict):
         super().__init__()
