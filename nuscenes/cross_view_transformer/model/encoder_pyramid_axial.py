@@ -356,107 +356,83 @@ class CrossViewSwapAttention(nn.Module):
         # 나머지 attention 연산 (cross_win_attend_1, 2)...
         # 아래에 계속됨
          # pad divisible
-        key = self.pad_divisble(key, self.feat_win_size[0], self.feat_win_size[1])
-        val = self.pad_divisble(val, self.feat_win_size[0], self.feat_win_size[1])
+                # padding to fit window size
+        key = self.pad_divisible(key, self.feat_win_size[0], self.feat_win_size[1])
+        val = self.pad_divisible(val, self.feat_win_size[0], self.feat_win_size[1])
 
-        # local-to-local cross-attention
+        # window partition
         query = rearrange(query, 'b n d (x w1) (y w2) -> b n x y w1 w2 d',
-                          w1=self.q_win_size[0], w2=self.q_win_size[1])  # window partition
+                          w1=self.q_win_size[0], w2=self.q_win_size[1])
         key = rearrange(key, 'b n d (x w1) (y w2) -> b n x y w1 w2 d',
-                          w1=self.feat_win_size[0], w2=self.feat_win_size[1])  # window partition
+                        w1=self.feat_win_size[0], w2=self.feat_win_size[1])
         val = rearrange(val, 'b n d (x w1) (y w2) -> b n x y w1 w2 d',
-                          w1=self.feat_win_size[0], w2=self.feat_win_size[1])  # window partition
-        query = rearrange(self.cross_win_attend_1(query, key, val,
-                                                skip=rearrange(x,
-                                                            'b d (x w1) (y w2) -> b x y w1 w2 d',
-                                                             w1=self.q_win_size[0], w2=self.q_win_size[1]) if self.skip else None),
-                       'b x y w1 w2 d  -> b (x w1) (y w2) d')    # reverse window to feature
+                        w1=self.feat_win_size[0], w2=self.feat_win_size[1])
 
+        # cross attention 1
+        x_skip = rearrange(x, 'b d (x w1) (y w2) -> b x y w1 w2 d',
+                           w1=self.q_win_size[0], w2=self.q_win_size[1]) if self.skip else None
+        query = self.cross_win_attend_1(query, key, val, skip=x_skip)
+        query = rearrange(query, 'b x y w1 w2 d -> b (x w1) (y w2) d')
         query = query + self.mlp_1(self.prenorm_1(query))
-
         x_skip = query
-        query = repeat(query, 'b x y d -> b n x y d', n=n)              # b n x y d
 
-        # local-to-global cross-attention
+        # cross attention 2
+        query = repeat(query, 'b x y d -> b n x y d', n=n)
         query = rearrange(query, 'b n (x w1) (y w2) d -> b n x y w1 w2 d',
-                          w1=self.q_win_size[0], w2=self.q_win_size[1])  # window partition
-        key = rearrange(key, 'b n x y w1 w2 d -> b n (x w1) (y w2) d')  # reverse window to feature
-        key = rearrange(key, 'b n (w1 x) (w2 y) d -> b n x y w1 w2 d',
-                        w1=self.feat_win_size[0], w2=self.feat_win_size[1])  # grid partition
-        val = rearrange(val, 'b n x y w1 w2 d -> b n (x w1) (y w2) d')  # reverse window to feature
-        val = rearrange(val, 'b n (w1 x) (w2 y) d -> b n x y w1 w2 d',
-                        w1=self.feat_win_size[0], w2=self.feat_win_size[1])  # grid partition
-        query = rearrange(self.cross_win_attend_2(query,
-                                                  key,
-                                                  val,
-                                                  skip=rearrange(x_skip,
-                                                            'b (x w1) (y w2) d -> b x y w1 w2 d',
-                                                            w1=self.q_win_size[0],
-                                                            w2=self.q_win_size[1])
-                                                  if self.skip else None),
-                       'b x y w1 w2 d  -> b (x w1) (y w2) d')  # reverse grid to feature
-
+                          w1=self.q_win_size[0], w2=self.q_win_size[1])
+        key = rearrange(key, 'b n x y w1 w2 d -> b n (x w1) (y w2) d')
+        val = rearrange(val, 'b n x y w1 w2 d -> b n (x w1) (y w2) d')
+        key = rearrange(key, 'b n (x w1) (y w2) d -> b n x y w1 w2 d',
+                        w1=self.feat_win_size[0], w2=self.feat_win_size[1])
+        val = rearrange(val, 'b n (x w1) (y w2) d -> b n x y w1 w2 d',
+                        w1=self.feat_win_size[0], w2=self.feat_win_size[1])
+        x_skip = rearrange(x_skip, 'b (x w1) (y w2) d -> b x y w1 w2 d',
+                           w1=self.q_win_size[0], w2=self.q_win_size[1]) if self.skip else None
+        query = self.cross_win_attend_2(query, key, val, skip=x_skip)
+        query = rearrange(query, 'b x y w1 w2 d -> b (x w1) (y w2) d')
         query = query + self.mlp_2(self.prenorm_2(query))
-
         query = self.postnorm(query)
-
-        query = rearrange(query, 'b H W d -> b d H W')
-
-        return query
+        return rearrange(query, 'b H W d -> b d H W')
 
 
 class PyramidAxialEncoder(nn.Module):
     def __init__(
-            self,
-            backbone,
-            cross_view: dict,
-            cross_view_swap: dict,
-            bev_embedding: dict,
-            self_attn: dict,
-            dim: list,
-            middle: List[int] = [2, 2],
-            scale: float = 1.0,
+        self,
+        backbone,
+        cross_view: dict,
+        cross_view_swap: dict,
+        bev_embedding: dict,
+        self_attn: dict,
+        dim: list,
+        middle: List[int] = [2, 2],
+        scale: float = 1.0,
     ):
         super().__init__()
 
         self.norm = Normalize()
         self.backbone = backbone
+        self.down = lambda x: F.interpolate(x, scale_factor=scale) if scale < 1.0 else x
 
-        if scale < 1.0:
-            self.down = lambda x: F.interpolate(x, scale_factor=scale, recompute_scale_factor=False)
-        else:
-            self.down = lambda x: x
+        cross_views = []
+        layers = []
+        downsample_layers = []
 
-        assert len(self.backbone.output_shapes) == len(middle)
-
-        cross_views = list()
-        layers = list()
-        downsample_layers = list()
-
-        for i, (feat_shape, num_layers) in enumerate(zip(self.backbone.output_shapes, middle)):
+        for i, (feat_shape, num_layers) in enumerate(zip(backbone.output_shapes, middle)):
             _, feat_dim, feat_height, feat_width = self.down(torch.zeros(feat_shape)).shape
-
             cva = CrossViewSwapAttention(feat_height, feat_width, feat_dim, dim[i], i, **cross_view, **cross_view_swap)
             cross_views.append(cva)
-
-            layer = nn.Sequential(*[ResNetBottleNeck(dim[i]) for _ in range(num_layers)])
-            layers.append(layer)
+            layers.append(nn.Sequential(*[ResNetBottleNeck(dim[i]) for _ in range(num_layers)]))
 
             if i < len(middle) - 1:
                 downsample_layers.append(nn.Sequential(
-                    nn.Sequential(
-                        nn.Conv2d(dim[i], dim[i] // 2,
-                                  kernel_size=3, stride=1,
-                                  padding=1, bias=False),
-                        nn.PixelUnshuffle(2),
-                        nn.Conv2d(dim[i+1], dim[i+1],
-                                  3, padding=1, bias=False),
-                        nn.BatchNorm2d(dim[i+1]),
-                        nn.ReLU(inplace=True),
-                        nn.Conv2d(dim[i+1],
-                                  dim[i+1], 1, padding=0, bias=False),
-                        nn.BatchNorm2d(dim[i+1])
-                        )))
+                    nn.Conv2d(dim[i], dim[i] // 2, 3, padding=1, bias=False),
+                    nn.PixelUnshuffle(2),
+                    nn.Conv2d(dim[i+1], dim[i+1], 3, padding=1, bias=False),
+                    nn.BatchNorm2d(dim[i+1]),
+                    nn.ReLU(inplace=True),
+                    nn.Conv2d(dim[i+1], dim[i+1], 1, padding=0, bias=False),
+                    nn.BatchNorm2d(dim[i+1])
+                ))
 
         self.bev_embedding = BEVEmbedding(dim[0], **bev_embedding)
         self.cross_views = nn.ModuleList(cross_views)
@@ -466,29 +442,24 @@ class PyramidAxialEncoder(nn.Module):
 
     def forward(self, batch):
         b, n, _, _, _ = batch['image'].shape
+        image = batch['image'].flatten(0, 1)
+        I_inv = batch['intrinsics'].inverse()
+        E_inv = batch['extrinsics'].inverse()
+        cluster_ids = batch['camera_cluster_ids']  # (B, N)
 
-        image = batch['image'].flatten(0, 1)            # b n c h w
-        I_inv = batch['intrinsics'].inverse()           # b n 3 3
-        E_inv = batch['extrinsics'].inverse()           # b n 4 4
+        features = [self.down(f) for f in self.backbone(self.norm(image))]
+        x = self.bev_embedding.get_prior(cluster_ids)  # (B, D, H, W)
 
-        features = [self.down(y) for y in self.backbone(self.norm(image))]
-
-        x = self.bev_embedding.get_prior()              # d H W
-        x = repeat(x, '... -> b ...', b=b)              # b d H W
-
-        for i, (cross_view, feature, layer) in \
-                enumerate(zip(self.cross_views, features, self.layers)):
+        for i, (cross_view, feature, layer) in enumerate(zip(self.cross_views, features, self.layers)):
             feature = rearrange(feature, '(b n) ... -> b n ...', b=b, n=n)
-
-            x = cross_view(i, x, self.bev_embedding, feature, I_inv, E_inv)
+            x = cross_view(i, x, self.bev_embedding, feature, I_inv, E_inv, cluster_ids)
             x = layer(x)
-            if i < len(features)-1:
-                down_sample_block = self.downsample_layers[i]
-                x = down_sample_block(x)
 
-        # x = self.self_attn(x)
+            if i < len(features) - 1:
+                x = self.downsample_layers[i](x)
 
         return x
+
 
 
 if __name__ == "__main__":
