@@ -17,7 +17,12 @@ def get_camera_pose(sensor_data, ego_pose):
 
 def main(nusc_path, version='v1.0-trainval', num_clusters=10, out_path='cluster_camera_pose_id.npy'):
     
-    nusc = NuScenes(version=version, dataroot=nusc_path, map_version=None)
+    nusc = NuScenes(version=version, dataroot=nusc_path)
+    
+    # maps 관련 데이터 무시 (임시 우회)
+    # nusc.maps 리스트가 있다면 빈 리스트로 강제 설정
+    if hasattr(nusc, 'maps'):
+        nusc.maps = []
 
     camera_poses = []
     tokens = []
