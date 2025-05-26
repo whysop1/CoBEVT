@@ -82,6 +82,7 @@ import subprocess
 import logging
 import pytorch_lightning as pl
 import hydra
+import sys  # ✅ 현재 파이썬 실행 파일 경로를 얻기 위해 추가
 
 from pytorch_lightning.strategies.ddp import DDPStrategy
 from pytorch_lightning.callbacks import LearningRateMonitor, ModelCheckpoint
@@ -116,7 +117,10 @@ def main(cfg):
     CLUSTER_PATH = Path('cluster_camera_pose_id.npy') 
     if not CLUSTER_PATH.exists():
         print("Cluster ID mapping not found. Generating...")
-        subprocess.run(['python', '/content/CoBEVT/nuscenes/tools/cluster_camera_pose.py'], check=True)
+
+        # ✅ 현재 실행 중인 파이썬 인터프리터를 명시적으로 사용
+        python_exec = sys.executable
+        subprocess.run([python_exec, '/content/CoBEVT/nuscenes/tools/cluster_camera_pose.py'], check=True)
     else:
         print("Cluster ID mapping found.")
 
@@ -163,3 +167,4 @@ def main(cfg):
 
 if __name__ == '__main__':
     main()
+
