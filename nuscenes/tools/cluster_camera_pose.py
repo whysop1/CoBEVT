@@ -19,8 +19,6 @@ def main(nusc_path, version='v1.0-trainval', num_clusters=10, out_path='cluster_
     
     nusc = NuScenes(version='v1.0-trainval', dataroot=nusc_path)
 
-    if hasattr(nusc, 'maps'):
-    nusc.maps = []
     
     camera_poses = []
     tokens = []
