@@ -113,10 +113,10 @@ def maybe_resume_training(experiment):
 @hydra.main(config_path=CONFIG_PATH, config_name=CONFIG_NAME)
 def main(cfg):
     # 1. cluster_camera_pose_id.npy 파일 체크 및 생성
-    CLUSTER_PATH = Path('/content/CoBEVT/nuscenes/tools/cluster_camera_pose_id.npy')
+    CLUSTER_PATH = Path('cluster_camera_pose_id.npy') 
     if not CLUSTER_PATH.exists():
         print("Cluster ID mapping not found. Generating...")
-        subprocess.run(['python', 'tools/cluster_camera_pose.py'], check=True)
+        subprocess.run(['python', '/content/CoBEVT/nuscenes/tools/cluster_camera_pose.py'], check=True)
     else:
         print("Cluster ID mapping found.")
 
