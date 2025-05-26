@@ -84,7 +84,162 @@ class BEVEmbedding(nn.Module):
         embeddings = self.learned_features[cluster_ids]  # (B, N, D, H, W)
         return embeddings.mean(dim=1)  # (B, D, H, W)
 
-# ... 위에 BEVEmbedding 클래스까지 이어짐
+class Attention(nn.Module):
+    def __init__(
+        self,
+        dim,
+        dim_head = 32,
+        dropout = 0.,
+        window_size = 25
+    ):
+        super().__init__()
+        assert (dim % dim_head) == 0, 'dimension should be divisible by dimension per head'
+
+        self.heads = dim // dim_head
+        self.scale = dim_head ** -0.5
+
+        self.to_qkv = nn.Linear(dim, dim * 3, bias = False)
+
+        self.attend = nn.Sequential(
+            nn.Softmax(dim = -1),
+            nn.Dropout(dropout)
+        )
+
+        self.to_out = nn.Sequential(
+            nn.Linear(dim, dim, bias = False),
+            nn.Dropout(dropout)
+        )
+
+        # relative positional bias
+
+        self.rel_pos_bias = nn.Embedding((2 * window_size - 1) ** 2, self.heads)
+
+        pos = torch.arange(window_size)
+        grid = torch.stack(torch.meshgrid(pos, pos, indexing = 'ij'))
+        grid = rearrange(grid, 'c i j -> (i j) c')
+        rel_pos = rearrange(grid, 'i ... -> i 1 ...') - rearrange(grid, 'j ... -> 1 j ...')
+        rel_pos += window_size - 1
+        rel_pos_indices = (rel_pos * torch.tensor([2 * window_size - 1, 1])).sum(dim = -1)
+
+        self.register_buffer('rel_pos_indices', rel_pos_indices, persistent = False)
+
+    def forward(self, x):
+        batch, _, height, width, device, h = *x.shape, x.device, self.heads
+
+        # flatten
+
+        x = rearrange(x, 'b d h w -> b (h w) d')
+
+        # project for queries, keys, values
+
+        q, k, v = self.to_qkv(x).chunk(3, dim = -1)
+
+        # split heads
+
+        q, k, v = map(lambda t: rearrange(t, 'b n (h d ) -> b h n d', h = h), (q, k, v))
+
+        # scale
+
+        q = q * self.scale
+
+        # sim
+
+        sim = einsum('b h i d, b h j d -> b h i j', q, k)
+
+        # add positional bias
+
+        bias = self.rel_pos_bias(self.rel_pos_indices)
+        sim = sim + rearrange(bias, 'i j h -> h i j')
+
+        # attention
+
+        attn = self.attend(sim)
+
+        # aggregate
+
+        out = einsum('b h i j, b h j d -> b h i d', attn, v)
+
+        # merge heads
+
+        out = rearrange(out, 'b m (h w) d -> b h w (m d)',
+                        h = height, w = width)
+
+        # combine heads out
+
+        out = self.to_out(out)
+        return rearrange(out, 'b h w d -> b d h w')
+
+
+class CrossWinAttention(nn.Module):
+    def __init__(self, dim, heads, dim_head, qkv_bias, rel_pos_emb=False, norm=nn.LayerNorm):
+        super().__init__()
+
+        self.scale = dim_head ** -0.5
+
+        self.heads = heads
+        self.dim_head = dim_head
+        self.rel_pos_emb = rel_pos_emb
+
+        self.to_q = nn.Sequential(norm(dim), nn.Linear(dim, heads * dim_head, bias=qkv_bias))
+        self.to_k = nn.Sequential(norm(dim), nn.Linear(dim, heads * dim_head, bias=qkv_bias))
+        self.to_v = nn.Sequential(norm(dim), nn.Linear(dim, heads * dim_head, bias=qkv_bias))
+
+        self.proj = nn.Linear(heads * dim_head, dim)
+
+    def add_rel_pos_emb(self, x):
+        return x
+
+    def forward(self, q, k, v, skip=None):
+        """
+        q: (b n X Y W1 W2 d)
+        k: (b n x y w1 w2 d)
+        v: (b n x y w1 w2 d)
+        return: (b X Y W1 W2 d)
+        """
+        assert k.shape == v.shape
+        _, view_size, q_height, q_width, q_win_height, q_win_width, _ = q.shape
+        _, _, kv_height, kv_width, _, _, _ = k.shape
+        assert q_height * q_width == kv_height * kv_width
+
+        # flattening
+        q = rearrange(q, 'b n x y w1 w2 d -> b (x y) (n w1 w2) d')
+        k = rearrange(k, 'b n x y w1 w2 d -> b (x y) (n w1 w2) d')
+        v = rearrange(v, 'b n x y w1 w2 d -> b (x y) (n w1 w2) d')
+
+        # Project with multiple heads
+        q = self.to_q(q)                                # b (X Y) (n W1 W2) (heads dim_head)
+        k = self.to_k(k)                                # b (X Y) (n w1 w2) (heads dim_head)
+        v = self.to_v(v)                                # b (X Y) (n w1 w2) (heads dim_head)
+
+        # Group the head dim with batch dim
+        q = rearrange(q, 'b ... (m d) -> (b m) ... d', m=self.heads, d=self.dim_head)
+        k = rearrange(k, 'b ... (m d) -> (b m) ... d', m=self.heads, d=self.dim_head)
+        v = rearrange(v, 'b ... (m d) -> (b m) ... d', m=self.heads, d=self.dim_head)
+
+        # Dot product attention along cameras
+        dot = self.scale * torch.einsum('b l Q d, b l K d -> b l Q K', q, k)  # b (X Y) (n W1 W2) (n w1 w2)
+        # dot = rearrange(dot, 'b l n Q K -> b l Q (n K)')  # b (X Y) (W1 W2) (n w1 w2)
+
+        if self.rel_pos_emb:
+            dot = self.add_rel_pos_emb(dot)
+        att = dot.softmax(dim=-1)
+
+        # Combine values (image level features).
+        a = torch.einsum('b n Q K, b n K d -> b n Q d', att, v)  # b (X Y) (n W1 W2) d
+        a = rearrange(a, '(b m) ... d -> b ... (m d)', m=self.heads, d=self.dim_head)
+        a = rearrange(a, ' b (x y) (n w1 w2) d -> b n x y w1 w2 d',
+            x=q_height, y=q_width, w1=q_win_height, w2=q_win_width)
+
+        # Combine multiple heads
+        z = self.proj(a)
+
+        # reduce n: (b n X Y W1 W2 d) -> (b X Y W1 W2 d)
+        z = z.mean(1)  # for sequential usage, we cannot reduce it!
+
+        # Optional skip connection
+        if skip is not None:
+            z = z + skip
+        return z
 
 class CrossViewSwapAttention(nn.Module):
     def __init__(
