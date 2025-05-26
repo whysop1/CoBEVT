@@ -37,7 +37,7 @@ def main(nusc_path, version='v1.0-trainval', num_clusters=10, out_path='cluster_
 
 if __name__ == "__main__":
     main(
-        nusc_path='/content/CoBEVT/nuscenes',  # 반드시 실제 경로로 수정
+        nusc_path='/content/drive/MyDrive/datasets/nuscenes',  # 반드시 실제 경로로 수정
         version='v1.0-trainval',
         num_clusters=10,
         out_path='cluster_camera_pose_id.npy'
