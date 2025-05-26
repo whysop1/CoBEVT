@@ -16,7 +16,8 @@ def get_camera_pose(sensor_data, ego_pose):
     return np.concatenate([translation, rotation])
 
 def main(nusc_path, version='v1.0-trainval', num_clusters=10, out_path='cluster_camera_pose_id.npy'):
-    nusc = NuScenes(version=version, dataroot=nusc_path)
+    
+    nusc = NuScenes(version=version, dataroot=nusc_path, map_version=None)
 
     camera_poses = []
     tokens = []
