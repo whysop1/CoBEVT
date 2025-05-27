@@ -16,9 +16,18 @@ def get_camera_pose(sensor_data, ego_pose):
     return np.concatenate([translation, rotation])
 
 def main(nusc_path, version='v1.0-trainval', num_clusters=10, out_path='cluster_camera_pose_id.npy'):
+
+
+    from nuscenes.nuscenes import NuScenes as NuScenesBase
+
+    class NuScenesNoMap(NuScenesBase):
+        def __init__(self, *args, **kwargs):
+            super().__init__(*args, **kwargs)
+            self.maps = []  # map 로딩 제거
+
     
     nusc = NuScenes(version='v1.0-trainval', dataroot=nusc_path)
-    nusc.maps = []
+    
     
     camera_poses = []
     tokens = []
