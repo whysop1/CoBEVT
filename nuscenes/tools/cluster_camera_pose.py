@@ -18,7 +18,7 @@ def get_camera_pose(sensor_data, ego_pose):
 def main(nusc_path, version='v1.0-trainval', num_clusters=10, out_path='cluster_camera_pose_id.npy'):
     
     nusc = NuScenes(version='v1.0-trainval', dataroot=nusc_path)
-
+    nusc.maps = []
     
     camera_poses = []
     tokens = []
