@@ -459,9 +459,6 @@ class PyramidAxialEncoder(nn.Module):
         self.downsample_layers = nn.ModuleList(downsample_layers)
         # self.self_attn = Attention(dim[-1], **self_attn)
 
-    
-
-
 
 
 
@@ -469,30 +466,34 @@ class PyramidAxialEncoder(nn.Module):
 
     def forward(self, batch):
         b, n, _, _, _ = batch['image'].shape
+        print(f"[DEBUG] batch['image'].shape: {batch['image'].shape} → B={b}, N={n}")
+    
         image = batch['image'].flatten(0, 1)
         I_inv = batch['intrinsics'].inverse()
         E_inv = batch['extrinsics'].inverse()
 
         cluster_ids = batch['camera_cluster_ids']  # (B, N) or list
+        print(f"[DEBUG] Type of cluster_ids: {type(cluster_ids)}")
 
         if isinstance(cluster_ids, list):
-            # 리스트 내부가 tensor인지 확인 후 tensor로 concat
-            print("cluster_ids:", cluster_ids)
+            print(f"[DEBUG] cluster_ids is a list of length {len(cluster_ids)}")
             for i, c in enumerate(cluster_ids):
                 if isinstance(c, torch.Tensor):
-                    print(f"cluster_ids[{i}] shape:", c.shape)
-
-            # 각 tensor를 cpu로 옮기고 concat
-            cluster_ids_tensors = [c.cpu() if isinstance(c, torch.Tensor) else torch.tensor(c) for c in cluster_ids]
-            cluster_ids = torch.cat(cluster_ids_tensors, dim=0)
+                    print(f"[DEBUG] cluster_ids[{i}] shape: {c.shape}")
+        
+            # 리스트 내부가 텐서이고 각 텐서가 (N,) shape일 경우
+            cluster_ids = torch.cat(cluster_ids, dim=0)  # (B * N,)
+            print(f"[DEBUG] cluster_ids after torch.cat: shape = {cluster_ids.shape}")
+            cluster_ids = cluster_ids.view(b, n)  # reshape to (B, N)
+            print(f"[DEBUG] cluster_ids reshaped to (B, N): shape = {cluster_ids.shape}")
             cluster_ids = cluster_ids.to(dtype=torch.long, device=image.device)
-            print("cluster_ids converted from list, shape:", cluster_ids.shape)
 
         elif isinstance(cluster_ids, torch.Tensor):
+            print(f"[DEBUG] cluster_ids is a tensor: shape = {cluster_ids.shape}")
             cluster_ids = cluster_ids.to(dtype=torch.long, device=image.device)
-            print("cluster_ids tensor shape:", cluster_ids.shape)
+
         else:
-            raise TypeError(f"Unexpected type for cluster_ids: {type(cluster_ids)}")
+            raise TypeError(f"[ERROR] Unexpected type for cluster_ids: {type(cluster_ids)}")
 
         features = [self.down(f) for f in self.backbone(self.norm(image))]
         x = self.bev_embedding.get_prior(cluster_ids)  # (B, D, H, W)
