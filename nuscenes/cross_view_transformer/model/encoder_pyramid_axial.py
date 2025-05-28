@@ -463,23 +463,26 @@ class PyramidAxialEncoder(nn.Module):
 
 
 
+
+
+
+
     def forward(self, batch):
         b, n, _, _, _ = batch['image'].shape
         image = batch['image'].flatten(0, 1)
         I_inv = batch['intrinsics'].inverse()
         E_inv = batch['extrinsics'].inverse()
 
-        cluster_ids = batch['camera_cluster_ids']  # (B, N)
-
-        print("cluster_ids shape:", cluster_ids.shape)  # <--- 이 부분 추가
+        cluster_ids = batch['camera_cluster_ids']  # (B, N) or list
 
         if isinstance(cluster_ids, list):
-            import numpy as np
+            # 리스트 내부가 tensor인지 확인 후 item 추출
             cluster_ids = [c.cpu().item() if isinstance(c, torch.Tensor) else c for c in cluster_ids]
-            cluster_ids = np.array(cluster_ids)
             cluster_ids = torch.tensor(cluster_ids, dtype=torch.long, device=image.device)
+            print("cluster_ids converted from list, shape:", cluster_ids.shape)
         elif isinstance(cluster_ids, torch.Tensor):
             cluster_ids = cluster_ids.to(dtype=torch.long, device=image.device)
+            print("cluster_ids tensor shape:", cluster_ids.shape)
         else:
             raise TypeError(f"Unexpected type for cluster_ids: {type(cluster_ids)}")
 
