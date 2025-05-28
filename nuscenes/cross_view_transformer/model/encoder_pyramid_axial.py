@@ -462,31 +462,7 @@ class PyramidAxialEncoder(nn.Module):
     
 
 
-    def forward(self, batch):
-        b, n, _, _, _ = batch['image'].shape
-        image = batch['image'].flatten(0, 1)
-        I_inv = batch['intrinsics'].inverse()
-        E_inv = batch['extrinsics'].inverse()
     
-        cluster_ids = batch['camera_cluster_ids']  # (B, N)
-        # cluster_ids가 list면 tensor로 변환, tensor면 dtype, device 맞춤
-        if isinstance(cluster_ids, list):
-            cluster_ids = torch.tensor(cluster_ids, dtype=torch.long, device=image.device)
-        else:
-            cluster_ids = cluster_ids.to(dtype=torch.long, device=image.device)
-
-        features = [self.down(f) for f in self.backbone(self.norm(image))]
-        x = self.bev_embedding.get_prior(cluster_ids)  # (B, D, H, W)
-
-        for i, (cross_view, feature, layer) in enumerate(zip(self.cross_views, features, self.layers)):
-            feature = rearrange(feature, '(b n) ... -> b n ...', b=b, n=n)
-            x = cross_view(i, x, self.bev_embedding, feature, I_inv, E_inv, cluster_ids)
-            x = layer(x)
-
-            if i < len(features) - 1:
-                x = self.downsample_layers[i](x)
-
-        return x
 
 
     def forward(self, batch):
