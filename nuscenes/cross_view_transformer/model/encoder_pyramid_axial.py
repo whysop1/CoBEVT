@@ -476,17 +476,18 @@ class PyramidAxialEncoder(nn.Module):
         cluster_ids = batch['camera_cluster_ids']  # (B, N) or list
 
         if isinstance(cluster_ids, list):
-            # 리스트 내부가 tensor인지 확인 후 item 추출
-
+            # 리스트 내부가 tensor인지 확인 후 tensor로 concat
             print("cluster_ids:", cluster_ids)
             for i, c in enumerate(cluster_ids):
                 if isinstance(c, torch.Tensor):
                     print(f"cluster_ids[{i}] shape:", c.shape)
 
-            
-            cluster_ids = [c.cpu().item() if isinstance(c, torch.Tensor) else c for c in cluster_ids]
-            cluster_ids = torch.tensor(cluster_ids, dtype=torch.long, device=image.device)
+            # 각 tensor를 cpu로 옮기고 concat
+            cluster_ids_tensors = [c.cpu() if isinstance(c, torch.Tensor) else torch.tensor(c) for c in cluster_ids]
+            cluster_ids = torch.cat(cluster_ids_tensors, dim=0)
+            cluster_ids = cluster_ids.to(dtype=torch.long, device=image.device)
             print("cluster_ids converted from list, shape:", cluster_ids.shape)
+
         elif isinstance(cluster_ids, torch.Tensor):
             cluster_ids = cluster_ids.to(dtype=torch.long, device=image.device)
             print("cluster_ids tensor shape:", cluster_ids.shape)
