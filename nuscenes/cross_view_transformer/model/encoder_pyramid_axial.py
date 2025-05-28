@@ -78,10 +78,10 @@ class BEVEmbedding(nn.Module):
         )
 
     def get_prior(self, cluster_ids: torch.Tensor):
-    """
-    cluster_ids: Tensor of shape (B, N) with cluster indices
-    Returns: Tensor of shape (B, D, H, W), averaged embeddings over N clusters
-    """
+        """
+        cluster_ids: Tensor of shape (B, N) with cluster indices
+        Returns: Tensor of shape (B, D, H, W), averaged embeddings over N clusters
+        """
         # 체크: cluster_ids 타입과 범위
         assert cluster_ids.dtype == torch.long, "cluster_ids must be LongTensor"
         assert cluster_ids.max() < self.num_clusters, "cluster_ids contains out-of-bound indices"
