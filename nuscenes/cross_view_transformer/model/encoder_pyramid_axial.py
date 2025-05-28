@@ -463,7 +463,6 @@ class PyramidAxialEncoder(nn.Module):
 
 
 
-
     def forward(self, batch):
         b, n, _, _, _ = batch['image'].shape
         image = batch['image'].flatten(0, 1)
@@ -472,9 +471,10 @@ class PyramidAxialEncoder(nn.Module):
 
         cluster_ids = batch['camera_cluster_ids']  # (B, N)
 
+        print("cluster_ids shape:", cluster_ids.shape)  # <--- 이 부분 추가
+
         if isinstance(cluster_ids, list):
             import numpy as np
-            # 리스트 내부에 GPU tensor가 있을 수도 있으니 CPU로 옮기고 숫자만 추출
             cluster_ids = [c.cpu().item() if isinstance(c, torch.Tensor) else c for c in cluster_ids]
             cluster_ids = np.array(cluster_ids)
             cluster_ids = torch.tensor(cluster_ids, dtype=torch.long, device=image.device)
