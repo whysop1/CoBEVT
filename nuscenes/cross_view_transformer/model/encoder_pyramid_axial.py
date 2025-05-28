@@ -466,8 +466,7 @@ class PyramidAxialEncoder(nn.Module):
 
 
     def forward(self, batch):
-        print("cluster_ids type:", type(cluster_ids))
-        print("cluster_ids sample:", cluster_ids[:2] if isinstance(cluster_ids, (list, torch.Tensor)) else cluster_ids)
+        
 
         
         b, n, _, _, _ = batch['image'].shape
