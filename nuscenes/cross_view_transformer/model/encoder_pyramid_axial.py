@@ -477,6 +477,13 @@ class PyramidAxialEncoder(nn.Module):
 
         if isinstance(cluster_ids, list):
             # 리스트 내부가 tensor인지 확인 후 item 추출
+
+            print("cluster_ids:", cluster_ids)
+            for i, c in enumerate(cluster_ids):
+                if isinstance(c, torch.Tensor):
+                    print(f"cluster_ids[{i}] shape:", c.shape)
+
+            
             cluster_ids = [c.cpu().item() if isinstance(c, torch.Tensor) else c for c in cluster_ids]
             cluster_ids = torch.tensor(cluster_ids, dtype=torch.long, device=image.device)
             print("cluster_ids converted from list, shape:", cluster_ids.shape)
