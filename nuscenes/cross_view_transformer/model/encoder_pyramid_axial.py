@@ -82,25 +82,25 @@ class BEVEmbedding(nn.Module):
     cluster_ids: Tensor of shape (B, N) with cluster indices
     Returns: Tensor of shape (B, D, H, W), averaged embeddings over N clusters
     """
-    # 체크: cluster_ids 타입과 범위
-    assert cluster_ids.dtype == torch.long, "cluster_ids must be LongTensor"
-    assert cluster_ids.max() < self.num_clusters, "cluster_ids contains out-of-bound indices"
+        # 체크: cluster_ids 타입과 범위
+        assert cluster_ids.dtype == torch.long, "cluster_ids must be LongTensor"
+        assert cluster_ids.max() < self.num_clusters, "cluster_ids contains out-of-bound indices"
 
-    B, N = cluster_ids.shape
+        B, N = cluster_ids.shape
 
-    # 1차원 인덱스로 변환
-    flat_ids = cluster_ids.view(-1)  # (B * N)
+        # 1차원 인덱스로 변환
+        flat_ids = cluster_ids.view(-1)  # (B * N)
 
-    # learned_features에서 인덱싱
-    selected = self.learned_features[flat_ids]  # (B * N, D, H, W)
+        # learned_features에서 인덱싱
+        selected = self.learned_features[flat_ids]  # (B * N, D, H, W)
 
-    # 다시 원래 배치 크기로 reshape
-    selected = selected.view(B, N, *self.learned_features.shape[1:])  # (B, N, D, H, W)
+        # 다시 원래 배치 크기로 reshape
+        selected = selected.view(B, N, *self.learned_features.shape[1:])  # (B, N, D, H, W)
 
-    # N개 클러스터 임베딩 평균
-    embeddings = selected.mean(dim=1)  # (B, D, H, W)
+        # N개 클러스터 임베딩 평균
+        embeddings = selected.mean(dim=1)  # (B, D, H, W)
 
-    return embeddings
+        return embeddings
 
 
 class Attention(nn.Module):
