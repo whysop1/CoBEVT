@@ -43,6 +43,6 @@ if __name__ == "__main__":
     main(
         nusc_path='/content/drive/MyDrive/datasets/nuscenes',  # 반드시 실제 경로로 수정
         version='v1.0-trainval',
-        num_clusters=10,
+        num_clusters=20,   #전엔 10으로 실험
         out_path='cluster_camera_pose_id.npy'
     )
