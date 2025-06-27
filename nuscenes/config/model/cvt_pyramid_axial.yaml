@@ -62,36 +62,59 @@
 
 # cvt_pyramid_axial.yaml (수정본 예시)
 
-model:
+outputs:
+  bev: [0, 1]
+
+encoder:
   _target_: cross_view_transformer.model.encoder_pyramid_axial.PyramidAxialEncoder
-  backbone:
-    _target_: cross_view_transformer.model.backbones.efficientnet.EfficientNetBackbone
-    arch: efficientnet-b4     # ← 하이픈(-)으로 수정됨
-    pretrained: true
-  cross_view:
-    heads: [8, 8, 8]
-    dim_head: [64, 64, 64]
-    q_win_size: [8, 8]
-    feat_win_size: [16, 16]
-    bev_embedding_flag: [true, true, true]
-    no_image_features: false
-  cross_view_swap:
-    # 필요시 내용 추가
-  bev_embedding:
-    _target_: cross_view_transformer.bev_embedding.BEVEmbedding
-    bev_size: [200, 200]
-    bev_dim: 128
-  self_attn: null
-  dim: [128, 128, 128]
-  middle: [3, 3, 3]
+
+  dim: [32, 64, 128]
   scale: 1.0
+  middle: [2, 2, 2]
 
-data:
-  dataset_dir: /content/drive/MyDrive/datasets/nuscenes
-  labels_dir: /content/drive/MyDrive/datasets/cvt_labels_nuscenes
+  backbone:
+    _target_: cross_view_transformer.model.backbones.efficientnet.EfficientNetExtractor
+    model_name: efficientnet-b4
+    layer_names: ['reduction_2', 'reduction_3', 'reduction_4']
+    image_height: ${data.image.h}
+    image_width: ${data.image.w}
 
-training:
-  batch_size: 8
-  lr: 1e-4
-  epochs: 100
+  self_attn:
+    dim_head: 32
+    dropout: 0.1
+    window_size: 25
 
+  cross_view:
+    heads: [1, 2, 4]
+    dim_head: [32, 32, 32]
+    qkv_bias: True
+    skip: True
+    no_image_features: False
+
+    image_height: ${data.image.h}
+    image_width: ${data.image.w}
+
+  cross_view_swap:
+    rel_pos_emb: False
+    q_win_size: [[10, 10], [10, 10], [25, 25]]
+    feat_win_size: [[6, 12], [6, 12], [14, 30]]
+    bev_embedding_flag: [true, false, false]
+
+  bev_embedding:
+    sigma: 1.0
+
+    bev_height: ${data.bev.h}
+    bev_width: ${data.bev.w}
+    h_meters: ${data.bev.h_meters}
+    w_meters: ${data.bev.w_meters}
+    offset: ${data.bev.offset}
+
+    upsample_scales: [2, 4, 8]
+
+decoder:
+  _target_: cross_view_transformer.model.decoder.Decoder
+
+  dim: 128
+  blocks: [128, 128, 64]
+  residual: True
+  factor: 2
