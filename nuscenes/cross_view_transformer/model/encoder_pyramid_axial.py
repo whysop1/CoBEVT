@@ -1,4 +1,4 @@
-
+'''
 
 import sys
 import torch
@@ -512,6 +512,458 @@ class PyramidAxialEncoder(nn.Module):
 
 
 
+
+if __name__ == "__main__":
+    import os
+    import re
+    import yaml
+    def load_yaml(file):
+        stream = open(file, 'r')
+        loader = yaml.Loader
+        loader.add_implicit_resolver(
+            u'tag:yaml.org,2002:float',
+            re.compile(u'''^(?:
+            [-+]?(?:[0-9][0-9_]*)\\.[0-9_]*(?:[eE][-+]?[0-9]+)?
+            |[-+]?(?:[0-9][0-9_]*)(?:[eE][-+]?[0-9]+)
+            |\\.[0-9_]+(?:[eE][-+][0-9]+)?
+            |[-+]?[0-9][0-9_]*(?::[0-5]?[0-9])+\\.[0-9_]*
+            |[-+]?\\.(?:inf|Inf|INF)
+            |\\.(?:nan|NaN|NAN))$''', re.X),
+            list(u'-+0123456789.'))
+        param = yaml.load(stream, Loader=loader)
+        if "yaml_parser" in param:
+            param = eval(param["yaml_parser"])(param)
+        return param
+
+    os.environ['CUDA_VISIBLE_DEVICES'] = '0,1'
+
+    block = CrossWinAttention(dim=128,
+                              heads=4,
+                              dim_head=32,
+                              qkv_bias=True,)
+    block.cuda()
+    test_q = torch.rand(1, 6, 5, 5, 5, 5, 128)
+    test_k = test_v = torch.rand(1, 6, 5, 5, 6, 12, 128)
+    test_q = test_q.cuda()
+    test_k = test_k.cuda()
+    test_v = test_v.cuda()
+
+    # test pad divisible
+    # output = block.pad_divisble(x=test_data, win_h=6, win_w=12)
+    output = block(test_q, test_k, test_v)
+    print(output.shape)
+
+    # block = CrossViewSwapAttention(
+    #     feat_height=28,
+    #     feat_width=60,
+    #     feat_dim=128,
+    #     dim=128,
+    #     index=0,
+    #     image_height=25,
+    #     image_width=25,
+    #     qkv_bias=True,
+    #     q_win_size=[5, 5],
+    #     feat_win_size=[6, 12],
+    #     heads=[4,],
+    #     dim_head=[32,],
+    #     qkv_bias=True,)
+
+    image = torch.rand(1, 6, 128, 28, 60)            # b n c h w
+    I_inv = torch.rand(1, 6, 3, 3)           # b n 3 3
+    E_inv = torch.rand(1, 6, 4, 4)           # b n 4 4
+
+    feature = torch.rand(1, 6, 128, 25, 25)
+
+    x = torch.rand(1, 128, 25, 25)                     # b d H W
+
+    # output = block(0, x, self.bev_embedding, feature, I_inv, E_inv)
+    block.cuda()
+
+    ##### EncoderSwap
+    params = load_yaml('config/model/cvt_pyramid_swap.yaml')
+
+    print(params)
+
+    batch = {}
+    batch['image'] = image
+    batch['intrinsics'] = I_inv
+    batch['extrinsics'] = E_inv
+
+    out = encoder(batch)
+
+    print(out.shape)
+
+'''
+
+import sys
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+
+from torch import einsum
+from einops import rearrange, repeat
+from torchvision.models.resnet import Bottleneck
+from typing import List
+
+from .decoder import DecoderBlock
+
+ResNetBottleNeck = lambda c: Bottleneck(c, c // 4)
+
+def generate_grid(height: int, width: int):
+    xs = torch.linspace(0, 1, width)
+    ys = torch.linspace(0, 1, height)
+    indices = torch.stack(torch.meshgrid((xs, ys), indexing='xy'), 0)
+    indices = F.pad(indices, (0, 0, 0, 0, 0, 1), value=1)
+    indices = indices[None]
+    return indices
+
+def get_view_matrix(h=200, w=200, h_meters=100.0, w_meters=100.0, offset=0.0):
+    sh = h / h_meters
+    sw = w / w_meters
+    return [
+        [ 0., -sw, w/2.],
+        [-sh,  0., h*offset + h/2.],
+        [ 0.,   0., 1.],
+    ]
+
+class Normalize(nn.Module):
+    def __init__(self, mean=[0.485,0.456,0.406], std=[0.229,0.224,0.225]):
+        super().__init__()
+        self.register_buffer('mean', torch.tensor(mean)[None,:,None,None], persistent=False)
+        self.register_buffer('std', torch.tensor(std)[None,:,None,None], persistent=False)
+
+    def forward(self, x):
+        return (x - self.mean) / self.std
+
+class BEVEmbedding(nn.Module):
+    def __init__(self, dim:int, sigma:int, bev_height:int, bev_width:int, h_meters:int, w_meters:int, offset:int, upsample_scales:list, num_clusters:int=10):
+        super().__init__()
+        self.num_clusters = num_clusters
+        self.dim = dim
+        h = bev_height // upsample_scales[0]
+        w = bev_width // upsample_scales[0]
+        V = get_view_matrix(bev_height, bev_width, h_meters, w_meters, offset)
+        V_inv = torch.FloatTensor(V).inverse()
+        for i, scale in enumerate(upsample_scales):
+            hh = bev_height // scale
+            ww = bev_width // scale
+            grid = generate_grid(hh, ww).squeeze(0)
+            grid[0] *= bev_width
+            grid[1] *= bev_height
+            grid = V_inv @ rearrange(grid, 'd h w -> d (h w)')
+            grid = rearrange(grid, 'd (h w) -> d h w', h=hh, w=ww)
+            self.register_buffer(f'grid{i}', grid, persistent=False)
+        self.learned_features = nn.Parameter(sigma * torch.randn(num_clusters, dim, h, w))
+
+    def get_prior(self, cluster_ids: torch.Tensor):
+        assert cluster_ids.dtype == torch.long
+        flat = cluster_ids.view(-1)
+        sel = self.learned_features[flat]
+        b,n = cluster_ids.shape
+        sel = sel.view(b, n, *self.learned_features.shape[1:])
+        return sel.mean(dim=1)
+
+class CrossWinAttention(nn.Module):
+    def __init__(self, dim, heads, dim_head, qkv_bias, rel_pos_emb=False, norm=nn.LayerNorm):
+        super().__init__()
+
+        self.scale = dim_head ** -0.5
+
+        self.heads = heads
+        self.dim_head = dim_head
+        self.rel_pos_emb = rel_pos_emb
+
+        self.to_q = nn.Sequential(norm(dim), nn.Linear(dim, heads * dim_head, bias=qkv_bias))
+        self.to_k = nn.Sequential(norm(dim), nn.Linear(dim, heads * dim_head, bias=qkv_bias))
+        self.to_v = nn.Sequential(norm(dim), nn.Linear(dim, heads * dim_head, bias=qkv_bias))
+
+        self.proj = nn.Linear(heads * dim_head, dim)
+
+    def add_rel_pos_emb(self, x):
+        return x
+
+    def forward(self, q, k, v, skip=None):
+        """
+        q: (b n X Y W1 W2 d)
+        k: (b n x y w1 w2 d)
+        v: (b n x y w1 w2 d)
+        return: (b X Y W1 W2 d)
+        """
+        assert k.shape == v.shape
+        _, view_size, q_height, q_width, q_win_height, q_win_width, _ = q.shape
+        _, _, kv_height, kv_width, _, _, _ = k.shape
+        assert q_height * q_width == kv_height * kv_width
+
+        # flattening
+        q = rearrange(q, 'b n x y w1 w2 d -> b (x y) (n w1 w2) d')
+        k = rearrange(k, 'b n x y w1 w2 d -> b (x y) (n w1 w2) d')
+        v = rearrange(v, 'b n x y w1 w2 d -> b (x y) (n w1 w2) d')
+
+        # Project with multiple heads
+        q = self.to_q(q)                                # b (X Y) (n W1 W2) (heads dim_head)
+        k = self.to_k(k)                                # b (X Y) (n w1 w2) (heads dim_head)
+        v = self.to_v(v)                                # b (X Y) (n w1 w2) (heads dim_head)
+
+        # Group the head dim with batch dim
+        q = rearrange(q, 'b ... (m d) -> (b m) ... d', m=self.heads, d=self.dim_head)
+        k = rearrange(k, 'b ... (m d) -> (b m) ... d', m=self.heads, d=self.dim_head)
+        v = rearrange(v, 'b ... (m d) -> (b m) ... d', m=self.heads, d=self.dim_head)
+
+        # Dot product attention along cameras
+        dot = self.scale * torch.einsum('b l Q d, b l K d -> b l Q K', q, k)  # b (X Y) (n W1 W2) (n w1 w2)
+        # dot = rearrange(dot, 'b l n Q K -> b l Q (n K)')  # b (X Y) (W1 W2) (n w1 w2)
+
+        if self.rel_pos_emb:
+            dot = self.add_rel_pos_emb(dot)
+        att = dot.softmax(dim=-1)
+
+        # Combine values (image level features).
+        a = torch.einsum('b n Q K, b n K d -> b n Q d', att, v)  # b (X Y) (n W1 W2) d
+        a = rearrange(a, '(b m) ... d -> b ... (m d)', m=self.heads, d=self.dim_head)
+        a = rearrange(a, ' b (x y) (n w1 w2) d -> b n x y w1 w2 d',
+            x=q_height, y=q_width, w1=q_win_height, w2=q_win_width)
+
+        # Combine multiple heads
+        z = self.proj(a)
+
+        # reduce n: (b n X Y W1 W2 d) -> (b X Y W1 W2 d)
+        z = z.mean(1)  # for sequential usage, we cannot reduce it!
+
+        # Optional skip connection
+        if skip is not None:
+            z = z + skip
+        return z
+
+class CrossViewSwapAttention(nn.Module):
+    def __init__(
+        self,
+        feat_height: int,
+        feat_width: int,
+        feat_dim: int,
+        dim: int,
+        index: int,
+        image_height: int,
+        image_width: int,
+        qkv_bias: bool,
+        q_win_size: list,
+        feat_win_size: list,
+        heads: list,
+        dim_head: list,
+        bev_embedding_flag: list,
+        rel_pos_emb: bool = False,
+        no_image_features: bool = False,
+        skip: bool = True,
+        norm=nn.LayerNorm,
+    ):
+        super().__init__()
+        self.feature_linear = nn.Sequential(
+            nn.BatchNorm2d(feat_dim),
+            nn.ReLU(),
+            nn.Conv2d(feat_dim, dim, 1, bias=False))
+
+        self.feature_proj = None if no_image_features else nn.Sequential(
+            nn.BatchNorm2d(feat_dim),
+            nn.ReLU(),
+            nn.Conv2d(feat_dim, dim, 1, bias=False))
+
+        self.bev_embed_flag = bev_embedding_flag[index]
+        if self.bev_embed_flag:
+            self.bev_embed = nn.Conv2d(2, dim, 1)
+        self.img_embed = nn.Conv2d(4, dim, 1, bias=False)
+        self.cam_embed = nn.Conv2d(4, dim, 1, bias=False)
+
+        self.q_win_size = q_win_size[index]
+        self.feat_win_size = feat_win_size[index]
+        self.cross_win_attend_1 = CrossWinAttention(dim, heads[index], dim_head[index], qkv_bias)
+        self.cross_win_attend_2 = CrossWinAttention(dim, heads[index], dim_head[index], qkv_bias)
+        self.skip = skip
+        self.prenorm_1 = norm(dim)
+        self.prenorm_2 = norm(dim)
+        self.mlp_1 = nn.Sequential(nn.Linear(dim, 2 * dim), nn.GELU(), nn.Linear(2 * dim, dim))
+        self.mlp_2 = nn.Sequential(nn.Linear(dim, 2 * dim), nn.GELU(), nn.Linear(2 * dim, dim))
+        self.postnorm = norm(dim)
+
+        self.register_buffer('image_plane', generate_grid(feat_height, feat_width)[None], persistent=False)
+        self.image_plane[:, :, 0] *= image_width
+        self.image_plane[:, :, 1] *= image_height
+
+    def pad_divisible(self, x, win_h, win_w):
+        _, _, _, h, w = x.shape
+        h_pad = ((h + win_h - 1) // win_h) * win_h
+        w_pad = ((w + win_w - 1) // win_w) * win_w
+        padh = h_pad - h
+        padw = w_pad - w
+        return F.pad(x, (0, padw, 0, padh), value=0)
+
+    def forward(
+        self,
+        index: int,
+        x: torch.Tensor,
+        bev: BEVEmbedding,
+        feature: torch.Tensor,
+        I_inv: torch.Tensor,
+        E_inv: torch.Tensor,
+        cluster_ids: torch.Tensor,
+    ):
+        b, n, _, _, _ = feature.shape
+        _, _, H, W = x.shape
+
+        pixel = self.image_plane
+        _, _, _, h, w = pixel.shape
+
+        c = E_inv[..., -1:]
+        c_flat = rearrange(c, 'b n ... -> (b n) ...')[..., None]
+        c_embed = self.cam_embed(c_flat)
+
+        pixel_flat = rearrange(pixel, '... h w -> ... (h w)')
+        cam = I_inv @ pixel_flat
+        cam = F.pad(cam, (0, 0, 0, 1, 0, 0, 0, 0), value=1)
+        d = E_inv @ cam
+        d_flat = rearrange(d, 'b n d (h w) -> (b n) d h w', h=h, w=w)
+        d_embed = self.img_embed(d_flat)
+
+        img_embed = d_embed - c_embed
+        img_embed = img_embed / (img_embed.norm(dim=1, keepdim=True) + 1e-7)
+
+        if self.bev_embed_flag:
+            grid = getattr(bev, f'grid{index}')[:2]
+            w_embed = self.bev_embed(grid[None])
+            bev_embed = w_embed - c_embed
+            bev_embed = bev_embed / (bev_embed.norm(dim=1, keepdim=True) + 1e-7)
+            query_pos = rearrange(bev_embed, '(b n) ... -> b n ...', b=b, n=n)
+
+        feature_flat = rearrange(feature, 'b n ... -> (b n) ...')
+        key_flat = img_embed + self.feature_proj(feature_flat) if self.feature_proj else img_embed
+        val_flat = self.feature_linear(feature_flat)
+
+        # 클러스터 기반 positional embedding 적용
+        if self.bev_embed_flag:
+            cluster_bev = bev.get_prior(cluster_ids)
+            query = query_pos + cluster_bev[:, None]
+        else:
+            query = x[:, None]  # (B, N, D, H, W)
+
+        key = rearrange(key_flat, '(b n) ... -> b n ...', b=b, n=n)
+        val = rearrange(val_flat, '(b n) ... -> b n ...', b=b, n=n)
+
+        # 나머지 attention 연산 (cross_win_attend_1, 2)...
+        # 아래에 계속됨
+         # pad divisible
+                # padding to fit window size
+        key = self.pad_divisible(key, self.feat_win_size[0], self.feat_win_size[1])
+        val = self.pad_divisible(val, self.feat_win_size[0], self.feat_win_size[1])
+
+        # window partition
+        query = rearrange(query, 'b n d (x w1) (y w2) -> b n x y w1 w2 d',
+                          w1=self.q_win_size[0], w2=self.q_win_size[1])
+        key = rearrange(key, 'b n d (x w1) (y w2) -> b n x y w1 w2 d',
+                        w1=self.feat_win_size[0], w2=self.feat_win_size[1])
+        val = rearrange(val, 'b n d (x w1) (y w2) -> b n x y w1 w2 d',
+                        w1=self.feat_win_size[0], w2=self.feat_win_size[1])
+
+        # cross attention 1
+        x_skip = rearrange(x, 'b d (x w1) (y w2) -> b x y w1 w2 d',
+                           w1=self.q_win_size[0], w2=self.q_win_size[1]) if self.skip else None
+        query = self.cross_win_attend_1(query, key, val, skip=x_skip)
+        query = rearrange(query, 'b x y w1 w2 d -> b (x w1) (y w2) d')
+        query = query + self.mlp_1(self.prenorm_1(query))
+        x_skip = query
+
+        # cross attention 2
+        query = repeat(query, 'b x y d -> b n x y d', n=n)
+        query = rearrange(query, 'b n (x w1) (y w2) d -> b n x y w1 w2 d',
+                          w1=self.q_win_size[0], w2=self.q_win_size[1])
+        key = rearrange(key, 'b n x y w1 w2 d -> b n (x w1) (y w2) d')
+        val = rearrange(val, 'b n x y w1 w2 d -> b n (x w1) (y w2) d')
+        key = rearrange(key, 'b n (x w1) (y w2) d -> b n x y w1 w2 d',
+                        w1=self.feat_win_size[0], w2=self.feat_win_size[1])
+        val = rearrange(val, 'b n (x w1) (y w2) d -> b n x y w1 w2 d',
+                        w1=self.feat_win_size[0], w2=self.feat_win_size[1])
+        x_skip = rearrange(x_skip, 'b (x w1) (y w2) d -> b x y w1 w2 d',
+                           w1=self.q_win_size[0], w2=self.q_win_size[1]) if self.skip else None
+        query = self.cross_win_attend_2(query, key, val, skip=x_skip)
+        query = rearrange(query, 'b x y w1 w2 d -> b (x w1) (y w2) d')
+        query = query + self.mlp_2(self.prenorm_2(query))
+        query = self.postnorm(query)
+        return rearrange(query, 'b H W d -> b d H W')
+
+class PyramidAxialEncoder(nn.Module):
+    def __init__(self, backbone, cross_view, cross_view_swap, bev_embedding, self_attn, dim:List[int], middle:List[int], scale:float=1.0):
+        super().__init__()
+        self.norm = Normalize()
+        self.backbone = backbone
+        self.down = lambda x: F.interpolate(x, scale_factor=scale) if scale < 1.0 else x
+        self.cross_views = nn.ModuleList()
+        self.layers = nn.ModuleList()
+        self.downsample_layers = nn.ModuleList()
+        for i,(feat_shape, num_layers) in enumerate(zip(backbone.output_shapes, middle)):
+            _, feat_dim, H, W = self.down(torch.zeros(feat_shape)).shape
+            cva = CrossViewSwapAttention(feat_height=H, feat_width=W, feat_dim=feat_dim, dim=dim[i], index=i,
+                                          image_height=feat_shape[2], image_width=feat_shape[3],
+                                          qkv_bias=True, heads=cross_view['heads'][i],
+                                          dim_head=cross_view['dim_head'][i],
+                                          q_win_size=cross_view['q_win_size'],
+                                          feat_win_size=cross_view['feat_win_size'],
+                                          bev_embedding_flag=cross_view['bev_embedding_flag'],
+                                          no_image_features=cross_view.get('no_image_features', False),
+                                          skip=True)
+            self.cross_views.append(cva)
+            self.layers.append(nn.Sequential(*[ResNetBottleNeck(dim[i]) for _ in range(num_layers)]))
+            if i < len(middle)-1:
+                self.downsample_layers.append(nn.Sequential(
+                    nn.Conv2d(dim[i], dim[i]//2, 3, padding=1, bias=False),
+                    nn.PixelUnshuffle(2),
+                    nn.Conv2d(dim[i+1], dim[i+1], 3, padding=1, bias=False),
+                    nn.BatchNorm2d(dim[i+1]),
+                    nn.ReLU(inplace=True),
+                    nn.Conv2d(dim[i+1], dim[i+1], 1, bias=False),
+                    nn.BatchNorm2d(dim[i+1])
+                ))
+        self.bev_embedding = bev_embedding
+        self.self_attn = None  # optional
+        self.dim = dim
+        self.middle = middle
+
+    def forward(self, batch):
+        # BEV 객체 수 읽기
+        bev_obj_count = batch.get('bev_obj_count', None)
+        repeat_times = self._decide_repeats(bev_obj_count)
+
+        b,n,_,_,_ = batch['image'].shape
+        image = batch['image'].flatten(0,1)
+        I_inv = batch['intrinsics'].inverse()
+        E_inv = batch['extrinsics'].inverse()
+        cluster_ids = batch['camera_cluster_ids']
+        if isinstance(cluster_ids, list):
+            cluster_ids = torch.cat(cluster_ids, dim=0).view(b, n).long().to(image.device)
+        else:
+            cluster_ids = cluster_ids.long().to(image.device)
+
+        features = [f.view(b,n,*f.shape[1:]) for f in self.backbone(self.norm(image))]
+        features = [self.down(f.flatten(0,1)).view(b,n,*f.shape[1:]) for f in features]
+        x = self.bev_embedding.get_prior(cluster_ids)
+
+        for _ in range(repeat_times):
+            for i,(cva,layer) in enumerate(zip(self.cross_views, self.layers)):
+                feat = features[i]
+                x = cva(i, x, self.bev_embedding, feat, I_inv, E_inv, cluster_ids)
+                x = layer(x)
+                if i < len(self.downsample_layers):
+                    x = self.downsample_layers[i](x)
+
+        if self.self_attn:
+            x = self.self_attn(x)
+        return x
+
+    def _decide_repeats(self, bev_obj_count):
+        if bev_obj_count is None:
+            return 1
+        if bev_obj_count < 5:
+            return 1
+        elif bev_obj_count < 15:
+            return 2
+        else:
+            return 3
 
 if __name__ == "__main__":
     import os
