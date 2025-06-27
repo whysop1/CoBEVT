@@ -65,8 +65,8 @@
 model:
   _target_: cross_view_transformer.model.encoder_pyramid_axial.PyramidAxialEncoder
   backbone:
-    _target_: cross_view_transformer.model.backbones.efficientnet.EfficientNetBackbone  # 수정된 부분
-    arch: efficientnet_b4
+    _target_: cross_view_transformer.model.backbones.efficientnet.EfficientNetBackbone
+    arch: efficientnet-b4     # ← 하이픈(-)으로 수정됨
     pretrained: true
   cross_view:
     heads: [8, 8, 8]
@@ -76,7 +76,7 @@ model:
     bev_embedding_flag: [true, true, true]
     no_image_features: false
   cross_view_swap:
-    # 필요시 내용 추가, 현재 예시로 비워둠
+    # 필요시 내용 추가
   bev_embedding:
     _target_: cross_view_transformer.bev_embedding.BEVEmbedding
     bev_size: [200, 200]
