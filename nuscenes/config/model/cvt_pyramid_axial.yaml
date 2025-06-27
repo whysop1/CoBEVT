@@ -97,13 +97,13 @@ encoder:
 
     image_height: ${data.image.h}
     image_width: ${data.image.w}
-    
-    q_win_size: [[10, 10], [10, 10], [25, 25]]   # ← 추가된 부분
+
+    q_win_size: [[10, 10], [10, 10], [25, 25]]    # 여기에 추가
 
   cross_view_swap:
     rel_pos_emb: False
     q_win_size: [[10, 10], [10, 10], [25, 25]]
-    feat_win_size: [[6, 12], [6, 12], [14, 30]]
+    feat_win_size: [[6, 12], [6, 12], [14, 30]]   # 여기에 추가
     bev_embedding_flag: [true, false, false]
 
   bev_embedding:
@@ -124,3 +124,4 @@ decoder:
   blocks: [128, 128, 64]
   residual: True
   factor: 2
+
