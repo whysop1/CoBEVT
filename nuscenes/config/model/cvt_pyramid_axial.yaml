@@ -62,59 +62,62 @@
 
 # cvt_pyramid_axial.yaml (수정본 예시)
 
-outputs:
-  bev: [0, 1]
+model:
+  _target_: cross_view_transformer.model.cvt.CrossViewTransformer  # 보통 이렇게 시작
+  encoder:
+    _target_: cross_view_transformer.model.encoder_pyramid_axial.PyramidAxialEncoder
+    backbone:
+      _target_: cross_view_transformer.model.backbones.efficientnet.EfficientNetExtractor
+      model_name: efficientnet-b4
+      layer_names: ['reduction_2', 'reduction_3', 'reduction_4']
+      image_height: ${data.image.h}
+      image_width: ${data.image.w}
+    self_attn:
+      dim_head: 32
+      dropout: 0.1
+      window_size: 25
+    cross_view:
+      heads: [1, 2, 4]
+      dim_head: [32, 32, 32]
+      qkv_bias: True
+      skip: True
+      no_image_features: False
+      image_height: ${data.image.h}
+      image_width: ${data.image.w}
+    cross_view_swap:
+      rel_pos_emb: False
+      q_win_size: [[10, 10], [10, 10], [25, 25]]
+      feat_win_size: [[6, 12], [6, 12], [14, 30]]
+      bev_embedding_flag: [true, false, false]
+    bev_embedding:
+      sigma: 1.0
+      bev_height: ${data.bev.h}
+      bev_width: ${data.bev.w}
+      h_meters: ${data.bev.h_meters}
+      w_meters: ${data.bev.w_meters}
+      offset: ${data.bev.offset}
+      upsample_scales: [2, 4, 8]
+  decoder:
+    _target_: cross_view_transformer.model.decoder.Decoder
+    dim: 128
+    blocks: [128, 128, 64]
+    residual: True
+    factor: 2
 
-encoder:
-  _target_: cross_view_transformer.model.encoder_pyramid_axial.PyramidAxialEncoder
+data:
+  image:
+    h: 224
+    w: 480
+    top_crop: 46
+  bev:
+    h: 200
+    w: 200
+    h_meters: 100.0
+    w_meters: 100.0
+    offset: 0.0
 
-  dim: [32, 64, 128]
-  scale: 1.0
-  middle: [2, 2, 2]
+training:
+  batch_size: 8
+  lr: 5e-3
+  epochs: 100
 
-  backbone:
-    _target_: cross_view_transformer.model.backbones.efficientnet.EfficientNetExtractor
-    model_name: efficientnet-b4
-    layer_names: ['reduction_2', 'reduction_3', 'reduction_4']
-    image_height: ${data.image.h}
-    image_width: ${data.image.w}
-
-  self_attn:
-    dim_head: 32
-    dropout: 0.1
-    window_size: 25
-
-  cross_view:
-    heads: [1, 2, 4]
-    dim_head: [32, 32, 32]
-    qkv_bias: True
-    skip: True
-    no_image_features: False
-
-    image_height: ${data.image.h}
-    image_width: ${data.image.w}
-
-  cross_view_swap:
-    rel_pos_emb: False
-    q_win_size: [[10, 10], [10, 10], [25, 25]]
-    feat_win_size: [[6, 12], [6, 12], [14, 30]]
-    bev_embedding_flag: [true, false, false]
-
-  bev_embedding:
-    sigma: 1.0
-
-    bev_height: ${data.bev.h}
-    bev_width: ${data.bev.w}
-    h_meters: ${data.bev.h_meters}
-    w_meters: ${data.bev.w_meters}
-    offset: ${data.bev.offset}
-
-    upsample_scales: [2, 4, 8]
-
-decoder:
-  _target_: cross_view_transformer.model.decoder.Decoder
-
-  dim: 128
-  blocks: [128, 128, 64]
-  residual: True
-  factor: 2
