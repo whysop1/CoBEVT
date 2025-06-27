@@ -98,7 +98,8 @@ encoder:
     image_width: ${data.image.w}
 
     q_win_size: [[10, 10], [10, 10], [25, 25]]
-    feat_win_size: [[6, 12], [6, 12], [14, 30]]  # 여기에 꼭 추가
+    feat_win_size: [[6, 12], [6, 12], [14, 30]]
+    bev_embedding_flag: [true, false, false]
 
   cross_view_swap:
     rel_pos_emb: False
