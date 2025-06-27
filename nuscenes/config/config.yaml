@@ -58,7 +58,7 @@
 defaults:
   - _self_
 
-  - model: cvt_pyramid_axial_nuscenes_vehicle  # <- 필요한 모델 config 참조
+  - model: cvt_pyramid_axial  # <- 필요한 모델 config 참조
   - data: ???                                   # <- 이건 여전히 채워야 함
   - visualization: null
 
