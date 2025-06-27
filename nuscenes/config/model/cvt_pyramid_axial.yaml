@@ -88,8 +88,8 @@ encoder:
     window_size: 25
 
   cross_view:
-    heads: [1, 2, 4]
-    dim_head: [32, 32, 32]
+    heads: [1, 2, 4]             # 리스트 형태로 꼭 맞춰야 함
+    dim_head: [32, 32, 32]       # 리스트 형태로 꼭 맞춰야 함
     qkv_bias: True
     skip: True
     no_image_features: False
@@ -125,3 +125,4 @@ decoder:
   blocks: [128, 128, 64]
   residual: True
   factor: 2
+
