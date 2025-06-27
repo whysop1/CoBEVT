@@ -1,3 +1,4 @@
+#클러스터링하며 내가 직접 새로 추가한 파일
 # tools/cluster_camera_pose.py
 
 import numpy as np
@@ -43,6 +44,6 @@ if __name__ == "__main__":
     main(
         nusc_path='/content/drive/MyDrive/datasets/nuscenes',  # 반드시 실제 경로로 수정
         version='v1.0-trainval',
-        num_clusters=20,   #전엔 10으로 실험
+        num_clusters=10,   #전엔 10으로 실험
         out_path='cluster_camera_pose_id.npy'
     )
