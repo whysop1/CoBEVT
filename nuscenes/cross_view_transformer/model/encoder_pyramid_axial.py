@@ -647,10 +647,21 @@ class Normalize(nn.Module):
         return (x - self.mean) / self.std
 
 class BEVEmbedding(nn.Module):
-    def __init__(self, dim:int, sigma:int, bev_height:int, bev_width:int, h_meters:int, w_meters:int, offset:int, upsample_scales:list, num_clusters:int=10):
+    def __init__(
+        self,
+        dim: int,
+        sigma: int,
+        bev_size: tuple,      # (bev_height, bev_width) 형태로 받도록 변경
+        h_meters: int,
+        w_meters: int,
+        offset: int,
+        upsample_scales: list,
+        num_clusters: int = 10,
+    ):
         super().__init__()
         self.num_clusters = num_clusters
         self.dim = dim
+        bev_height, bev_width = bev_size
         h = bev_height // upsample_scales[0]
         w = bev_width // upsample_scales[0]
         V = get_view_matrix(bev_height, bev_width, h_meters, w_meters, offset)
@@ -666,13 +677,6 @@ class BEVEmbedding(nn.Module):
             self.register_buffer(f'grid{i}', grid, persistent=False)
         self.learned_features = nn.Parameter(sigma * torch.randn(num_clusters, dim, h, w))
 
-    def get_prior(self, cluster_ids: torch.Tensor):
-        assert cluster_ids.dtype == torch.long
-        flat = cluster_ids.view(-1)
-        sel = self.learned_features[flat]
-        b,n = cluster_ids.shape
-        sel = sel.view(b, n, *self.learned_features.shape[1:])
-        return sel.mean(dim=1)
 
 class CrossWinAttention(nn.Module):
     def __init__(self, dim, heads, dim_head, qkv_bias, rel_pos_emb=False, norm=nn.LayerNorm):
