@@ -291,19 +291,19 @@ if __name__ == '__main__':
         print(model_name, ':', {k: v for k, v in record})
 
 class EfficientNetBackbone(nn.Module):
-    def __init__(self,
-                 arch: str = 'efficientnet-b4',
-                 pretrained: bool = True,
-                 layer_names: list = ['reduction_1', 'reduction_2', 'reduction_3', 'reduction_4'],
-                 image_height: int = 224,
-                 image_width: int = 480):
+    def __init__(self, arch='efficientnet-b4', pretrained=True):
         super().__init__()
-        self.extractor = EfficientNetExtractor(
-            layer_names=layer_names,
-            image_height=image_height,
-            image_width=image_width,
-            model_name=arch
-        )
+        self.backbone = timm.create_model(arch, features_only=True, pretrained=pretrained)
+        
+        # ✅ 추가: output_shapes 정의
+        # 아래 채널 수는 efficientnet-b4 기준. 필요 시 print로 직접 확인 가능
+        self.output_shapes = [
+            (24, 100, 100),   # stage1
+            (32, 50, 50),     # stage2
+            (112, 25, 25),    # stage3
+        ]
 
     def forward(self, x):
-        return self.extractor(x)
+        feats = self.backbone(x)  # List of feature maps
+        return feats
+
