@@ -913,8 +913,16 @@ class PyramidAxialEncoder(nn.Module):
         self.cross_views = nn.ModuleList()
         self.layers = nn.ModuleList()
         self.downsample_layers = nn.ModuleList()
-        for i,(feat_shape, num_layers) in enumerate(zip(backbone.output_shapes, middle)):
-            _, feat_dim, H, W = self.down(torch.zeros(feat_shape)).shape
+
+        print("Backbone output_shapes:", backbone.output_shapes)
+        
+        for i, (feat_shape, num_layers) in enumerate(zip(backbone.output_shapes, middle)):
+            if len(feat_shape) == 3:
+                dummy_input = torch.zeros(1, *feat_shape)  # Ensure batch dimension
+            else:
+                dummy_input = torch.zeros(feat_shape)
+            _, feat_dim, H, W = self.down(dummy_input).shape
+
             cva = CrossViewSwapAttention(feat_height=H, feat_width=W, feat_dim=feat_dim, dim=dim[i], index=i,
                                           image_height=feat_shape[2], image_width=feat_shape[3],
                                           qkv_bias=True, heads=cross_view['heads'][i],
