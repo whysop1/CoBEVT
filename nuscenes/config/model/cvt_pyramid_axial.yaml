@@ -64,10 +64,12 @@
 
 model:
   _target_: cross_view_transformer.model.encoder_pyramid_axial.PyramidAxialEncoder
+
   backbone:
     _target_: cross_view_transformer.model.backbones.efficientnet.EfficientNetBackbone
-    arch: efficientnet-b4     # ← 하이픈(-)으로 수정됨
+    arch: efficientnet-b4
     pretrained: true
+
   cross_view:
     heads: [8, 8, 8]
     dim_head: [64, 64, 64]
@@ -75,12 +77,21 @@ model:
     feat_win_size: [16, 16]
     bev_embedding_flag: [true, true, true]
     no_image_features: false
+
   cross_view_swap:
     # 필요시 내용 추가
+
   bev_embedding:
-    _target_: cross_view_transformer.model.encoder_pyramid_axial.BEVEmbedding  # ✅ 경로 수정됨
+    _target_: cross_view_transformer.model.encoder_pyramid_axial.BEVEmbedding
     bev_size: [200, 200]
-    bev_dim: 128
+    dim: 128                    # ✅ 올바른 키로 수정됨
+    sigma: 0.1                  # ✅ 누락된 필수 인자 추가
+    h_meters: 100
+    w_meters: 100
+    offset: 0
+    upsample_scales: [4, 2, 1]
+    num_clusters: 10
+
   self_attn: null
   dim: [128, 128, 128]
   middle: [3, 3, 3]
