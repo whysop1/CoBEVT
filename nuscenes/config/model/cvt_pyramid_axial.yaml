@@ -78,7 +78,7 @@ model:
   cross_view_swap:
     # 필요시 내용 추가
   bev_embedding:
-    _target_: cross_view_transformer.bev_embedding.BEVEmbedding
+    _target_: cross_view_transformer.model.encoder_pyramid_axial.BEVEmbedding  # ✅ 경로 수정됨
     bev_size: [200, 200]
     bev_dim: 128
   self_attn: null
@@ -94,3 +94,4 @@ training:
   batch_size: 8
   lr: 1e-4
   epochs: 100
+
