@@ -924,7 +924,7 @@ class PyramidAxialEncoder(nn.Module):
             _, feat_dim, H, W = self.down(dummy_input).shape
 
             cva = CrossViewSwapAttention(feat_height=H, feat_width=W, feat_dim=feat_dim, dim=dim[i], index=i,
-                                          image_height=feat_shape[2], image_width=feat_shape[3],
+                                          image_height=feat_shape[1], image_width=feat_shape[2],
                                           qkv_bias=True, heads=cross_view['heads'][i],
                                           dim_head=cross_view['dim_head'][i],
                                           q_win_size=cross_view['q_win_size'],
