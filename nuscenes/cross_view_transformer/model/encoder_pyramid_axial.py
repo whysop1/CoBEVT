@@ -751,6 +751,13 @@ class CrossWinAttention(nn.Module):
             z = z + skip
         return z
 
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+from einops import rearrange, repeat
+
+# CrossWinAttention, generate_grid, BEVEmbedding 등은 별도로 정의되어 있다고 가정
+
 class CrossViewSwapAttention(nn.Module):
     def __init__(
         self,
@@ -776,12 +783,14 @@ class CrossViewSwapAttention(nn.Module):
         self.feature_linear = nn.Sequential(
             nn.BatchNorm2d(feat_dim),
             nn.ReLU(),
-            nn.Conv2d(feat_dim, dim, 1, bias=False))
+            nn.Conv2d(feat_dim, dim, 1, bias=False)
+        )
 
         self.feature_proj = None if no_image_features else nn.Sequential(
             nn.BatchNorm2d(feat_dim),
             nn.ReLU(),
-            nn.Conv2d(feat_dim, dim, 1, bias=False))
+            nn.Conv2d(feat_dim, dim, 1, bias=False)
+        )
 
         self.bev_embed_flag = bev_embedding_flag[index]
         if self.bev_embed_flag:
@@ -797,7 +806,6 @@ class CrossViewSwapAttention(nn.Module):
         print("dim_head:", dim_head)
         print("index:", index)
 
-        
         self.cross_win_attend_1 = CrossWinAttention(dim, heads[index], dim_head[index], qkv_bias)
         self.cross_win_attend_2 = CrossWinAttention(dim, heads[index], dim_head[index], qkv_bias)
         self.skip = skip
@@ -812,6 +820,7 @@ class CrossViewSwapAttention(nn.Module):
         self.image_plane[:, :, 1] *= image_height
 
     def pad_divisible(self, x, win_h, win_w):
+        # x shape: (B, N, D, H, W) or (B, N, D, H, W)
         _, _, _, h, w = x.shape
         h_pad = ((h + win_h - 1) // win_h) * win_h
         w_pad = ((w + win_w - 1) // win_w) * win_w
@@ -822,9 +831,9 @@ class CrossViewSwapAttention(nn.Module):
     def forward(
         self,
         index: int,
-        x: torch.Tensor,
-        bev: BEVEmbedding,
-        feature: torch.Tensor,
+        x: torch.Tensor,             # (B, D, H, W)
+        bev: 'BEVEmbedding',
+        feature: torch.Tensor,       # (B, N, C, Hf, Wf)
         I_inv: torch.Tensor,
         E_inv: torch.Tensor,
         cluster_ids: torch.Tensor,
@@ -833,11 +842,11 @@ class CrossViewSwapAttention(nn.Module):
         _, _, H, W = x.shape
 
         pixel = self.image_plane
-        _, _, _, h, w = pixel.shape
+        _, _, _, h, w = pixel.shape  # h, w == feat_height, feat_width
 
-        c = E_inv[..., -1:]
+        c = E_inv[..., -1:]           # (B, N, 4, 1)
         c_flat = rearrange(c, 'b n ... -> (b n) ...')[..., None]
-        c_embed = self.cam_embed(c_flat)
+        c_embed = self.cam_embed(c_flat)  # (B*N, dim, 1, 1)
 
         pixel_flat = rearrange(pixel, '... h w -> ... (h w)')
         cam = I_inv @ pixel_flat
@@ -856,28 +865,25 @@ class CrossViewSwapAttention(nn.Module):
             bev_embed = bev_embed / (bev_embed.norm(dim=1, keepdim=True) + 1e-7)
             query_pos = rearrange(bev_embed, '(b n) ... -> b n ...', b=b, n=n)
 
-        feature_flat = rearrange(feature, 'b n ... -> (b n) ...')
-        key_flat = img_embed + self.feature_proj(feature_flat) if self.feature_proj else img_embed
+        feature_flat = rearrange(feature, 'b n c h w -> (b n) c h w')
+        key_flat = img_embed + (self.feature_proj(feature_flat) if self.feature_proj else 0)
         val_flat = self.feature_linear(feature_flat)
 
-        # 클러스터 기반 positional embedding 적용
+        # cluster based positional embedding
         if self.bev_embed_flag:
-            cluster_bev = bev.get_prior(cluster_ids)
-            query = query_pos + cluster_bev[:, None]
+            cluster_bev = bev.get_prior(cluster_ids)  # (B, n, D, H, W) or similar
+            query = query_pos + cluster_bev[:, None]  # Broadcast N dim if necessary
         else:
-            query = x[:, None]  # (B, N, D, H, W)
+            query = x[:, None]  # (B, 1, D, H, W) assuming x has shape (B, D, H, W)
 
-        key = rearrange(key_flat, '(b n) ... -> b n ...', b=b, n=n)
-        val = rearrange(val_flat, '(b n) ... -> b n ...', b=b, n=n)
+        key = rearrange(key_flat, '(b n) c h w -> b n c h w', b=b, n=n)
+        val = rearrange(val_flat, '(b n) c h w -> b n c h w', b=b, n=n)
 
-        # 나머지 attention 연산 (cross_win_attend_1, 2)...
-        # 아래에 계속됨
-         # pad divisible
-                # padding to fit window size
+        # Pad key and val to fit window size
         key = self.pad_divisible(key, self.feat_win_size[0], self.feat_win_size[1])
         val = self.pad_divisible(val, self.feat_win_size[0], self.feat_win_size[1])
 
-        # window partition
+        # Window partition for query, key, val
         query = rearrange(query, 'b n d (x w1) (y w2) -> b n x y w1 w2 d',
                           w1=self.q_win_size[0], w2=self.q_win_size[1])
         key = rearrange(key, 'b n d (x w1) (y w2) -> b n x y w1 w2 d',
@@ -885,31 +891,45 @@ class CrossViewSwapAttention(nn.Module):
         val = rearrange(val, 'b n d (x w1) (y w2) -> b n x y w1 w2 d',
                         w1=self.feat_win_size[0], w2=self.feat_win_size[1])
 
-        # cross attention 1
-        x_skip = rearrange(x, 'b d (x w1) (y w2) -> b x y w1 w2 d',
-                           w1=self.q_win_size[0], w2=self.q_win_size[1]) if self.skip else None
-        query = self.cross_win_attend_1(query, key, val, skip=x_skip)
-        query = rearrange(query, 'b x y w1 w2 d -> b (x w1) (y w2) d')
-        query = query + self.mlp_1(self.prenorm_1(query))
-        x_skip = query
+        # Cross attention 1
+        x_skip = None
+        if self.skip:
+            x_skip = rearrange(x, 'b d (x w1) (y w2) -> b x y w1 w2 d',
+                               w1=self.q_win_size[0], w2=self.q_win_size[1])
 
-        # cross attention 2
-        query = repeat(query, 'b x y d -> b n x y d', n=n)
+        query = self.cross_win_attend_1(query, key, val, skip=x_skip)
+        query = rearrange(query, 'b n x y w1 w2 d -> b n (x w1) (y w2) d')
+        query = query + self.mlp_1(self.prenorm_1(query))
+        x_skip = query[:, 0] if self.skip else None  # Take first camera view or average if needed
+
+        # Cross attention 2
+        # Repeat query for all views
+        query = repeat(query[:, 0], 'b h w d -> b n h w d', n=n)  # broadcasting query across n views
         query = rearrange(query, 'b n (x w1) (y w2) d -> b n x y w1 w2 d',
                           w1=self.q_win_size[0], w2=self.q_win_size[1])
+
+        # Flatten key and val back to original shape (if needed)
         key = rearrange(key, 'b n x y w1 w2 d -> b n (x w1) (y w2) d')
         val = rearrange(val, 'b n x y w1 w2 d -> b n (x w1) (y w2) d')
+
         key = rearrange(key, 'b n (x w1) (y w2) d -> b n x y w1 w2 d',
                         w1=self.feat_win_size[0], w2=self.feat_win_size[1])
         val = rearrange(val, 'b n (x w1) (y w2) d -> b n x y w1 w2 d',
                         w1=self.feat_win_size[0], w2=self.feat_win_size[1])
-        x_skip = rearrange(x_skip, 'b (x w1) (y w2) d -> b x y w1 w2 d',
-                           w1=self.q_win_size[0], w2=self.q_win_size[1]) if self.skip else None
+
+        if self.skip:
+            x_skip = rearrange(x_skip, 'b (x w1) (y w2) d -> b x y w1 w2 d',
+                               w1=self.q_win_size[0], w2=self.q_win_size[1])
+
         query = self.cross_win_attend_2(query, key, val, skip=x_skip)
-        query = rearrange(query, 'b x y w1 w2 d -> b (x w1) (y w2) d')
+        query = rearrange(query, 'b n x y w1 w2 d -> b n (x w1) (y w2) d')
         query = query + self.mlp_2(self.prenorm_2(query))
+        query = rearrange(query, 'b n h w d -> b n d h w')
         query = self.postnorm(query)
-        return rearrange(query, 'b H W d -> b d H W')
+
+        # 보통 출력은 (B, D, H, W) 형태로 리턴한다고 가정, n 카메라 뷰 중 하나만 혹은 평균해서
+        # 여기서는 첫번째 뷰만 리턴
+        return query[:, 0]
 
 class PyramidAxialEncoder(nn.Module):
     def __init__(self, backbone, cross_view, cross_view_swap, bev_embedding, self_attn, dim:List[int], middle:List[int], scale:float=1.0):
