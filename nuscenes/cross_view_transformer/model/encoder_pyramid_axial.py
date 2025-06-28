@@ -791,6 +791,13 @@ class CrossViewSwapAttention(nn.Module):
 
         self.q_win_size = q_win_size[index]
         self.feat_win_size = feat_win_size[index]
+
+        print("dim:", dim)
+        print("heads:", heads)
+        print("dim_head:", dim_head)
+        print("index:", index)
+
+        
         self.cross_win_attend_1 = CrossWinAttention(dim, heads[index], dim_head[index], qkv_bias)
         self.cross_win_attend_2 = CrossWinAttention(dim, heads[index], dim_head[index], qkv_bias)
         self.skip = skip
