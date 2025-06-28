@@ -78,14 +78,13 @@ model:
     bev_embedding_flag: [true, true, true]
     no_image_features: false
 
-  cross_view_swap:
-    # 필요시 내용 추가
+  cross_view_swap: {}
 
   bev_embedding:
     _target_: cross_view_transformer.model.encoder_pyramid_axial.BEVEmbedding
     bev_size: [200, 200]
-    dim: 128                    # ✅ 올바른 키로 수정됨
-    sigma: 0.1                  # ✅ 누락된 필수 인자 추가
+    dim: 128
+    sigma: 0.1
     h_meters: 100
     w_meters: 100
     offset: 0
@@ -93,6 +92,8 @@ model:
     num_clusters: 10
 
   self_attn: null
+
+  # ❗️이 부분이 가장 중요합니다. 반드시 리스트여야 함
   dim: [128, 128, 128]
   middle: [3, 3, 3]
   scale: 1.0
