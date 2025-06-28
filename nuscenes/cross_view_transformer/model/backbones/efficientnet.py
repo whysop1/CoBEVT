@@ -293,6 +293,7 @@ if __name__ == '__main__':
 class EfficientNetBackbone(nn.Module):
     def __init__(self, arch='efficientnet-b4', pretrained=True):
         super().__init__()
+        arch = arch.replace('-', '_')  # 하이픈을 언더바로 변환
         self.backbone = timm.create_model(arch, pretrained=pretrained)
 
         
