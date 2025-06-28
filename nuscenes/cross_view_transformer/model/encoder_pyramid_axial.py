@@ -688,11 +688,13 @@ class CrossWinAttention(nn.Module):
         self.dim_head = dim_head
         self.rel_pos_emb = rel_pos_emb
 
-        self.to_q = nn.Sequential(norm(dim), nn.Linear(dim, heads * dim_head, bias=qkv_bias))
-        self.to_k = nn.Sequential(norm(dim), nn.Linear(dim, heads * dim_head, bias=qkv_bias))
-        self.to_v = nn.Sequential(norm(dim), nn.Linear(dim, heads * dim_head, bias=qkv_bias))
+        # nn.LayerNorm(dim) 을 사용하여 dim 차원 기준 norm 하도록 수정
+        self.to_q = nn.Sequential(nn.LayerNorm(dim), nn.Linear(dim, heads * dim_head, bias=qkv_bias))
+        self.to_k = nn.Sequential(nn.LayerNorm(dim), nn.Linear(dim, heads * dim_head, bias=qkv_bias))
+        self.to_v = nn.Sequential(nn.LayerNorm(dim), nn.Linear(dim, heads * dim_head, bias=qkv_bias))
 
         self.proj = nn.Linear(heads * dim_head, dim)
+
 
     def add_rel_pos_emb(self, x):
         return x
@@ -1010,10 +1012,13 @@ if __name__ == "__main__":
                               qkv_bias=True,)
     block.cuda()
     test_q = torch.rand(1, 6, 5, 5, 5, 5, 128)
-    test_k = test_v = torch.rand(1, 6, 5, 5, 6, 12, 128)
+    test_k = test_v = torch.rand(1, 6, 5, 5, 5, 5, 128)  # 윈도우 크기 맞춤
     test_q = test_q.cuda()
     test_k = test_k.cuda()
     test_v = test_v.cuda()
+
+    output = block(test_q, test_k, test_v)
+    print(output.shape)
 
     # test pad divisible
     # output = block.pad_divisble(x=test_data, win_h=6, win_w=12)
