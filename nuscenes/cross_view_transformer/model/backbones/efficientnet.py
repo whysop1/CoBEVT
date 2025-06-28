@@ -144,7 +144,7 @@ if __name__ == '__main__':
 
         print(model_name, ':', {k: v for k, v in record})
 '''
-
+import timm
 import torch
 import torch.nn as nn
 
