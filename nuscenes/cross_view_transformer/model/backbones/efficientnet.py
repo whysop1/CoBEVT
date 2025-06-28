@@ -293,7 +293,8 @@ if __name__ == '__main__':
 class EfficientNetBackbone(nn.Module):
     def __init__(self, arch='efficientnet-b4', pretrained=True):
         super().__init__()
-        self.backbone = timm.create_model(arch, features_only=True, pretrained=pretrained)
+        self.backbone = timm.create_model(arch, pretrained=pretrained)
+
         
         # ✅ 추가: output_shapes 정의
         # 아래 채널 수는 efficientnet-b4 기준. 필요 시 print로 직접 확인 가능
