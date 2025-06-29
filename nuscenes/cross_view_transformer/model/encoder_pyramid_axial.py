@@ -913,7 +913,8 @@ class CrossViewSwapAttention(nn.Module):
 
 
 class PyramidAxialEncoder(nn.Module):
-    def __init__(self, backbone, cross_view, cross_view_swap, bev_embedding, self_attn, dim:List[int], middle:List[int], scale:float=1.0):
+    def __init__(self, backbone, cross_view, cross_view_swap, bev_embedding,
+                 self_attn, dim: List[int], middle: List[int], scale: float = 1.0):
         super().__init__()
         self.norm = Normalize()
         self.backbone = backbone
@@ -923,47 +924,63 @@ class PyramidAxialEncoder(nn.Module):
         self.downsample_layers = nn.ModuleList()
 
         print("Backbone output_shapes:", backbone.output_shapes)
-        
+
         for i, (feat_shape, num_layers) in enumerate(zip(backbone.output_shapes, middle)):
+            # Create dummy input to determine feature dimensions
             if len(feat_shape) == 3:
                 dummy_input = torch.zeros(1, *feat_shape)  # Ensure batch dimension
             else:
                 dummy_input = torch.zeros(feat_shape)
+
             _, feat_dim, H, W = self.down(dummy_input).shape
 
-            cva = CrossViewSwapAttention(feat_height=H, feat_width=W, feat_dim=feat_dim, dim=dim[i], index=i,
-                                          image_height=feat_shape[1], image_width=feat_shape[2],
-                                          qkv_bias=True, heads=cross_view['heads'][i],
-                                          dim_head=cross_view['dim_head'][i],
-                                          q_win_size=cross_view['q_win_size'],
-                                          feat_win_size=cross_view['feat_win_size'],
-                                          bev_embedding_flag=cross_view['bev_embedding_flag'],
-                                          no_image_features=cross_view.get('no_image_features', False),
-                                          skip=True)
+            # ✅ 수정된 부분: dim[i] 사용
+            cva = CrossViewSwapAttention(
+                feat_height=H,
+                feat_width=W,
+                feat_dim=feat_dim,
+                dim=dim[i],
+                index=i,
+                image_height=feat_shape[1],
+                image_width=feat_shape[2],
+                qkv_bias=True,
+                heads=cross_view['heads'][i],
+                dim_head=cross_view['dim_head'][i],
+                q_win_size=cross_view['q_win_size'],
+                feat_win_size=cross_view['feat_win_size'],
+                bev_embedding_flag=cross_view['bev_embedding_flag'],
+                no_image_features=cross_view.get('no_image_features', False),
+                skip=True
+            )
+
             self.cross_views.append(cva)
-            self.layers.append(nn.Sequential(*[ResNetBottleNeck(dim[i]) for _ in range(num_layers)]))
-            if i < len(middle)-1:
+            self.layers.append(nn.Sequential(*[
+                ResNetBottleNeck(dim[i]) for _ in range(num_layers)
+            ]))
+
+            # Downsampling for multi-level features
+            if i < len(middle) - 1:
                 self.downsample_layers.append(nn.Sequential(
-                    nn.Conv2d(dim[i], dim[i]//2, 3, padding=1, bias=False),
+                    nn.Conv2d(dim[i], dim[i] // 2, 3, padding=1, bias=False),
                     nn.PixelUnshuffle(2),
-                    nn.Conv2d(dim[i+1], dim[i+1], 3, padding=1, bias=False),
-                    nn.BatchNorm2d(dim[i+1]),
+                    nn.Conv2d(dim[i + 1], dim[i + 1], 3, padding=1, bias=False),
+                    nn.BatchNorm2d(dim[i + 1]),
                     nn.ReLU(inplace=True),
-                    nn.Conv2d(dim[i+1], dim[i+1], 1, bias=False),
-                    nn.BatchNorm2d(dim[i+1])
+                    nn.Conv2d(dim[i + 1], dim[i + 1], 1, bias=False),
+                    nn.BatchNorm2d(dim[i + 1])
                 ))
+
         self.bev_embedding = bev_embedding
-        self.self_attn = None  # optional
+        self.self_attn = self_attn  # Optional
         self.dim = dim
         self.middle = middle
 
     def forward(self, batch):
-        # BEV 객체 수 읽기
         bev_obj_count = batch.get('bev_obj_count', None)
         repeat_times = self._decide_repeats(bev_obj_count)
 
-        b,n,_,_,_ = batch['image'].shape
-        image = batch['image'].flatten(0,1)
+        b, n, _, _, _ = batch['image'].shape
+        image = batch['image'].flatten(0, 1)
         I_inv = batch['intrinsics'].inverse()
         E_inv = batch['extrinsics'].inverse()
         cluster_ids = batch['camera_cluster_ids']
@@ -972,20 +989,24 @@ class PyramidAxialEncoder(nn.Module):
         else:
             cluster_ids = cluster_ids.long().to(image.device)
 
-        features = [f.view(b,n,*f.shape[1:]) for f in self.backbone(self.norm(image))]
-        features = [self.down(f.flatten(0,1)).view(b,n,*f.shape[1:]) for f in features]
+        # Feature extraction
+        features = [f.view(b, n, *f.shape[1:]) for f in self.backbone(self.norm(image))]
+        features = [self.down(f.flatten(0, 1)).view(b, n, *f.shape[1:]) for f in features]
         x = self.bev_embedding.get_prior(cluster_ids)
 
+        # Cross-view and residual layers
         for _ in range(repeat_times):
-            for i,(cva,layer) in enumerate(zip(self.cross_views, self.layers)):
+            for i, (cva, layer) in enumerate(zip(self.cross_views, self.layers)):
                 feat = features[i]
                 x = cva(i, x, self.bev_embedding, feat, I_inv, E_inv, cluster_ids)
                 x = layer(x)
                 if i < len(self.downsample_layers):
                     x = self.downsample_layers[i](x)
 
+        # Optional self-attention
         if self.self_attn:
             x = self.self_attn(x)
+
         return x
 
     def _decide_repeats(self, bev_obj_count):
@@ -997,6 +1018,7 @@ class PyramidAxialEncoder(nn.Module):
             return 2
         else:
             return 3
+
 
 if __name__ == "__main__":
     import os
