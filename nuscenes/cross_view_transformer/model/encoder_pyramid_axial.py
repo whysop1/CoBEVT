@@ -909,7 +909,11 @@ class PyramidAxialEncoder(nn.Module):
     def __init__(self, backbone, cross_view, cross_view_swap, bev_embedding,
                  self_attn, dim: List[int], middle: List[int], scale: float = 1.0):
         super().__init__()
-        self.norm = Normalize()
+                     
+        # backbone이 DictConfig라면 instantiate를 통해 객체화
+        if isinstance(backbone, dict) or 'DictConfig' in str(type(backbone)):
+            backbone = instantiate(backbone)
+            
         self.backbone = backbone
         self.down = lambda x: F.interpolate(x, scale_factor=scale) if scale < 1.0 else x
         self.cross_views = nn.ModuleList()
