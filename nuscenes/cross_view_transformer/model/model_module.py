@@ -83,6 +83,7 @@ class ModelModule(pl.LightningModule):
             v.sampler.set_epoch(self.current_epoch)
 
     def configure_optimizers(self, disable_scheduler=False):
+        print(f"Type of self.backbone: {type(self.backbone)}")
         parameters = [x for x in self.backbone.parameters() if x.requires_grad]
         optimizer = torch.optim.AdamW(parameters, **self.optimizer_args)
 
