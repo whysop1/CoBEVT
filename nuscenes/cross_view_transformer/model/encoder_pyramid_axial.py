@@ -931,13 +931,13 @@ class PyramidAxialEncoder(nn.Module):
                 feat_height=H,
                 feat_width=W,
                 feat_dim=feat_dim,
-                dim=dim[i],               # 단일 int
+                dim=dim[i],               # 단일 int 값
                 index=i,
                 image_height=feat_shape[1],
                 image_width=feat_shape[2],
                 qkv_bias=True,
-                heads=cross_view['heads'],       # 리스트 전체 전달
-                dim_head=cross_view['dim_head'], # 리스트 전체 전달
+                heads=cross_view['heads'][i],       # 리스트에서 i번째 값 전달
+                dim_head=cross_view['dim_head'][i], # 리스트에서 i번째 값 전달
                 q_win_size=cross_view['q_win_size'],
                 feat_win_size=cross_view['feat_win_size'],
                 bev_embedding_flag=cross_view['bev_embedding_flag'],
