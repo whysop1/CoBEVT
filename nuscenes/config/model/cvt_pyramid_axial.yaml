@@ -62,9 +62,6 @@
 
 # cvt_pyramid_axial.yaml (수정본 예시)
 
-defaults:
-  - _self_
-
 model:
   _target_: cross_view_transformer.model.encoder_pyramid_axial.PyramidAxialEncoder
 
@@ -74,8 +71,8 @@ model:
     pretrained: true
 
   cross_view:
-    heads: [8, 8, 8]
-    dim_head: [64, 64, 64]
+    heads: [8, 8, 8]            # ✅ 리스트
+    dim_head: [64, 64, 64]      # ✅ 리스트
     q_win_size: [8, 8]
     feat_win_size: [16, 16]
     bev_embedding_flag: [true, true, true]
@@ -95,7 +92,7 @@ model:
     num_clusters: 10
 
   self_attn: null
-  dim: [128, 128, 128]
+  dim: [128, 128, 128]          # ✅ 리스트 (매우 중요)
   middle: [3, 3, 3]
   scale: 1.0
 
@@ -106,25 +103,4 @@ data:
 training:
   batch_size: 8
   lr: 1e-4
-  epochs: 100
-
-experiment:
-  seed: 2022
-  save_dir: /content/logs
-  project: cvt_nuscenes_project
-  uuid: cvt_run_001
-  checkpoint_interval: 500
-  log_image_interval: 100
-  optimizer_args:
-    lr: ${training.lr}
-    weight_decay: 0.01
-
-trainer:
-  accelerator: gpu
-  devices: 1
-  max_epochs: ${training.epochs}
-  precision: 32
-  log_every_n_steps: 10
-  val_check_interval: 1.0
-  limit_train_batches: 1.0
-  limit_val_batches: 1.0
+  epochs: 100 
