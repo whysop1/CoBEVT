@@ -758,21 +758,22 @@ class CrossViewSwapAttention(nn.Module):
         feat_width: int,
         feat_dim: int,
         dim: int,
-        index: int,
+        index: int,  # 유지되지만 인덱싱 용도로만 사용하지 않음
         image_height: int,
         image_width: int,
         qkv_bias: bool,
-        q_win_size: list,
-        feat_win_size: list,
-        heads: list,
-        dim_head: list,
-        bev_embedding_flag: list,
+        q_win_size: list,         # e.g., [8, 8]
+        feat_win_size: list,      # e.g., [16, 16]
+        heads: int,               # ✅ 이제 int
+        dim_head: int,            # ✅ 이제 int
+        bev_embedding_flag: bool, # ✅ 이제 bool
         rel_pos_emb: bool = False,
         no_image_features: bool = False,
         skip: bool = True,
         norm=nn.LayerNorm,
     ):
         super().__init__()
+
         self.feature_linear = nn.Sequential(
             nn.BatchNorm2d(feat_dim),
             nn.ReLU(),
@@ -783,23 +784,22 @@ class CrossViewSwapAttention(nn.Module):
             nn.ReLU(),
             nn.Conv2d(feat_dim, dim, 1, bias=False))
 
-        self.bev_embed_flag = bev_embedding_flag[index]
+        self.bev_embed_flag = bev_embedding_flag
         if self.bev_embed_flag:
             self.bev_embed = nn.Conv2d(2, dim, 1)
         self.img_embed = nn.Conv2d(4, dim, 1, bias=False)
         self.cam_embed = nn.Conv2d(4, dim, 1, bias=False)
 
-        self.q_win_size = q_win_size[index]
-        self.feat_win_size = feat_win_size[index]
+        self.q_win_size = q_win_size
+        self.feat_win_size = feat_win_size
 
         print("dim:", dim)
         print("heads:", heads)
         print("dim_head:", dim_head)
         print("index:", index)
 
-        
-        self.cross_win_attend_1 = CrossWinAttention(dim, heads[index], dim_head[index], qkv_bias)
-        self.cross_win_attend_2 = CrossWinAttention(dim, heads[index], dim_head[index], qkv_bias)
+        self.cross_win_attend_1 = CrossWinAttention(dim, heads, dim_head, qkv_bias)
+        self.cross_win_attend_2 = CrossWinAttention(dim, heads, dim_head, qkv_bias)
         self.skip = skip
         self.prenorm_1 = norm(dim)
         self.prenorm_2 = norm(dim)
@@ -860,7 +860,6 @@ class CrossViewSwapAttention(nn.Module):
         key_flat = img_embed + self.feature_proj(feature_flat) if self.feature_proj else img_embed
         val_flat = self.feature_linear(feature_flat)
 
-        # 클러스터 기반 positional embedding 적용
         if self.bev_embed_flag:
             cluster_bev = bev.get_prior(cluster_ids)
             query = query_pos + cluster_bev[:, None]
@@ -870,14 +869,9 @@ class CrossViewSwapAttention(nn.Module):
         key = rearrange(key_flat, '(b n) ... -> b n ...', b=b, n=n)
         val = rearrange(val_flat, '(b n) ... -> b n ...', b=b, n=n)
 
-        # 나머지 attention 연산 (cross_win_attend_1, 2)...
-        # 아래에 계속됨
-         # pad divisible
-                # padding to fit window size
         key = self.pad_divisible(key, self.feat_win_size[0], self.feat_win_size[1])
         val = self.pad_divisible(val, self.feat_win_size[0], self.feat_win_size[1])
 
-        # window partition
         query = rearrange(query, 'b n d (x w1) (y w2) -> b n x y w1 w2 d',
                           w1=self.q_win_size[0], w2=self.q_win_size[1])
         key = rearrange(key, 'b n d (x w1) (y w2) -> b n x y w1 w2 d',
@@ -885,7 +879,6 @@ class CrossViewSwapAttention(nn.Module):
         val = rearrange(val, 'b n d (x w1) (y w2) -> b n x y w1 w2 d',
                         w1=self.feat_win_size[0], w2=self.feat_win_size[1])
 
-        # cross attention 1
         x_skip = rearrange(x, 'b d (x w1) (y w2) -> b x y w1 w2 d',
                            w1=self.q_win_size[0], w2=self.q_win_size[1]) if self.skip else None
         query = self.cross_win_attend_1(query, key, val, skip=x_skip)
@@ -893,7 +886,6 @@ class CrossViewSwapAttention(nn.Module):
         query = query + self.mlp_1(self.prenorm_1(query))
         x_skip = query
 
-        # cross attention 2
         query = repeat(query, 'b x y d -> b n x y d', n=n)
         query = rearrange(query, 'b n (x w1) (y w2) d -> b n x y w1 w2 d',
                           w1=self.q_win_size[0], w2=self.q_win_size[1])
@@ -909,7 +901,8 @@ class CrossViewSwapAttention(nn.Module):
         query = rearrange(query, 'b x y w1 w2 d -> b (x w1) (y w2) d')
         query = query + self.mlp_2(self.prenorm_2(query))
         query = self.postnorm(query)
-        return rearrange(query, 'b H W d -> b d H W') 
+        return rearrange(query, 'b H W d -> b d H W')
+
 
 
 class PyramidAxialEncoder(nn.Module):
