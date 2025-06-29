@@ -99,10 +99,6 @@ model:
   middle: [3, 3, 3]
   scale: 1.0
 
-  optimizer_args:
-    lr: 1e-4            # ✅ 하드코딩하거나 아래 training.lr 사용 가능 (수정된 위치에 정의되어야 함)
-    weight_decay: 0.01
-
 data:
   dataset_dir: /content/drive/MyDrive/datasets/nuscenes
   labels_dir: /content/drive/MyDrive/datasets/cvt_labels_nuscenes
@@ -112,3 +108,23 @@ training:
   lr: 1e-4
   epochs: 100
 
+experiment:
+  seed: 2022
+  save_dir: /content/logs
+  project: cvt_nuscenes_project
+  uuid: cvt_run_001
+  checkpoint_interval: 500
+  log_image_interval: 100
+  optimizer_args:
+    lr: ${training.lr}
+    weight_decay: 0.01
+
+trainer:
+  accelerator: gpu
+  devices: 1
+  max_epochs: ${training.epochs}
+  precision: 32
+  log_every_n_steps: 10
+  val_check_interval: 1.0
+  limit_train_batches: 1.0
+  limit_val_batches: 1.0
