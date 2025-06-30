@@ -95,28 +95,26 @@ class ModelModule(pl.LightningModule):
 
         return [optimizer], [{'scheduler': scheduler, 'interval': 'step'}]
 '''
-
 import torch
+import torch.nn as nn
 import pytorch_lightning as pl
 
-# CoBEVT의 백본 생성 함수 (이 경로는 실제 파일 위치에 따라 조정 필요)
-from cross_view_transformer.model.backbones.efficientnet import build_backbone
-
+from cross_view_transformer.model.backbones.efficientnet import EfficientNetBackbone
 
 
 class ModelModule(pl.LightningModule):
-    def __init__(self, backbone, loss_func, metrics, optimizer_args, scheduler_args=None, cfg=None):
+    def __init__(self, backbone_cfg, loss_func, metrics, optimizer_args, scheduler_args=None, cfg=None):
         super().__init__()
 
         self.save_hyperparameters(
             cfg,
-            ignore=['backbone', 'loss_func', 'metrics', 'optimizer_args', 'scheduler_args'])
+            ignore=['backbone_cfg', 'loss_func', 'metrics', 'optimizer_args', 'scheduler_args'])
 
-        # ⚠️ 수정된 부분: config일 경우 실제 모델로 변환
-        if isinstance(backbone, dict) or 'DictConfig' in str(type(backbone)):
-            self.backbone = build_backbone(backbone)
-        else:
-            self.backbone = backbone
+        # ✅ EfficientNetBackbone 직접 생성
+        self.backbone = EfficientNetBackbone(
+            arch=backbone_cfg.arch,
+            pretrained=backbone_cfg.get("pretrained", True)
+        )
 
         self.loss_func = loss_func
         self.metrics = metrics
@@ -137,7 +135,6 @@ class ModelModule(pl.LightningModule):
             self.log_dict({f'{prefix}/loss/{k}': v.detach() for k, v in loss_details.items()},
                           on_step=on_step, on_epoch=True)
 
-        # Used for visualizations
         if return_output:
             return {'loss': loss, 'batch': batch, 'pred': pred}
 
@@ -171,18 +168,18 @@ class ModelModule(pl.LightningModule):
         self.metrics.reset()
 
     def _enable_dataloader_shuffle(self, dataloaders):
-        # HACK for https://github.com/PyTorchLightning/pytorch-lightning/issues/11054
         for v in dataloaders:
             v.sampler.shuffle = True
             v.sampler.set_epoch(self.current_epoch)
 
     def configure_optimizers(self, disable_scheduler=False):
-        print(f"Type of self.backbone: {type(self.backbone)}")  # 디버그 출력
+        print(f"Type of self.backbone: {type(self.backbone)}")
+
         parameters = [x for x in self.backbone.parameters() if x.requires_grad]
         optimizer = torch.optim.AdamW(parameters, **self.optimizer_args)
 
         if disable_scheduler or self.scheduler_args is None:
-            scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, lambda lr: 1)
+            scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, lambda _: 1)
         else:
             scheduler = torch.optim.lr_scheduler.OneCycleLR(optimizer, **self.scheduler_args)
 
