@@ -110,16 +110,23 @@ class ModelModule(pl.LightningModule):
             cfg,
             ignore=['backbone_cfg', 'loss_func', 'metrics', 'optimizer_args', 'scheduler_args'])
 
-        # ✅ EfficientNetBackbone 직접 생성
+        # dict-like 접근을 안전하게 처리
+        arch = backbone_cfg.get('arch') if isinstance(backbone_cfg, dict) else getattr(backbone_cfg, 'arch', None)
+        pretrained = backbone_cfg.get('pretrained', True) if isinstance(backbone_cfg, dict) else getattr(backbone_cfg, 'pretrained', True)
+
+        if arch is None:
+            raise ValueError("backbone_cfg must contain 'arch' key")
+
         self.backbone = EfficientNetBackbone(
-            arch=backbone_cfg.arch,
-            pretrained=backbone_cfg.get("pretrained", True)
+            arch=arch,
+            pretrained=pretrained
         )
 
         self.loss_func = loss_func
         self.metrics = metrics
         self.optimizer_args = optimizer_args
         self.scheduler_args = scheduler_args
+
 
     def forward(self, batch):
         return self.backbone(batch)
