@@ -107,10 +107,9 @@ class ModelModule(pl.LightningModule):
 
         self.save_hyperparameters(
             cfg,
-            ignore=['backbone', 'loss_func', 'metrics', 'optimizer_args', 'scheduler_args'])
+            ignore=['model', 'loss_func', 'metrics', 'optimizer_args', 'scheduler_args'])
 
         self.model = model  # ✅ 이 줄을 추가하세요!
-        self.backbone = backbone
         self.loss_func = loss_func
         self.metrics = metrics
 
