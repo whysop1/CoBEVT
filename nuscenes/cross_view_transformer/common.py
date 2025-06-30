@@ -147,7 +147,7 @@ def setup_viz(cfg: DictConfig) -> Callable:
 
 def setup_experiment(cfg: DictConfig) -> Tuple[ModelModule, DataModule, Callable]:
     model = instantiate(cfg.model)  # ✅ PyTorch 객체로 변환
-    model_module = ModelModule(model)  # ⬅️ 여기서 진짜 모델 객체 넘김
+    model_module = ModelModule(model, loss_func, metrics, optimizer_args)
     data_module = setup_data_module(cfg)
     viz_fn = setup_viz(cfg)
 
