@@ -100,7 +100,8 @@ import torch
 import pytorch_lightning as pl
 
 # CoBEVT의 백본 생성 함수 (이 경로는 실제 파일 위치에 따라 조정 필요)
-from cross_view_transformer.model.backbones import build_backbone  
+from cross_view_transformer.model.backbones.efficientnet import build_backbone
+
 
 
 class ModelModule(pl.LightningModule):
