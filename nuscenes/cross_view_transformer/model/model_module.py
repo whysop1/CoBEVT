@@ -1,4 +1,4 @@
-'''
+
 import torch
 import pytorch_lightning as pl
 
@@ -90,103 +90,6 @@ class ModelModule(pl.LightningModule):
 
         if disable_scheduler or self.scheduler_args is None:
             scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, lambda lr: 1)
-        else:
-            scheduler = torch.optim.lr_scheduler.OneCycleLR(optimizer, **self.scheduler_args)
-
-        return [optimizer], [{'scheduler': scheduler, 'interval': 'step'}]
-'''
-import torch
-import torch.nn as nn
-import pytorch_lightning as pl
-
-from cross_view_transformer.model.backbones.efficientnet import EfficientNetBackbone
-
-
-class ModelModule(pl.LightningModule):
-    def __init__(self, backbone_cfg, loss_func, metrics, optimizer_args, scheduler_args=None, cfg=None):
-        super().__init__()
-
-        self.save_hyperparameters(
-            cfg,
-            ignore=['backbone_cfg', 'loss_func', 'metrics', 'optimizer_args', 'scheduler_args'])
-
-        # dict-like 접근을 안전하게 처리
-        arch = backbone_cfg.get('arch') if isinstance(backbone_cfg, dict) else getattr(backbone_cfg, 'arch', None)
-        pretrained = backbone_cfg.get('pretrained', True) if isinstance(backbone_cfg, dict) else getattr(backbone_cfg, 'pretrained', True)
-
-        if arch is None:
-            raise ValueError("backbone_cfg must contain 'arch' key")
-
-        self.backbone = EfficientNetBackbone(
-            arch=arch,
-            pretrained=pretrained
-        )
-
-        self.loss_func = loss_func
-        self.metrics = metrics
-        self.optimizer_args = optimizer_args
-        self.scheduler_args = scheduler_args
-
-
-    def forward(self, batch):
-        return self.backbone(batch)
-
-    def shared_step(self, batch, prefix='', on_step=False, return_output=True):
-        pred = self(batch)
-        loss, loss_details = self.loss_func(pred, batch)
-
-        self.metrics.update(pred, batch)
-
-        if self.trainer is not None:
-            self.log(f'{prefix}/loss', loss.detach(), on_step=on_step, on_epoch=True)
-            self.log_dict({f'{prefix}/loss/{k}': v.detach() for k, v in loss_details.items()},
-                          on_step=on_step, on_epoch=True)
-
-        if return_output:
-            return {'loss': loss, 'batch': batch, 'pred': pred}
-
-        return {'loss': loss}
-
-    def training_step(self, batch, batch_idx):
-        return self.shared_step(batch, 'train', True,
-                                batch_idx % self.hparams.experiment.log_image_interval == 0)
-
-    def validation_step(self, batch, batch_idx):
-        return self.shared_step(batch, 'val', False,
-                                batch_idx % self.hparams.experiment.log_image_interval == 0)
-
-    def on_validation_start(self) -> None:
-        self._log_epoch_metrics('train')
-        self._enable_dataloader_shuffle(self.trainer.val_dataloaders)
-
-    def validation_epoch_end(self, outputs):
-        self._log_epoch_metrics('val')
-
-    def _log_epoch_metrics(self, prefix: str):
-        metrics = self.metrics.compute()
-
-        for key, value in metrics.items():
-            if isinstance(value, dict):
-                for subkey, val in value.items():
-                    self.log(f'{prefix}/metrics/{key}{subkey}', val)
-            else:
-                self.log(f'{prefix}/metrics/{key}', value)
-
-        self.metrics.reset()
-
-    def _enable_dataloader_shuffle(self, dataloaders):
-        for v in dataloaders:
-            v.sampler.shuffle = True
-            v.sampler.set_epoch(self.current_epoch)
-
-    def configure_optimizers(self, disable_scheduler=False):
-        print(f"Type of self.backbone: {type(self.backbone)}")
-
-        parameters = [x for x in self.backbone.parameters() if x.requires_grad]
-        optimizer = torch.optim.AdamW(parameters, **self.optimizer_args)
-
-        if disable_scheduler or self.scheduler_args is None:
-            scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, lambda _: 1)
         else:
             scheduler = torch.optim.lr_scheduler.OneCycleLR(optimizer, **self.scheduler_args)
 
