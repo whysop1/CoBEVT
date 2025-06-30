@@ -126,19 +126,17 @@ def setup_network(cfg: DictConfig):
 
 
 def setup_model_module(cfg: DictConfig) -> ModelModule:
-    full_model = instantiate(cfg.model)  # 전체 PyramidAxialEncoder 인스턴스
+    model = instantiate(cfg.model)  # 전체 모델 객체
     loss_func = MultipleLoss(instantiate(cfg.loss))
     metrics = MetricCollection({k: v for k, v in instantiate(cfg.metrics).items()})
 
-    # ✨ 여기서 .backbone만 추출해서 따로 넘겨줌
-    model_module = ModelModule(full_model.backbone, loss_func, metrics,
+    # ✅ 전체 모델을 넘기자 (backbone 아님)
+    model_module = ModelModule(model, loss_func, metrics,
                                cfg.optimizer, cfg.scheduler,
                                cfg=cfg)
 
-    # ⚠️ 추가: full_model 자체도 추후 쓰려면 필요할 수 있음
-    model_module.full_model = full_model
-
     return model_module
+
 
 
 
