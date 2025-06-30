@@ -12,4 +12,8 @@ model:
     bev: [0, 1]
     center: [1, 2]
 
-
+#내가 직접 추가함
+training:
+  batch_size: 8
+  lr: 1e-4
+  epochs: 100
