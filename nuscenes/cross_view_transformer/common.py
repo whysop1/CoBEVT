@@ -123,15 +123,18 @@ def setup_network(cfg: DictConfig):
 
 
 def setup_model_module(cfg: DictConfig) -> ModelModule:
-    backbone = instantiate(cfg.model)  # ✅ 전체 모델을 생성
+    backbone = instantiate(cfg.model)  # ✅ DictConfig → 실제 모델 객체로 변환
     loss_func = MultipleLoss(instantiate(cfg.loss))
     metrics = MetricCollection({k: v for k, v in instantiate(cfg.metrics).items()})
 
-    model_module = ModelModule(backbone, loss_func, metrics,
-                               cfg.optimizer, cfg.scheduler,
-                               cfg=cfg)
+    model_module = ModelModule(
+        backbone, loss_func, metrics,
+        cfg.optimizer, cfg.scheduler,
+        cfg=cfg
+    )
 
     return model_module
+
 
 
 def setup_data_module(cfg: DictConfig) -> DataModule:
