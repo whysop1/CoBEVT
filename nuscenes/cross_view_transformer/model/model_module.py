@@ -102,7 +102,7 @@ import pytorch_lightning as pl
 
 
 class ModelModule(pl.LightningModule):
-    def __init__(self, backbone, loss_func, metrics, optimizer_args, scheduler_args=None, cfg=None):
+    def __init__(self, model, loss_func, metrics, optimizer_args, scheduler_args=None, cfg=None):
         super().__init__()
 
         self.save_hyperparameters(
