@@ -89,8 +89,7 @@ def remove_prefix(state_dict: Dict, prefix: str) -> Dict:
         if tokens[0] == prefix:
             tokens = tokens[1:]
 '''
-
-import torch
+import torch 
 from hydra.utils import instantiate
 from omegaconf import OmegaConf, DictConfig
 from torchmetrics import MetricCollection
@@ -184,11 +183,6 @@ def remove_prefix(state_dict: Dict, prefix: str) -> Dict:
 
         if tokens[0] == prefix:
             tokens = tokens[1:]
-
-        key = '.'.join(tokens)
-        result[key] = v
-
-    return result
 
         key = '.'.join(tokens)
         result[key] = v
