@@ -102,7 +102,7 @@ import pytorch_lightning as pl
 
 
 class ModelModule(pl.LightningModule):
-    def __init__(self, model, loss_func, metrics, optimizer_args, scheduler_args=None, cfg=None):
+    def __init__(self, model, backbone, loss_func, metrics, optimizer_args, scheduler_args=None, cfg=None):
         super().__init__()
 
         self.save_hyperparameters(
@@ -110,6 +110,7 @@ class ModelModule(pl.LightningModule):
             ignore=['model', 'loss_func', 'metrics', 'optimizer_args', 'scheduler_args'])
 
         self.model = model  # ✅ 이 줄을 추가하세요!
+        self.backbone = backbone
         self.loss_func = loss_func
         self.metrics = metrics
 
