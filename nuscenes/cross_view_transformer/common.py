@@ -145,13 +145,30 @@ def setup_viz(cfg: DictConfig) -> Callable:
     return instantiate(cfg.visualization)
 
 
+from torch import nn
+from torchmetrics import Accuracy
+
 def setup_experiment(cfg: DictConfig) -> Tuple[ModelModule, DataModule, Callable]:
-    model = instantiate(cfg.model)  # ✅ PyTorch 객체로 변환
+    model = instantiate(cfg.model)  # 모델 객체 생성
+
+    # loss function 정의 (문제에 맞게 변경 가능)
+    loss_func = nn.CrossEntropyLoss()
+
+    # metrics 정의 (예시)
+    metrics = [Accuracy(task='multiclass', num_classes=10)]
+
+    # optimizer 인자 정의 (예: Adam optimizer, learning rate는 cfg에서 가져오기)
+    optimizer_args = {
+        'lr': cfg.training.lr,
+        'weight_decay': 1e-4
+    }
+
     model_module = ModelModule(model, loss_func, metrics, optimizer_args)
     data_module = setup_data_module(cfg)
     viz_fn = setup_viz(cfg)
 
     return model_module, data_module, viz_fn
+
 
 
 def load_backbone(checkpoint_path: str, prefix: str = 'backbone'):
