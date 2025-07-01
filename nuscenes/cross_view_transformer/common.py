@@ -156,7 +156,6 @@ import torch
 from omegaconf import DictConfig, OmegaConf
 from hydra.utils import instantiate
 
-from .common import remove_prefix  # 이 함수가 같은 디렉토리에 있다면
 
 def load_backbone(checkpoint_path: str, prefix: str = 'backbone'):
     # 1. 체크포인트 로드
