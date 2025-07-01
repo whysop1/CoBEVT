@@ -155,25 +155,22 @@ def setup_experiment(cfg: DictConfig) -> Tuple[ModelModule, DataModule, Callable
 import torch
 from omegaconf import DictConfig, OmegaConf
 
-def load_backbone(checkpoint_path: str, prefix: str = 'backbone'):
+def load_backbone(checkpoint_path: str, prefix: str = 'backbone', current_cfg: DictConfig = None):
     checkpoint = torch.load(checkpoint_path, map_location='cpu')
 
-    cfg = checkpoint['hyper_parameters']
+    ckpt_cfg = checkpoint['hyper_parameters']
+    if not isinstance(ckpt_cfg, DictConfig):
+        ckpt_cfg = OmegaConf.create(ckpt_cfg)
 
-    # 만약 dict이면 OmegaConf로 변환
-    if not isinstance(cfg, DictConfig):
-        cfg = OmegaConf.create(cfg)
-
-    print("Loaded model config:", cfg.model)  # <- 이 부분 출력
+    if current_cfg is not None:
+        # 현재 설정으로 덮어쓰기 또는 병합
+        cfg = OmegaConf.merge(ckpt_cfg, current_cfg)
+    else:
+        cfg = ckpt_cfg
 
     state_dict = remove_prefix(checkpoint['state_dict'], prefix)
-
     backbone = setup_network(cfg)
-
-    print("Backbone type:", type(backbone))  # <- 이 부분 출력
-
     backbone.load_state_dict(state_dict)
-
     return backbone
 
 
