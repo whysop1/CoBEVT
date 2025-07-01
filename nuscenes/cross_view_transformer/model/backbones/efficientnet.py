@@ -294,7 +294,7 @@ class EfficientNetBackbone(nn.Module):
     def __init__(self, arch='efficientnet-b4', pretrained=True):
         super().__init__()
         arch = arch.replace('-', '_')  # 하이픈을 언더바로 변환
-        self.backbone = timm.create_model(arch, pretrained=pretrained)
+        self.backbone = timm.create_model(arch, pretrained=pretrained, features_only=True) #내가 수정함->features_onl=True를 추가했음
 
         
         # ✅ 추가: output_shapes 정의
