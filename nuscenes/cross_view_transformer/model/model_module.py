@@ -110,6 +110,7 @@ class ModelModule(pl.LightningModule):
             cfg,
             ignore=['backbone', 'loss_func', 'metrics', 'optimizer_args', 'scheduler_args'])
 
+        # DictConfig 인스턴스면 instantiate 해서 실제 nn.Module 객체로 변환
         if isinstance(backbone, DictConfig):
             self.backbone = instantiate(backbone)
         else:
@@ -123,9 +124,6 @@ class ModelModule(pl.LightningModule):
 
     def forward(self, batch):
         return self.backbone(batch)
-
-    # ... 이하 기존 코드 동일 ...
-
 
     def shared_step(self, batch, prefix='', on_step=False, return_output=True):
         pred = self(batch)
@@ -186,3 +184,4 @@ class ModelModule(pl.LightningModule):
             scheduler = torch.optim.lr_scheduler.OneCycleLR(optimizer, **self.scheduler_args)
 
         return [optimizer], [{'scheduler': scheduler, 'interval': 'step'}]
+
