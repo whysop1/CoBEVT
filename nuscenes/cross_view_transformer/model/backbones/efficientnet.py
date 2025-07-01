@@ -307,5 +307,15 @@ class EfficientNetBackbone(nn.Module):
 
     def forward(self, x):
         feats = self.backbone(x)  # List of feature maps
+
+        
+        
+        # 내가 추가한 코드
+        if self.training:
+            for i, f in enumerate(feats):
+                print(f"[backbone] feature[{i}] shape: {f.shape}")
+
+
+        
         return feats
 
