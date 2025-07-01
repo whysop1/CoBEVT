@@ -158,22 +158,24 @@ from omegaconf import DictConfig, OmegaConf
 def load_backbone(checkpoint_path: str, prefix: str = 'backbone'):
     checkpoint = torch.load(checkpoint_path, map_location='cpu')
 
-    # checkpoint['hyper_parameters']는 DictConfig 혹은 dict 타입일 가능성 있음
     cfg = checkpoint['hyper_parameters']
 
+    # 만약 dict이면 OmegaConf로 변환
     if not isinstance(cfg, DictConfig):
         cfg = OmegaConf.create(cfg)
 
-    # state_dict key에 prefix 제거 함수도 필요 (remove_prefix)
+    print("Loaded model config:", cfg.model)  # <- 이 부분 출력
+
     state_dict = remove_prefix(checkpoint['state_dict'], prefix)
 
-    # 실제 모델 객체 생성: setup_network(cfg) 함수가 모델을 리턴해야 함
     backbone = setup_network(cfg)
 
-    # state_dict 로드
+    print("Backbone type:", type(backbone))  # <- 이 부분 출력
+
     backbone.load_state_dict(state_dict)
 
     return backbone
+
 
 
 
