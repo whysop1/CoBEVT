@@ -987,8 +987,6 @@ class PyramidAxialEncoder(nn.Module):
         else:
             cluster_ids = cluster_ids.long().to(image.device)
 
-
-        #내가 추가한 코드
         # backbone에 입력 넣기 전 이미지 정규화
         images_norm = self.norm(image)
 
@@ -1005,10 +1003,10 @@ class PyramidAxialEncoder(nn.Module):
             if f.numel() != expected_numel:
                 print(f"Mismatch in number of elements: got {f.numel()}, expected {expected_numel}")
 
-        
-        # Feature extraction
-        features = [f.view(b, n, *f.shape[1:]) for f in self.backbone(self.norm(image))]
+        # Feature extraction (backbone_outputs 재사용)
+        features = [f.view(b, n, *f.shape[1:]) for f in backbone_outputs]
         features = [self.down(f.flatten(0, 1)).view(b, n, *f.shape[1:]) for f in features]
+
         x = self.bev_embedding.get_prior(cluster_ids)
 
         # Cross-view and residual layers
@@ -1025,6 +1023,7 @@ class PyramidAxialEncoder(nn.Module):
             x = self.self_attn(x)
 
         return x
+
 
     def _decide_repeats(self, bev_obj_count):
         if bev_obj_count is None:
