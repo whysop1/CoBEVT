@@ -987,6 +987,25 @@ class PyramidAxialEncoder(nn.Module):
         else:
             cluster_ids = cluster_ids.long().to(image.device)
 
+
+        #내가 추가한 코드
+        # backbone에 입력 넣기 전 이미지 정규화
+        images_norm = self.norm(image)
+
+        # backbone 실행
+        backbone_outputs = self.backbone(images_norm)
+
+        # 점검용 출력 추가
+        print(f"batch size (b): {b}, number of views (n): {n}")
+        for i, f in enumerate(backbone_outputs):
+            print(f"features[{i}] shape before view: {f.shape}")
+            expected_shape = (b, n, *f.shape[1:])
+            print(f"expected shape after view: {expected_shape}")
+            expected_numel = b * n * f.shape[1] * f.shape[2] * f.shape[3]
+            if f.numel() != expected_numel:
+                print(f"Mismatch in number of elements: got {f.numel()}, expected {expected_numel}")
+
+        
         # Feature extraction
         features = [f.view(b, n, *f.shape[1:]) for f in self.backbone(self.norm(image))]
         features = [self.down(f.flatten(0, 1)).view(b, n, *f.shape[1:]) for f in features]
