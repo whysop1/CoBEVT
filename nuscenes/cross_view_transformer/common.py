@@ -121,11 +121,14 @@ def setup_config(cfg: DictConfig, override: Optional[Callable] = None):
 
 
 def setup_network(cfg: DictConfig):
+    print("cfg:", cfg)
+    # 여기서 cfg가 DictConfig이고, 'model' 키를 포함하면 안쪽까지 들어감
+    if '_target_' not in cfg and 'model' in cfg:
+        cfg = cfg['model']
     
-    print("cfg.model:", cfg.model)
-    print("_target_ in cfg.model?", '_target_' in cfg.model)
-
+    print("Instantiating model with _target_:", cfg['_target_'])
     return instantiate(cfg)
+
 
 
 def setup_model_module(cfg: DictConfig) -> ModelModule:
