@@ -122,6 +122,9 @@ class ModelModule(pl.LightningModule):
         self.optimizer_args = optimizer_args
         self.scheduler_args = scheduler_args
 
+        print(f"[DEBUG] model type at init: {type(model)}")
+
+
     def forward(self, batch):
         return self.model(batch)
 
