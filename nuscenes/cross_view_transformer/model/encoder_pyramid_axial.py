@@ -1003,9 +1003,15 @@ class PyramidAxialEncoder(nn.Module):
             if f.numel() != expected_numel:
                 print(f"Mismatch in number of elements: got {f.numel()}, expected {expected_numel}")
 
-        # Feature extraction (backbone_outputs 재사용)
-        features = [f.view(b, n, *f.shape[1:]) for f in backbone_outputs]
-        features = [self.down(f.flatten(0, 1)).view(b, n, *f.shape[1:]) for f in features]
+        # Feature extraction
+        features = []
+        for i, f in enumerate(backbone_outputs):
+            f = f.view(b, n, *f.shape[1:])             # (B, N, C, H, W)
+            f = f.flatten(0, 1)                        # (B*N, C, H, W)
+            f = self.down(f)                           # (B*N, C', H', W')
+            _, c, h, w = f.shape
+            f = f.view(b, n, c, h, w)                  # (B, N, C', H', W')
+            features.append(f)
 
         x = self.bev_embedding.get_prior(cluster_ids)
 
