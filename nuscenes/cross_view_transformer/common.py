@@ -125,7 +125,7 @@ def setup_network(cfg: DictConfig):
     print("cfg.model:", cfg.model)
     print("_target_ in cfg.model?", '_target_' in cfg.model)
 
-    return instantiate(cfg.model)
+    return instantiate(cfg)
 
 
 def setup_model_module(cfg: DictConfig) -> ModelModule:
@@ -159,27 +159,25 @@ def setup_experiment(cfg: DictConfig) -> Tuple[ModelModule, DataModule, Callable
 import torch
 from omegaconf import DictConfig, OmegaConf
 
+# load_backbone 함수 예시
 def load_backbone(checkpoint_path: str, prefix: str = 'backbone'):
     checkpoint = torch.load(checkpoint_path, map_location='cpu')
-
-    # 하이퍼파라미터 불러오기
     cfg = checkpoint['hyper_parameters']
 
-    # dict면 DictConfig로 변환
     if not isinstance(cfg, DictConfig):
         cfg = OmegaConf.create(cfg)
 
-    # 모델 설정이 올바른지 확인 (_target_ 필드 존재 여부)
-    if '_target_' not in cfg.model:
-        raise ValueError("cfg.model에 '_target_' 키가 없습니다. instantiate할 수 없습니다.")
+    # 여기서 'model' 키가 중첩되어 있음
+    print("cfg.model:", cfg.model)  # {'model': {...}}
+    print("_target_ in cfg.model?", '_target_' in cfg.model)  # False
+    print("_target_ in cfg.model['model']?", '_target_' in cfg.model['model'])  # True
 
-    # state_dict에서 prefix 제거
     state_dict = remove_prefix(checkpoint['state_dict'], prefix)
 
-    # 모델 생성
-    backbone = setup_network(cfg)
+    # 실제 모델 설정은 cfg.model['model'] 이므로
+    backbone = setup_network(cfg.model['model'])
+    print("Backbone type after instantiate:", type(backbone))
 
-    # state_dict 로드
     backbone.load_state_dict(state_dict)
 
     return backbone
