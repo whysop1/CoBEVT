@@ -124,6 +124,9 @@ class ModelModule(pl.LightningModule):
     def forward(self, batch):
         return self.backbone(batch)
 
+    # ... 이하 기존 코드 동일 ...
+
+
     def shared_step(self, batch, prefix='', on_step=False, return_output=True):
         pred = self(batch)
         loss, loss_details = self.loss_func(pred, batch)
