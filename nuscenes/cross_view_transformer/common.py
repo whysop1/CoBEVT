@@ -132,7 +132,7 @@ def setup_network(cfg: DictConfig):
 
 
 def setup_model_module(cfg: DictConfig) -> ModelModule:
-    model = setup_network(cfg)  # 'backbone' -> 'model'로 변수명 변경
+    model = setup_network(cfg.model['model'])  # 'backbone' -> 'model'로 변수명 변경
     loss_func = MultipleLoss(instantiate(cfg.loss))
     metrics = MetricCollection({k: v for k, v in instantiate(cfg.metrics).items()})
 
