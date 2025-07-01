@@ -103,18 +103,18 @@ from omegaconf import DictConfig
 
 
 class ModelModule(pl.LightningModule):
-    def __init__(self, backbone, loss_func, metrics, optimizer_args, scheduler_args=None, cfg=None):
+    def __init__(self, model, loss_func, metrics, optimizer_args, scheduler_args=None, cfg=None):
         super().__init__()
 
         self.save_hyperparameters(
             cfg,
-            ignore=['backbone', 'loss_func', 'metrics', 'optimizer_args', 'scheduler_args'])
+            ignore=['model', 'loss_func', 'metrics', 'optimizer_args', 'scheduler_args'])
 
-        # DictConfig 인스턴스면 instantiate 해서 실제 nn.Module 객체로 변환
-        if isinstance(backbone, DictConfig):
-            self.backbone = instantiate(backbone)
+        # Instantiate model if it's a config
+        if isinstance(model, DictConfig):
+            self.model = instantiate(model)
         else:
-            self.backbone = backbone
+            self.model = model
 
         self.loss_func = loss_func
         self.metrics = metrics
@@ -123,7 +123,7 @@ class ModelModule(pl.LightningModule):
         self.scheduler_args = scheduler_args
 
     def forward(self, batch):
-        return self.backbone(batch)
+        return self.model(batch)
 
     def shared_step(self, batch, prefix='', on_step=False, return_output=True):
         pred = self(batch)
@@ -174,8 +174,8 @@ class ModelModule(pl.LightningModule):
             v.sampler.set_epoch(self.current_epoch)
 
     def configure_optimizers(self, disable_scheduler=False):
-        print(f"Type of self.backbone: {type(self.backbone)}")
-        parameters = [x for x in self.backbone.parameters() if x.requires_grad]
+        print(f"Type of self.model: {type(self.model)}")
+        parameters = [x for x in self.model.parameters() if x.requires_grad]
         optimizer = torch.optim.AdamW(parameters, **self.optimizer_args)
 
         if disable_scheduler or self.scheduler_args is None:
