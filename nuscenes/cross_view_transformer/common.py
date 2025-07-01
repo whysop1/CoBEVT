@@ -129,15 +129,21 @@ def setup_network(cfg: DictConfig):
 
 
 def setup_model_module(cfg: DictConfig) -> ModelModule:
-    backbone = setup_network(cfg)
+    model = setup_network(cfg)  # 'backbone' -> 'model'로 변수명 변경
     loss_func = MultipleLoss(instantiate(cfg.loss))
     metrics = MetricCollection({k: v for k, v in instantiate(cfg.metrics).items()})
 
-    model_module = ModelModule(backbone, loss_func, metrics,
-                               cfg.optimizer, cfg.scheduler,
-                               cfg=cfg)
+    model_module = ModelModule(
+        model=model,                           # 핵심 수정: model=...
+        loss_func=loss_func,
+        metrics=metrics,
+        optimizer_args=cfg.optimizer,
+        scheduler_args=cfg.scheduler,
+        cfg=cfg
+    )
 
     return model_module
+
 
 
 def setup_data_module(cfg: DictConfig) -> DataModule:
