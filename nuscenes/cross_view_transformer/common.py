@@ -154,30 +154,27 @@ def setup_experiment(cfg: DictConfig) -> Tuple[ModelModule, DataModule, Callable
 
 import torch
 from omegaconf import DictConfig, OmegaConf
-from hydra.utils import instantiate
-
 
 def load_backbone(checkpoint_path: str, prefix: str = 'backbone'):
-    # 1. 체크포인트 로드
     checkpoint = torch.load(checkpoint_path, map_location='cpu')
 
-    # 2. 하이퍼파라미터 가져오기
-    raw_cfg = checkpoint['hyper_parameters']
+    # checkpoint['hyper_parameters']는 DictConfig 혹은 dict 타입일 가능성 있음
+    cfg = checkpoint['hyper_parameters']
 
-    # 3. OmegaConf로 변환
-    cfg = OmegaConf.create(raw_cfg)
-    cfg = DictConfig(cfg)
+    if not isinstance(cfg, DictConfig):
+        cfg = OmegaConf.create(cfg)
 
-    # 4. 모델 백본만 인스턴스화
-    backbone_cfg = cfg.model.backbone
-    backbone = instantiate(backbone_cfg)
-
-    # 5. 백본 관련 파라미터만 로드
+    # state_dict key에 prefix 제거 함수도 필요 (remove_prefix)
     state_dict = remove_prefix(checkpoint['state_dict'], prefix)
+
+    # 실제 모델 객체 생성: setup_network(cfg) 함수가 모델을 리턴해야 함
+    backbone = setup_network(cfg)
+
+    # state_dict 로드
     backbone.load_state_dict(state_dict)
 
-    # 6. nn.Module 리턴
     return backbone
+
 
 
 
