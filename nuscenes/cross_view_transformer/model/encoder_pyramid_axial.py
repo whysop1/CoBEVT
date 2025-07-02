@@ -832,6 +832,7 @@ class CrossViewSwapAttention(nn.Module):
         padw = w_pad - w
         return F.pad(x, (0, padw, 0, padh), value=0)
 
+    '''
     def forward(
         self,
         index: int,
@@ -895,6 +896,105 @@ class CrossViewSwapAttention(nn.Module):
 
         key = self.pad_divisible(key, self.feat_win_size[0], self.feat_win_size[1])
         val = self.pad_divisible(val, self.feat_win_size[0], self.feat_win_size[1])
+
+        query = rearrange(query, 'b n d (x w1) (y w2) -> b n x y w1 w2 d',
+                          w1=self.q_win_size[0], w2=self.q_win_size[1])
+        key = rearrange(key, 'b n d (x w1) (y w2) -> b n x y w1 w2 d',
+                        w1=self.feat_win_size[0], w2=self.feat_win_size[1])
+        val = rearrange(val, 'b n d (x w1) (y w2) -> b n x y w1 w2 d',
+                        w1=self.feat_win_size[0], w2=self.feat_win_size[1])
+
+        x_skip = rearrange(x, 'b d (x w1) (y w2) -> b x y w1 w2 d',
+                           w1=self.q_win_size[0], w2=self.q_win_size[1]) if self.skip else None
+        query = self.cross_win_attend_1(query, key, val, skip=x_skip)
+        query = rearrange(query, 'b x y w1 w2 d -> b (x w1) (y w2) d')
+        query = query + self.mlp_1(self.prenorm_1(query))
+        x_skip = query
+
+        query = repeat(query, 'b x y d -> b n x y d', n=n)
+        query = rearrange(query, 'b n (x w1) (y w2) d -> b n x y w1 w2 d',
+                          w1=self.q_win_size[0], w2=self.q_win_size[1])
+        key = rearrange(key, 'b n x y w1 w2 d -> b n (x w1) (y w2) d')
+        val = rearrange(val, 'b n x y w1 w2 d -> b n (x w1) (y w2) d')
+        key = rearrange(key, 'b n (x w1) (y w2) d -> b n x y w1 w2 d',
+                        w1=self.feat_win_size[0], w2=self.feat_win_size[1])
+        val = rearrange(val, 'b n (x w1) (y w2) d -> b n x y w1 w2 d',
+                        w1=self.feat_win_size[0], w2=self.feat_win_size[1])
+        x_skip = rearrange(x_skip, 'b (x w1) (y w2) d -> b x y w1 w2 d',
+                           w1=self.q_win_size[0], w2=self.q_win_size[1]) if self.skip else None
+        query = self.cross_win_attend_2(query, key, val, skip=x_skip)
+        query = rearrange(query, 'b x y w1 w2 d -> b (x w1) (y w2) d')
+        query = query + self.mlp_2(self.prenorm_2(query))
+        query = self.postnorm(query)
+        return rearrange(query, 'b H W d -> b d H W')
+    '''
+
+    def forward(
+        self,
+        index: int,
+        x: torch.Tensor,
+        bev: BEVEmbedding,
+        feature: torch.Tensor,
+        I_inv: torch.Tensor,
+        E_inv: torch.Tensor,
+        cluster_ids: torch.Tensor,
+    ):
+        b, n, _, _, _ = feature.shape
+        _, _, H, W = x.shape
+    
+        pixel = self.image_plane
+        _, _, _, h, w = pixel.shape
+    
+        c = E_inv[..., -1:]
+        c_flat = rearrange(c, 'b n ... -> (b n) ...')[..., None]
+        c_embed = self.cam_embed(c_flat)
+
+        pixel_flat = rearrange(pixel, '... h w -> ... (h w)')
+        cam = I_inv @ pixel_flat
+        cam = F.pad(cam, (0, 0, 0, 1, 0, 0, 0, 0), value=1)
+        d = E_inv @ cam
+        d_flat = rearrange(d, 'b n d (h w) -> (b n) d h w', h=h, w=w)
+        d_embed = self.img_embed(d_flat)
+
+        img_embed = d_embed - c_embed
+
+        # Normalize image embedding
+        img_embed = F.interpolate(img_embed, size=feature.shape[-2:], mode='bilinear', align_corners=False)
+        img_embed = img_embed / (img_embed.norm(dim=1, keepdim=True) + 1e-7)
+
+        if self.bev_embed_flag:
+            grid = getattr(bev, f'grid{index}')[:2]
+            w_embed = self.bev_embed(grid[None])
+            bev_embed = w_embed - c_embed
+            bev_embed = bev_embed / (bev_embed.norm(dim=1, keepdim=True) + 1e-7)
+            query_pos = rearrange(bev_embed, '(b n) ... -> b n ...', b=b, n=n)
+
+        feature_flat = rearrange(feature, 'b n ... -> (b n) ...')
+
+        key_flat = img_embed + self.feature_proj(feature_flat) if self.feature_proj else img_embed
+        val_flat = self.feature_linear(feature_flat)
+
+        if self.bev_embed_flag:
+            cluster_bev = bev.get_prior(cluster_ids)
+            query = query_pos + cluster_bev[:, None]
+        else:
+            query = x[:, None]  # (B, N, D, H, W)
+
+        # ✅ 패딩 적용 (query도!)
+        query = rearrange(query, 'b n d h w -> (b n) d h w')
+        query = self.pad_divisible(query, self.q_win_size[0], self.q_win_size[1])
+        query = rearrange(query, '(b n) d h w -> b n d h w', b=b, n=n)
+
+        key = rearrange(key_flat, '(b n) ... -> b n ...', b=b, n=n)
+        val = rearrange(val_flat, '(b n) ... -> b n ...', b=b, n=n)
+
+        key = self.pad_divisible(key, self.feat_win_size[0], self.feat_win_size[1])
+        val = self.pad_divisible(val, self.feat_win_size[0], self.feat_win_size[1])
+
+        # ✅ 디버깅 출력
+        print("query shape after padding:", query.shape)
+        print("key shape after padding:", key.shape)
+        print("val shape after padding:", val.shape)
 
         query = rearrange(query, 'b n d (x w1) (y w2) -> b n x y w1 w2 d',
                           w1=self.q_win_size[0], w2=self.q_win_size[1])
