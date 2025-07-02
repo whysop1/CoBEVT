@@ -948,10 +948,10 @@ class CrossViewSwapAttention(nn.Module):
     ):
         b, n, _, _, _ = feature.shape
         _, _, H, W = x.shape
-    
+
         pixel = self.image_plane
         _, _, _, h, w = pixel.shape
-    
+
         c = E_inv[..., -1:]
         c_flat = rearrange(c, 'b n ... -> (b n) ...')[..., None]
         c_embed = self.cam_embed(c_flat)
@@ -964,8 +964,6 @@ class CrossViewSwapAttention(nn.Module):
         d_embed = self.img_embed(d_flat)
 
         img_embed = d_embed - c_embed
-
-        # Normalize image embedding
         img_embed = F.interpolate(img_embed, size=feature.shape[-2:], mode='bilinear', align_corners=False)
         img_embed = img_embed / (img_embed.norm(dim=1, keepdim=True) + 1e-7)
 
@@ -977,7 +975,6 @@ class CrossViewSwapAttention(nn.Module):
             query_pos = rearrange(bev_embed, '(b n) ... -> b n ...', b=b, n=n)
 
         feature_flat = rearrange(feature, 'b n ... -> (b n) ...')
-
         key_flat = img_embed + self.feature_proj(feature_flat) if self.feature_proj else img_embed
         val_flat = self.feature_linear(feature_flat)
 
@@ -987,21 +984,31 @@ class CrossViewSwapAttention(nn.Module):
         else:
             query = x[:, None]  # (B, N, D, H, W)
 
-        # ✅ 패딩 적용 (query도!)
+        # 🔧 모든 feature size를 맞춘다
         query = rearrange(query, 'b n d h w -> (b n) d h w')
+        key = key_flat
+        val = val_flat
+
+        target_h = max(query.shape[-2], key.shape[-2], val.shape[-2])
+        target_w = max(query.shape[-1], key.shape[-1], val.shape[-1])
+
+        query = F.interpolate(query, size=(target_h, target_w), mode='bilinear', align_corners=False)
+        key = F.interpolate(key, size=(target_h, target_w), mode='bilinear', align_corners=False)
+        val = F.interpolate(val, size=(target_h, target_w), mode='bilinear', align_corners=False)
+
+        # 🔧 윈도우 크기만큼 나눌 수 있도록 패딩
         query = self.pad_divisible(query, self.q_win_size[0], self.q_win_size[1])
-        query = rearrange(query, '(b n) d h w -> b n d h w', b=b, n=n)
-
-        key = rearrange(key_flat, '(b n) ... -> b n ...', b=b, n=n)
-        val = rearrange(val_flat, '(b n) ... -> b n ...', b=b, n=n)
-
         key = self.pad_divisible(key, self.feat_win_size[0], self.feat_win_size[1])
         val = self.pad_divisible(val, self.feat_win_size[0], self.feat_win_size[1])
 
-        # ✅ 디버깅 출력
-        print("query shape after padding:", query.shape)
-        print("key shape after padding:", key.shape)
-        print("val shape after padding:", val.shape)
+        query = rearrange(query, '(b n) d h w -> b n d h w', b=b, n=n)
+        key = rearrange(key, '(b n) d h w -> b n d h w', b=b, n=n)
+        val = rearrange(val, '(b n) d h w -> b n d h w', b=b, n=n)
+
+        # 🔍 디버깅용 출력 (원하면 주석 처리 가능)
+        print("query shape after pad/interp:", query.shape)
+        print("key shape after pad/interp:", key.shape)
+        print("val shape after pad/interp:", val.shape)
 
         query = rearrange(query, 'b n d (x w1) (y w2) -> b n x y w1 w2 d',
                           w1=self.q_win_size[0], w2=self.q_win_size[1])
@@ -1012,6 +1019,7 @@ class CrossViewSwapAttention(nn.Module):
 
         x_skip = rearrange(x, 'b d (x w1) (y w2) -> b x y w1 w2 d',
                            w1=self.q_win_size[0], w2=self.q_win_size[1]) if self.skip else None
+
         query = self.cross_win_attend_1(query, key, val, skip=x_skip)
         query = rearrange(query, 'b x y w1 w2 d -> b (x w1) (y w2) d')
         query = query + self.mlp_1(self.prenorm_1(query))
