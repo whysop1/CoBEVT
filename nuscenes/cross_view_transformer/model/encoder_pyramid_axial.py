@@ -825,12 +825,19 @@ class CrossViewSwapAttention(nn.Module):
         self.image_plane[:, :, 1] *= image_height
 
     def pad_divisible(self, x, win_h, win_w):
-        _, _, _, h, w = x.shape
+        if x.dim() == 5:
+            _, _, _, h, w = x.shape
+        elif x.dim() == 4:
+            _, _, h, w = x.shape
+        else:
+            raise ValueError(f"Unsupported tensor shape in pad_divisible: {x.shape}")
+
         h_pad = ((h + win_h - 1) // win_h) * win_h
         w_pad = ((w + win_w - 1) // win_w) * win_w
         padh = h_pad - h
         padw = w_pad - w
         return F.pad(x, (0, padw, 0, padh), value=0)
+
 
     '''
     def forward(
