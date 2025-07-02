@@ -1001,8 +1001,8 @@ class CrossViewSwapAttention(nn.Module):
 
         # 🔧 윈도우 크기만큼 나눌 수 있도록 패딩
         query = self.pad_divisible(query, self.q_win_size[0], self.q_win_size[1])
-        key = self.pad_divisible(key, self.feat_win_size[0], self.feat_win_size[1])
-        val = self.pad_divisible(val, self.feat_win_size[0], self.feat_win_size[1])
+        key = self.pad_divisible(key, self.q_win_size[0], self.q_win_size[1])
+        val = self.pad_divisible(val, self.q_win_size[0], self.q_win_size[1])
 
         query = rearrange(query, '(b n) d h w -> b n d h w', b=b, n=n)
         key = rearrange(key, '(b n) d h w -> b n d h w', b=b, n=n)
