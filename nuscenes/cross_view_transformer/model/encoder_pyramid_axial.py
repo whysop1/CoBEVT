@@ -860,6 +860,10 @@ class CrossViewSwapAttention(nn.Module):
         d_embed = self.img_embed(d_flat)
 
         img_embed = d_embed - c_embed
+
+        #내가 추가한 코드
+        img_embed = F.interpolate(img_embed, size=feature.shape[-2:], mode='bilinear', align_corners=False)
+        
         img_embed = img_embed / (img_embed.norm(dim=1, keepdim=True) + 1e-7)
 
         if self.bev_embed_flag:
