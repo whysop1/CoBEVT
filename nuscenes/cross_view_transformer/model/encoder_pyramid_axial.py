@@ -677,20 +677,10 @@ class BEVEmbedding(nn.Module):
             self.register_buffer(f'grid{i}', grid, persistent=False)
         self.learned_features = nn.Parameter(sigma * torch.randn(num_clusters, dim, h, w))
 
-    def get_prior(self, cluster_ids):
-        """
-        Args:
-            cluster_ids (Tensor): LongTensor of shape (B,) containing a single cluster ID per batch
-                              OR shape (B, num_views) for multiple views
+    def get_prior(self, cluster_ids=None):#clustering 비활성화->활성화시키고 싶으면 해당 함수 수정 필요함!
+        # 평균 BEV feature 사용
+        return self.learned_features.mean(dim=0, keepdim=True).expand(batch_size, -1, -1, -1)
 
-        Returns:
-        Tensor of shape (B, dim, H, W)
-        """
-        if cluster_ids.dim() == 2:
-            # 다수 view → 첫 번째 view 기준 클러스터 선택 (예시)
-            cluster_ids = cluster_ids[:, 0]
-
-        return self.learned_features[cluster_ids]  # shape: (B, dim, H, W)
 
 
 
