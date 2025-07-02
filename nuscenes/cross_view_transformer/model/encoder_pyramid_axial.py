@@ -677,6 +677,22 @@ class BEVEmbedding(nn.Module):
             self.register_buffer(f'grid{i}', grid, persistent=False)
         self.learned_features = nn.Parameter(sigma * torch.randn(num_clusters, dim, h, w))
 
+    def get_prior(self, cluster_ids):
+        """
+        Args:
+            cluster_ids (Tensor): LongTensor of shape (B,) containing a single cluster ID per batch
+                              OR shape (B, num_views) for multiple views
+
+        Returns:
+        Tensor of shape (B, dim, H, W)
+        """
+        if cluster_ids.dim() == 2:
+            # 다수 view → 첫 번째 view 기준 클러스터 선택 (예시)
+            cluster_ids = cluster_ids[:, 0]
+
+        return self.learned_features[cluster_ids]  # shape: (B, dim, H, W)
+
+
 
 class CrossWinAttention(nn.Module):
     def __init__(self, dim, heads, dim_head, qkv_bias, rel_pos_emb=False, norm=nn.LayerNorm):
