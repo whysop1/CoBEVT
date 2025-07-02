@@ -836,7 +836,10 @@ class CrossViewSwapAttention(nn.Module):
         w_pad = ((w + win_w - 1) // win_w) * win_w
         padh = h_pad - h
         padw = w_pad - w
-        return F.pad(x, (0, padw, 0, padh), value=0)
+        x_padded = F.pad(x, (0, padw, 0, padh), value=0)
+        print(f"pad_divisible input shape: {x.shape} -> output shape: {x_padded.shape}")
+        return x_padded
+
 
 
     '''
@@ -1010,6 +1013,12 @@ class CrossViewSwapAttention(nn.Module):
         print("key shape after pad/interp:", key.shape)
         print("val shape after pad/interp:", val.shape)
 
+        # ===== 디버깅 출력 =====
+        print("query shape after padding:", query.shape)
+        print("key shape after padding:", key.shape)
+        print("val shape after padding:", val.shape)
+        # ======================
+        
         query = rearrange(query, 'b n d (x w1) (y w2) -> b n x y w1 w2 d',
                           w1=self.q_win_size[0], w2=self.q_win_size[1])
         key = rearrange(key, 'b n d (x w1) (y w2) -> b n x y w1 w2 d',
