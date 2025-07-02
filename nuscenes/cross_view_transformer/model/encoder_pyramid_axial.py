@@ -677,8 +677,12 @@ class BEVEmbedding(nn.Module):
             self.register_buffer(f'grid{i}', grid, persistent=False)
         self.learned_features = nn.Parameter(sigma * torch.randn(num_clusters, dim, h, w))
 
-    def get_prior(self, cluster_ids):
+    def get_prior(self, cluster_ids):#클러스터링 적용 x ->클러스터링하고 싶으면 해당 함수 수정 필요
         batch_size = cluster_ids.shape[0]  # 여기 추가
+
+        print(f"[get_prior] cluster_ids.shape: {cluster_ids.shape}")
+        print(f"[get_prior] learned_features.shape: {self.learned_features.shape}")
+        print(f"[get_prior] returning shape: {(batch_size, ) + self.learned_features.shape[1:]}")
 
         # 기존 코드
         return self.learned_features.mean(dim=0, keepdim=True).expand(batch_size, -1, -1, -1)
