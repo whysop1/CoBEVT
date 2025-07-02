@@ -677,9 +677,12 @@ class BEVEmbedding(nn.Module):
             self.register_buffer(f'grid{i}', grid, persistent=False)
         self.learned_features = nn.Parameter(sigma * torch.randn(num_clusters, dim, h, w))
 
-    def get_prior(self, cluster_ids=None):#clustering 비활성화->활성화시키고 싶으면 해당 함수 수정 필요함!
-        # 평균 BEV feature 사용
+    def get_prior(self, cluster_ids):
+        batch_size = cluster_ids.shape[0]  # 여기 추가
+
+        # 기존 코드
         return self.learned_features.mean(dim=0, keepdim=True).expand(batch_size, -1, -1, -1)
+
 
 
 
