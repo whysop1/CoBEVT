@@ -870,6 +870,13 @@ class CrossViewSwapAttention(nn.Module):
             query_pos = rearrange(bev_embed, '(b n) ... -> b n ...', b=b, n=n)
 
         feature_flat = rearrange(feature, 'b n ... -> (b n) ...')
+
+        #내가 추가한 코드
+        print("img_embed shape:", img_embed.shape)
+        print("feature_flat shape:", feature_flat.shape)
+        if self.feature_proj:
+            print("feature_proj(feature_flat) shape:", self.feature_proj(feature_flat).shape)
+        
         key_flat = img_embed + self.feature_proj(feature_flat) if self.feature_proj else img_embed
         val_flat = self.feature_linear(feature_flat)
 
