@@ -1181,13 +1181,13 @@ class PyramidAxialEncoder(nn.Module):
 
     def _decide_repeats(self, bev_obj_count):
         if bev_obj_count is None:
-            return 1
-        if bev_obj_count < 5:
-            return 1
-        elif bev_obj_count < 15:
             return 2
-        else:
+        if bev_obj_count < 5:
+            return 2
+        elif bev_obj_count < 15:
             return 3
+        else:
+            return 4
 
 
 if __name__ == "__main__":
