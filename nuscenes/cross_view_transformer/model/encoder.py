@@ -512,11 +512,11 @@ class Encoder(nn.Module):
         repeat_times = 3
         if bev_obj_count is not None:
             if bev_obj_count < 5:
-                repeat_times = 1
-            elif bev_obj_count < 10:
                 repeat_times = 2
-            else:
+            elif bev_obj_count < 10:
                 repeat_times = 3
+            else:
+                repeat_times = 4
 
         for _ in range(repeat_times):
             for cross_view, feature, layer in zip(self.cross_views, features, self.layers):
