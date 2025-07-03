@@ -1184,7 +1184,7 @@ class PyramidAxialEncoder(nn.Module):
             return 2  #원래 1
         if bev_obj_count < 5:
             return 2  #원래 1
-        elif bev_obj_count < 15:
+        elif bev_obj_count < 10:
             return 3  #원래 2
         else:
             return 4  #원래 3
