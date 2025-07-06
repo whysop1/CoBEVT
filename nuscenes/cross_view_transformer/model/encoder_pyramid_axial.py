@@ -1023,6 +1023,9 @@ class CrossViewSwapAttention(nn.Module):
         q_w = self.q_win_size[index]
         f_w = self.feat_win_size[index]
 
+        print(f"Calling pad_divisible with q_w={q_w}, f_w={f_w}")
+
+        
         # pad to divisible
         query = self.pad_divisible(query, q_w, q_w)
         key = self.pad_divisible(key, f_w, f_w)
