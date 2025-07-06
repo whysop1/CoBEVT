@@ -1022,8 +1022,8 @@ class CrossViewSwapAttention(nn.Module):
 
         # pad to divisible
         query = self.pad_divisible(query, q_w, q_w)
-        key = self.pad_divisible(key, q_w, q_w)
-        val = self.pad_divisible(val, q_w, q_w)
+        key = self.pad_divisible(key, f_w, f_w)
+        val = self.pad_divisible(val, f_w, f_w)
 
         query = rearrange(query, '(b n) d h w -> b n d h w', b=b, n=n)
         key = rearrange(key, '(b n) d h w -> b n d h w', b=b, n=n)
