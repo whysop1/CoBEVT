@@ -1020,11 +1020,7 @@ class CrossViewSwapAttention(nn.Module):
         val = F.interpolate(val, size=(target_h, target_w), mode='bilinear', align_corners=False)
 
 
-        print(f"index: {index}")
-        print(f"q_win_size: {self.q_win_size}")
-        print(f"feat_win_size: {self.feat_win_size}")
-        print(f"q_w = {self.q_win_size[index]}, f_w = {self.feat_win_size[index]}")
-        print(f"key.shape before rearrange: {key.shape}")
+        
 
         
         
