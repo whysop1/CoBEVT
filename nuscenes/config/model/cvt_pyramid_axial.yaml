@@ -74,7 +74,7 @@ model:
     heads: [8, 8, 8]            # ✅ 리스트
     dim_head: [64, 64, 64]      # ✅ 리스트
     q_win_size: [8, 8, 8]  #원래 [8,8] 이었음
-    feat_win_size: [16, 16, 16]
+    feat_win_size: [8, 8, 8] #원래 16이었음
     bev_embedding_flag: [true, true, true]
     no_image_features: false
 
