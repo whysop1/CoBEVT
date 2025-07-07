@@ -83,7 +83,7 @@ model:
 
   bev_embedding:
     _target_: cross_view_transformer.model.encoder_pyramid_axial.BEVEmbedding
-    bev_size: [200, 200]
+    bev_size: [100, 100] #원래 200
     dim: 128
     sigma: 0.1
     h_meters: 100
