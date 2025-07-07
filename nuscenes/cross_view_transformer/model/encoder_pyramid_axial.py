@@ -847,7 +847,7 @@ class CrossViewSwapAttention(nn.Module):
 
 
 
-'''
+
     def forward(
         self,
         index: int,
@@ -959,8 +959,8 @@ class CrossViewSwapAttention(nn.Module):
         query = query + self.mlp_2(self.prenorm_2(query))
         query = self.postnorm(query)
         return rearrange(query, 'b H W d -> b d H W')
-'''
 
+'''
     def forward(
         self,
         index: int,
@@ -1078,7 +1078,7 @@ class CrossViewSwapAttention(nn.Module):
         query = query + self.mlp_2(self.prenorm_2(query))
         query = self.postnorm(query)
         return rearrange(query, 'b H W d -> b d H W')
-
+'''
 
 
 class PyramidAxialEncoder(nn.Module):
