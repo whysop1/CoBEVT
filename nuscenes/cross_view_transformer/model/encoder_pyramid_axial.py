@@ -611,6 +611,8 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
+import math#임의로 추가
+
 from torch import einsum
 from einops import rearrange, repeat
 from torchvision.models.resnet import Bottleneck
@@ -824,7 +826,7 @@ class CrossViewSwapAttention(nn.Module):
         self.image_plane[:, :, 0] *= image_width
         self.image_plane[:, :, 1] *= image_height
 
-    import math
+   
 
     def pad_divisible(self, x, win_h, win_w):
         if x.dim() == 5:
