@@ -1047,7 +1047,7 @@ class PyramidAxialEncoder(nn.Module):
                 self.downsample_layers.append(nn.Sequential(
                     nn.Conv2d(dim[i], dim[i] // 2, 3, padding=1, bias=False),
                     nn.PixelUnshuffle(2),
-                    nn.Conv2d(dim[i + 1], dim[i + 1], 3, padding=1, bias=False),
+                    nn.Conv2d(2 * dim[i], dim[i + 1], 3, padding=1, bias=False), #수정한 줄
                     nn.BatchNorm2d(dim[i + 1]),
                     nn.ReLU(inplace=True),
                     nn.Conv2d(dim[i + 1], dim[i + 1], 1, bias=False),
