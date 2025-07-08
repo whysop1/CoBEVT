@@ -102,6 +102,6 @@ data:
   labels_dir: /content/drive/MyDrive/datasets/cvt_labels_nuscenes
 
 training:
-  batch_size: 2 #원래 8이었음
+  batch_size: 1 #원래 8이었음
   lr: 1e-4
   epochs: 100 
