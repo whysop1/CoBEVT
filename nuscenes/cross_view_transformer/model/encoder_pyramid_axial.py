@@ -1132,15 +1132,15 @@ class PyramidAxialEncoder(nn.Module):
             return 4  #원래 3
 
 
+
 if __name__ == "__main__":
     import os
     import re
     import yaml
-    import torch
-
     def load_yaml(file):
         stream = open(file, 'r')
         loader = yaml.Loader
+        
         loader.add_implicit_resolver(
             u'tag:yaml.org,2002:float',
             re.compile(u'''^(?:
@@ -1158,17 +1158,13 @@ if __name__ == "__main__":
 
     os.environ['CUDA_VISIBLE_DEVICES'] = '0,1'
 
-    # dim을 56으로 수정 (백본 출력 채널 수에 맞춰서 변경)
-    dim = 56
-
-    block = CrossWinAttention(dim=dim,
+    block = CrossWinAttention(dim=128,
                               heads=4,
                               dim_head=32,
                               qkv_bias=True,)
     block.cuda()
-
-    test_q = torch.rand(1, 6, 5, 5, 5, 5, dim)
-    test_k = test_v = torch.rand(1, 6, 5, 5, 5, 5, dim)  # 윈도우 크기 맞춤
+    test_q = torch.rand(1, 6, 5, 5, 5, 5, 128)
+    test_k = test_v = torch.rand(1, 6, 5, 5, 5, 5, 128)  # 윈도우 크기 맞춤
     test_q = test_q.cuda()
     test_k = test_k.cuda()
     test_v = test_v.cuda()
@@ -1184,8 +1180,8 @@ if __name__ == "__main__":
     # block = CrossViewSwapAttention(
     #     feat_height=28,
     #     feat_width=60,
-    #     feat_dim=dim,
-    #     dim=dim,
+    #     feat_dim=128,
+    #     dim=128,
     #     index=0,
     #     image_height=25,
     #     image_width=25,
@@ -1196,13 +1192,13 @@ if __name__ == "__main__":
     #     dim_head=[32,],
     #     qkv_bias=True,)
 
-    image = torch.rand(1, 6, dim, 28, 60)            # b n c h w
-    I_inv = torch.rand(1, 6, 3, 3)                    # b n 3 3
-    E_inv = torch.rand(1, 6, 4, 4)                    # b n 4 4
+    image = torch.rand(1, 6, 128, 28, 60)            # b n c h w
+    I_inv = torch.rand(1, 6, 3, 3)           # b n 3 3
+    E_inv = torch.rand(1, 6, 4, 4)           # b n 4 4
 
-    feature = torch.rand(1, 6, dim, 25, 25)
+    feature = torch.rand(1, 6, 128, 25, 25)
 
-    x = torch.rand(1, dim, 25, 25)                     # b d H W
+    x = torch.rand(1, 128, 25, 25)                     # b d H W
 
     # output = block(0, x, self.bev_embedding, feature, I_inv, E_inv)
     block.cuda()
@@ -1220,3 +1216,4 @@ if __name__ == "__main__":
     out = encoder(batch)
 
     print(out.shape)
+
