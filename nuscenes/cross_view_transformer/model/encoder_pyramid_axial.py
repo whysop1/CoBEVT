@@ -938,13 +938,17 @@ class CrossViewSwapAttention(nn.Module):
 
         #내가 임의로 추가한 코드
         if self.skip:
-            target_h, target_w = query.shape[-2], query.shape[-1]  # ✅ 이 라인 추가
+            # query에서 공간 해상도를 가져옴 (윈도우 적용 전이므로 다시 계산 필요)
+            q_spatial = rearrange(query, 'b n x y w1 w2 d -> b d (x w1) (y w2)')
+            target_h, target_w = q_spatial.shape[-2], q_spatial.shape[-1]
+    
             x = F.interpolate(x, size=(target_h, target_w), mode='bilinear', align_corners=False)
             x = self.pad_divisible(x, self.q_win_size[0], self.q_win_size[1])
             x_skip = rearrange(x, 'b d (x w1) (y w2) -> b x y w1 w2 d',
                                w1=self.q_win_size[0], w2=self.q_win_size[1])
         else:
             x_skip = None
+
 
 
 
