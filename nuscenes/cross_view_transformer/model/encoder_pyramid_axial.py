@@ -721,14 +721,19 @@ class CrossWinAttention(nn.Module):
         v: (b n x y w1 w2 d)
         return: (b X Y W1 W2 d)
         """
-        print(f"[DEBUG] query shape: {query.shape}")
-        print(f"[DEBUG] key shape: {key.shape}")
-        print(f"[DEBUG] q_height*q_width: {q_height * q_width}")
-        print(f"[DEBUG] kv_height*kv_width: {kv_height * kv_width}")
+        
         
         assert k.shape == v.shape
         _, view_size, q_height, q_width, q_win_height, q_win_width, _ = q.shape
         _, _, kv_height, kv_width, _, _, _ = k.shape
+
+
+        print(f"[DEBUG] query shape: {q.shape}")
+        print(f"[DEBUG] key shape: {k.shape}")
+        print(f"[DEBUG] q_height*q_width: {q_height * q_width}")
+        print(f"[DEBUG] kv_height*kv_width: {kv_height * kv_width}")
+
+        
         assert q_height * q_width == kv_height * kv_width
 
         # flattening
