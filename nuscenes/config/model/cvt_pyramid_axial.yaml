@@ -71,8 +71,8 @@ model:
     pretrained: true
 
   cross_view:
-    heads: [4, 4, 4]            # 원래 8
-    dim_head: [32, 32, 32]      # 원래 64
+    heads: [2, 2, 2]            # 원래 8
+    dim_head: [16, 16, 16]      # 원래 64
 
     q_win_size: [4, 4, 4]  #원래 [8,8] 이었음
     feat_win_size: [4, 4, 4] #원래 16이었음
