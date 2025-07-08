@@ -902,6 +902,10 @@ class CrossViewSwapAttention(nn.Module):
 
         if self.bev_embed_flag:
             cluster_bev = bev.get_prior(cluster_ids)
+
+            #내가 추가한 코드
+            cluster_bev_resized = F.interpolate(cluster_bev, size=query_pos.shape[-2:], mode='bilinear', align_corners=False)  # (b, d, H, W)
+            
             query = query_pos + cluster_bev[:, None]
         else:
             query = x[:, None]  # (B, N, D, H, W)
