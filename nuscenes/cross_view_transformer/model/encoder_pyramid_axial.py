@@ -1131,7 +1131,7 @@ class PyramidAxialEncoder(nn.Module):
         else:
             return 4  #원래 3
 
-
+'''
 if __name__ == "__main__":
     import os
     import re
@@ -1214,4 +1214,92 @@ if __name__ == "__main__":
     out = encoder(batch)
 
     print(out.shape)
+'''
+if __name__ == "__main__":
+    import os
+    import re
+    import yaml
+    import torch
 
+    def load_yaml(file):
+        stream = open(file, 'r')
+        loader = yaml.Loader
+        loader.add_implicit_resolver(
+            u'tag:yaml.org,2002:float',
+            re.compile(u'''^(?:
+            [-+]?(?:[0-9][0-9_]*)\\.[0-9_]*(?:[eE][-+]?[0-9]+)?
+            |[-+]?(?:[0-9][0-9_]*)(?:[eE][-+]?[0-9]+)
+            |\\.[0-9_]+(?:[eE][-+][0-9]+)?
+            |[-+]?[0-9][0-9_]*(?::[0-5]?[0-9])+\\.[0-9_]*
+            |[-+]?\\.(?:inf|Inf|INF)
+            |\\.(?:nan|NaN|NAN))$''', re.X),
+            list(u'-+0123456789.'))
+        param = yaml.load(stream, Loader=loader)
+        if "yaml_parser" in param:
+            param = eval(param["yaml_parser"])(param)
+        return param
+
+    os.environ['CUDA_VISIBLE_DEVICES'] = '0,1'
+
+    # dim을 56으로 수정 (백본 출력 채널 수에 맞춰서 변경)
+    dim = 56
+
+    block = CrossWinAttention(dim=dim,
+                              heads=4,
+                              dim_head=32,
+                              qkv_bias=True,)
+    block.cuda()
+
+    test_q = torch.rand(1, 6, 5, 5, 5, 5, dim)
+    test_k = test_v = torch.rand(1, 6, 5, 5, 5, 5, dim)  # 윈도우 크기 맞춤
+    test_q = test_q.cuda()
+    test_k = test_k.cuda()
+    test_v = test_v.cuda()
+
+    output = block(test_q, test_k, test_v)
+    print(output.shape)
+
+    # test pad divisible
+    # output = block.pad_divisble(x=test_data, win_h=6, win_w=12)
+    output = block(test_q, test_k, test_v)
+    print(output.shape)
+
+    # block = CrossViewSwapAttention(
+    #     feat_height=28,
+    #     feat_width=60,
+    #     feat_dim=dim,
+    #     dim=dim,
+    #     index=0,
+    #     image_height=25,
+    #     image_width=25,
+    #     qkv_bias=True,
+    #     q_win_size=[5, 5],
+    #     feat_win_size=[6, 12],
+    #     heads=[4,],
+    #     dim_head=[32,],
+    #     qkv_bias=True,)
+
+    image = torch.rand(1, 6, dim, 28, 60)            # b n c h w
+    I_inv = torch.rand(1, 6, 3, 3)                    # b n 3 3
+    E_inv = torch.rand(1, 6, 4, 4)                    # b n 4 4
+
+    feature = torch.rand(1, 6, dim, 25, 25)
+
+    x = torch.rand(1, dim, 25, 25)                     # b d H W
+
+    # output = block(0, x, self.bev_embedding, feature, I_inv, E_inv)
+    block.cuda()
+
+    ##### EncoderSwap
+    params = load_yaml('config/model/cvt_pyramid_swap.yaml')
+
+    print(params)
+
+    batch = {}
+    batch['image'] = image
+    batch['intrinsics'] = I_inv
+    batch['extrinsics'] = E_inv
+
+    out = encoder(batch)
+
+    print(out.shape)
