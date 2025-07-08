@@ -938,11 +938,13 @@ class CrossViewSwapAttention(nn.Module):
 
         #내가 임의로 추가한 코드
         if self.skip:
-            x = self.pad_divisible(x, self.q_win_size[0], self.q_win_size[1])  # 🔧 패딩 추가
+            x = F.interpolate(x, size=(target_h, target_w), mode='bilinear', align_corners=False)
+            x = self.pad_divisible(x, self.q_win_size[0], self.q_win_size[1])
             x_skip = rearrange(x, 'b d (x w1) (y w2) -> b x y w1 w2 d',
-                       w1=self.q_win_size[0], w2=self.q_win_size[1])
+                               w1=self.q_win_size[0], w2=self.q_win_size[1])
         else:
             x_skip = None
+
 
         
         
