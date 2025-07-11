@@ -302,7 +302,7 @@ class EfficientNetBackbone(nn.Module):
         self.output_shapes = [
             (24, 100, 100),   # stage1
             (32, 50, 50),     # stage2
-            (112, 25, 25),    # stage3
+            (56, 25, 25),    # stage3
         ]
 
     def forward(self, x):
