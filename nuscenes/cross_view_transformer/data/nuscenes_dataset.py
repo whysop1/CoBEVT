@@ -240,6 +240,7 @@ class NuScenesDataset(torch.utils.data.Dataset):
         result = np.concatenate((segmentation, center_score, center_offset, center_ohw), 2)
 
         object_count = len(annotations) #object 세기 기능 추가
+        print(object_count)
 
         # (h, w, 1 + 1 + 2 + 2)
         return result, visibility, object_count #return 값에 object_count 추가
