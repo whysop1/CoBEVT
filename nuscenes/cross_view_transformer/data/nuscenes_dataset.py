@@ -196,7 +196,7 @@ class NuScenesDataset(torch.utils.data.Dataset):
             'images': images,
         }
 
-    def get_dynamic_objects(self, sample, annotations):
+    def get_dynamic_objects(self, sample, annotations): #카메라 이미지 내 객체 수를 세는 object_count 역할 수행 함수임
         h, w = self.bev_shape[:2]
 
         segmentation = np.zeros((h, w), dtype=np.uint8)
