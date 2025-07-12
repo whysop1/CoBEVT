@@ -9,7 +9,7 @@ from torchvision.models.resnet import Bottleneck
 from typing import List
 from .decoder import  DecoderBlock
 
-from nuscenes_dataset import get_dynamic_objects
+from nuscenes_dataset import get_dynamic_objects #object-count 호출 위함
 
 ResNetBottleNeck = lambda c: Bottleneck(c, c // 4)
 
