@@ -209,6 +209,8 @@ class NuScenesDataset(torch.utils.data.Dataset):
 
         coords = np.stack(np.meshgrid(np.arange(w), np.arange(h)), -1).astype(np.float32)
 
+        object_count = 0  # 객체 수 카운트
+        
         for ann, p in zip(annotations, self.convert_to_box(sample, annotations)):
             box = p[:2, :4]
             center = p[:2, 4]
@@ -234,12 +236,15 @@ class NuScenesDataset(torch.utils.data.Dataset):
 
             visibility[mask] = ann['visibility_token']
 
+            # 객체 수 증가
+            object_count += 1
+
         segmentation = np.float32(segmentation[..., None])
         center_score = center_score[..., None]
 
         result = np.concatenate((segmentation, center_score, center_offset, center_ohw), 2)
 
-        object_count = len(annotations) #object 세기 기능 추가
+        
         print(object_count)
 
         # (h, w, 1 + 1 + 2 + 2)
