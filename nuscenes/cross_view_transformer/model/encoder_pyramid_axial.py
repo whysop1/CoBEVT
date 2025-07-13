@@ -359,6 +359,7 @@ class CrossViewSwapAttention(nn.Module):
         feature: torch.FloatTensor,
         I_inv: torch.FloatTensor,
         E_inv: torch.FloatTensor,
+        object_count: Optional[torch.Tensor] = None,
     ):
         """
         x: (b, c, H, W)
@@ -368,6 +369,14 @@ class CrossViewSwapAttention(nn.Module):
 
         Returns: (b, d, H, W)
         """
+
+        #디버깅
+        if object_count is not None:
+            print(">> object_count:", object_count.shape, object_count) #각 인덱스가 특정 종류(차, 트럭, 보행자)의 객체 수임
+        else:
+            print(">> object_count is None")
+
+        
         b, n, _, _, _ = feature.shape
         _, _, H, W = x.shape
 
@@ -538,6 +547,9 @@ class PyramidAxialEncoder(nn.Module):
         I_inv = batch['intrinsics'].inverse()           # b n 3 3
         E_inv = batch['extrinsics'].inverse()           # b n 4 4
 
+        # ✅ 여기서 object_count 가져오기
+        object_count = batch.get('object_count', None)
+        
         features = [self.down(y) for y in self.backbone(self.norm(image))]
 
         x = self.bev_embedding.get_prior()              # d H W
@@ -547,7 +559,7 @@ class PyramidAxialEncoder(nn.Module):
                 enumerate(zip(self.cross_views, features, self.layers)):
             feature = rearrange(feature, '(b n) ... -> b n ...', b=b, n=n)
 
-            x = cross_view(i, x, self.bev_embedding, feature, I_inv, E_inv)
+            x = cross_view(i, x, self.bev_embedding, feature, I_inv, E_inv, object_count)
             x = layer(x)
             if i < len(features)-1:
                 down_sample_block = self.downsample_layers[i]
