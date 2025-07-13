@@ -418,7 +418,7 @@ class NuScenesDataset(torch.utils.data.Dataset):
         assert bev.shape[2] == NUM_CLASSES
 
         # Additional labels for vehicles only.
-        aux, visibility = self.get_dynamic_objects(sample, anns_vehicle)
+        aux, visibility, object_count = self.get_dynamic_objects(sample, anns_vehicle)
 
         # Package the data.
         data = Sample(
@@ -426,6 +426,7 @@ class NuScenesDataset(torch.utils.data.Dataset):
             bev=bev,
             aux=aux,
             visibility=visibility,
+            object_count = object_count,
             **sample
         )
 
