@@ -93,11 +93,31 @@ def get_data(
 
 
 
-
 class NuScenesGeneratedDataset(torch.utils.data.Dataset):
-    def __init__(self, scene_name, labels_dir, transform=None):
+    def __init__(self, scene_name, labels_dir, nusc, categories, transform=None):
         self.samples = json.loads((Path(labels_dir) / f'{scene_name}.json').read_text())
+        self.nusc = nusc  # NuScenes 객체를 전달받음
+        self.categories = categories  # 카테고리 리스트
         self.transform = transform
+
+    def get_category_index(self, category_name, categories):
+        """카테고리 이름을 통해 카테고리 인덱스를 반환"""
+        try:
+            return categories.index(category_name)
+        except ValueError:
+            return None
+
+    def get_annotations_by_category(self, sample, categories):
+        result = [[] for _ in categories]
+
+        for ann_token in self.nusc.get('sample', sample['token'])['anns']:
+            a = self.nusc.get('sample_annotation', ann_token)
+            idx = self.get_category_index(a['category_name'], categories)
+
+            if idx is not None:
+                result[idx].append(a)
+
+        return result
 
     def get_dynamic_objects(self, sample, annotations):
         h, w = self.bev_shape[:2]
@@ -159,7 +179,7 @@ class NuScenesGeneratedDataset(torch.utils.data.Dataset):
         sample = self.samples[idx]
 
         # 카메라 이미지를 위한 annotation 가져오기
-        anns_dynamic = self.get_annotations_by_category(sample, DYNAMIC)
+        anns_dynamic = self.get_annotations_by_category(sample, ['DYNAMIC'])[0]
 
         # 객체 수 계산
         aux, visibility, object_count = self.get_dynamic_objects(sample, anns_dynamic)
@@ -177,3 +197,4 @@ class NuScenesGeneratedDataset(torch.utils.data.Dataset):
             data = self.transform(data)
 
         return data
+
