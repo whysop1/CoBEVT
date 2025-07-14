@@ -374,9 +374,9 @@ class CrossViewSwapAttention(nn.Module):
 
         #디버깅
         if object_count is not None:
-            print(">> object_count:", object_count.shape, object_count) #각 인덱스가 특정 종류(차, 트럭, 보행자)의 객체 수임
+            print(">> object_count(crossviewswapattention):", object_count.shape, object_count) #각 인덱스가 특정 종류(차, 트럭, 보행자)의 객체 수임
         else:
-            print(">> object_count is None")
+            print(">> object_count(crossviewswapattention) is None")
 
         
         b, n, _, _, _ = feature.shape
@@ -551,6 +551,12 @@ class PyramidAxialEncoder(nn.Module):
 
         # ✅ 여기서 object_count 가져오기
         object_count = batch.get('object_count', None)
+
+        #디버깅
+        if object_count is not None:
+            print(">> object_count(pyramid axial encoder):", object_count.shape, object_count) #각 인덱스가 특정 종류(차, 트럭, 보행자)의 객체 수임
+        else:
+            print(">> object_count(pyramid axial encoder) is None")
         
         features = [self.down(y) for y in self.backbone(self.norm(image))]
 
