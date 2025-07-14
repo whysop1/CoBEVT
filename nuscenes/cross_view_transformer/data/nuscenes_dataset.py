@@ -688,6 +688,108 @@ class NuScenesDataset(torch.utils.data.Dataset):
                 return i
         return None
 
+    def get_line_layers(self, sample, layers, patch_radius=150, thickness=1):
+        h, w = self.bev_shape[:2]
+        V = self.view
+        M_inv = np.array(sample['pose_inverse'])
+        S = np.array([
+            [1, 0, 0, 0],
+            [0, 1, 0, 0],
+            [0, 0, 0, 1],
+        ])
+
+        box_coords = (sample['pose'][0][-1] - patch_radius, sample['pose'][1][-1] - patch_radius,
+                      sample['pose'][0][-1] + patch_radius, sample['pose'][1][-1] + patch_radius)
+        records_in_patch = self.nusc_map.get_records_in_patch(box_coords, layers, 'intersect')
+
+        result = list()
+
+        for layer in layers:
+            render = np.zeros((h, w), dtype=np.uint8)
+
+            for r in records_in_patch[layer]:
+                polygon_token = self.nusc_map.get(layer, r)
+                line = self.nusc_map.extract_line(polygon_token['line_token'])
+
+                p = np.float32(line.xy)                                     # 2 n
+                p = np.pad(p, ((0, 1), (0, 0)), constant_values=0.0)        # 3 n
+                p = np.pad(p, ((0, 1), (0, 0)), constant_values=1.0)        # 4 n
+                p = V @ S @ M_inv @ p                                       # 3 n
+                p = p[:2].round().astype(np.int32).T                        # n 2
+
+                cv2.polylines(render, [p], False, 1, thickness=thickness)
+
+            result.append(render)
+
+        return 255 * np.stack(result, -1)
+
+    def get_static_layers(self, sample, layers, patch_radius=150):
+        h, w = self.bev_shape[:2]
+        V = self.view
+        M_inv = np.array(sample['pose_inverse'])
+        S = np.array([
+            [1, 0, 0, 0],
+            [0, 1, 0, 0],
+            [0, 0, 0, 1],
+        ])
+
+        box_coords = (sample['pose'][0][-1] - patch_radius, sample['pose'][1][-1] - patch_radius,
+                      sample['pose'][0][-1] + patch_radius, sample['pose'][1][-1] + patch_radius)
+        records_in_patch = self.nusc_map.get_records_in_patch(box_coords, layers, 'intersect')
+
+        result = list()
+
+        for layer in layers:
+            render = np.zeros((h, w), dtype=np.uint8)
+
+            for r in records_in_patch[layer]:
+                polygon_token = self.nusc_map.get(layer, r)
+
+                if layer == 'drivable_area': polygon_tokens = polygon_token['polygon_tokens']
+                else: polygon_tokens = [polygon_token['polygon_token']]
+
+                for p in polygon_tokens:
+                    polygon = self.nusc_map.extract_polygon(p)
+                    polygon = MultiPolygon([polygon])
+
+                    exteriors = [np.array(poly.exterior.coords).T for poly in polygon.geoms]
+                    exteriors = [np.pad(p, ((0, 1), (0, 0)), constant_values=0.0) for p in exteriors]
+                    exteriors = [np.pad(p, ((0, 1), (0, 0)), constant_values=1.0) for p in exteriors]
+                    exteriors = [V @ S @ M_inv @ p for p in exteriors]
+                    exteriors = [p[:2].round().astype(np.int32).T for p in exteriors]
+
+                    cv2.fillPoly(render, exteriors, 1, INTERPOLATION)
+
+                    interiors = [np.array(pi.coords).T for poly in polygon.geoms for pi in poly.interiors]
+                    interiors = [np.pad(p, ((0, 1), (0, 0)), constant_values=0.0) for p in interiors]
+                    interiors = [np.pad(p, ((0, 1), (0, 0)), constant_values=1.0) for p in interiors]
+                    interiors = [V @ S @ M_inv @ p for p in interiors]
+                    interiors = [p[:2].round().astype(np.int32).T for p in interiors]
+
+                    cv2.fillPoly(render, interiors, 0, INTERPOLATION)
+
+            result.append(render)
+
+        return 255 * np.stack(result, -1)
+
+    def get_dynamic_layers(self, sample, anns_by_category):
+        h, w = self.bev_shape[:2]
+        result = list()
+
+        for anns in anns_by_category:
+            render = np.zeros((h, w), dtype=np.uint8)
+
+            for p in self.convert_to_box(sample, anns):
+                p = p[:2, :4]
+
+                cv2.fillPoly(render, [p.round().astype(np.int32).T], 1, INTERPOLATION)
+
+            result.append(render)
+
+        return 255 * np.stack(result, -1)
+
+
+    
     def __len__(self):
         return len(self.samples)
 
