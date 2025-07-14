@@ -1,3 +1,5 @@
+#nuscenes_dataset과 nuscenes_dataset_generated 중 택1하는 방식 -> 현 논문에서는 nuscenes_dataset_generated 사용중임
+
 import torch
 import numpy as np
 import cv2
