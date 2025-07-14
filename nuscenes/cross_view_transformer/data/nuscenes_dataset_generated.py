@@ -155,28 +155,13 @@ class NuScenesGeneratedDataset(torch.utils.data.Dataset):
         return anns
 
     def count_objects(self, sample, annotations):
-        h, w = 200, 200
-        coords = np.stack(np.meshgrid(np.arange(w), np.arange(h)), -1).astype(np.float32)
-        visibility = np.full((h, w), 255, dtype=np.uint8)
+        # 단순히 유효한 annotation 개수 세기
+        count = 0
+        for ann in annotations:
+            if 'translation' in ann and 'size' in ann and 'rotation' in ann:
+                count += 1
+        return count
 
-        object_count = 0
-        for ann, p in zip(annotations, self.convert_to_box(sample, annotations)):
-            box = p[:2, :4]
-            center = p[:2, 4]
-            front = p[:2, 5]
-            left = p[:2, 6]
-
-            buf = np.zeros((h, w), dtype=np.uint8)
-            cv2.fillPoly(buf, [box.round().astype(np.int32).T], 1, INTERPOLATION)
-            mask = buf > 0
-
-            if not np.count_nonzero(mask):
-                continue
-
-            object_count += 1
-            visibility[mask] = ann['visibility_token']
-
-        return object_count
 
     def convert_to_box(self, sample, annotations):
         from nuscenes.utils import data_classes
