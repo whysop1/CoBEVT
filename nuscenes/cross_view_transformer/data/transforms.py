@@ -35,6 +35,9 @@ class Sample(dict):
         self.intrinsics = intrinsics
         self.extrinsics = extrinsics
 
+        # 새로 추가된 object_count
+        self.object_count = object_count  # object_count를 속성으로 저장
+
     def __getattr__(self, key):
         return super().__getitem__(key)
 
