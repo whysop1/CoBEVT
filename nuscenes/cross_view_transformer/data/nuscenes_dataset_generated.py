@@ -156,11 +156,11 @@ class NuScenesGeneratedDataset(torch.utils.data.Dataset):
 
     def count_objects(self, sample, annotations):
         # 단순히 유효한 annotation 개수 세기
-        count = 0
+        object_count = 0
         for ann in annotations:
             if 'translation' in ann and 'size' in ann and 'rotation' in ann:
-                count += 1
-        return count
+                object_count += 1
+        return object_count
 
 
     def convert_to_box(self, sample, annotations):
