@@ -19,7 +19,7 @@ class Sample(dict):
         images,
         view,
         bev,
-        object_count,
+        object_count = None,
         **kwargs
     ):
         super().__init__(**kwargs)
