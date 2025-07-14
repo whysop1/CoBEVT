@@ -19,6 +19,7 @@ class Sample(dict):
         images,
         view,
         bev,
+        object_count,
         **kwargs
     ):
         super().__init__(**kwargs)
@@ -82,6 +83,10 @@ class SaveDataTransform:
             Image.fromarray(batch.visibility).save(scene_dir / visibility_path)
 
             result['visibility'] = visibility_path
+
+        # Save object_count
+        if batch.object_count is not None:  # object_count가 존재하면 저장
+            result['object_count'] = batch.object_count
 
         return result
 
@@ -173,6 +178,10 @@ class LoadDataTransform(torchvision.transforms.ToTensor):
 
         if 'pose' in sample:
             result['pose'] = np.float32(sample['pose'])
+
+        # Load object_count
+        if 'object_count' in sample:
+            result['object_count'] = sample['object_count']  # object_count 로드
 
         return result
 
