@@ -1,6 +1,6 @@
 # @package _global_
 defaults:
-  - override /model: cvt_pyramid_axial
+  - override /model: cvt #cvt_pyramid_axial
   - override /data: nuscenes_vehicle
 
   - override /loss: center_loss
