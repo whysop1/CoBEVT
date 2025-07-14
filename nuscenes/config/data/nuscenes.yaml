@@ -1,4 +1,4 @@
-dataset: 'nuscenes_generated'           # 원본 코드 -> dataset: 'nuscenes_generated'
+dataset: 'nuscenes'           # 원본 코드 -> dataset: 'nuscenes_generated'
 num_classes: 12                         # do not modify :)
 
 # used to get_split
