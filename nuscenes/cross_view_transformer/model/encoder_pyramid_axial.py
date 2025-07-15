@@ -361,7 +361,7 @@ class CrossViewSwapAttention(nn.Module):
         feature: torch.FloatTensor,
         I_inv: torch.FloatTensor,
         E_inv: torch.FloatTensor,
-        object_count: Optional[torch.Tensor] = None,
+        object_count: Optional[torch.Tensor] = None, #object_count
     ):
         """
         x: (b, c, H, W)
