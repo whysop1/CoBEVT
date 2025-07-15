@@ -122,7 +122,6 @@ class ObjectCounter:
             yield p
 
 
-
 def get_data(
     dataset_dir,
     labels_dir,
@@ -130,8 +129,8 @@ def get_data(
     version,
     num_classes,
     augment='none',
-    image=None,                         # image config
-    dataset='unused',                   # ignore
+    image=None,
+    dataset='unused',
     **dataset_kwargs
 ):
     dataset_dir = Path(dataset_dir)
@@ -145,7 +144,24 @@ def get_data(
     split = f'mini_{split}' if version == 'v1.0-mini' else split
     split_scenes = get_split(split, 'nuscenes')
 
-    return [NuScenesGeneratedDataset(s, labels_dir, transform=transform) for s in split_scenes]
+    # ✅ 1. BEV 설정
+    bev_shape = (200, 200)
+    bev_meters = {'h_meters': 100, 'w_meters': 100, 'offset': 0.0}
+    view_matrix = get_view_matrix(h=bev_shape[0], w=bev_shape[1], **bev_meters)
+
+    # ✅ 2. ObjectCounter 생성
+    object_counter = ObjectCounter(bev_shape, view_matrix)
+
+    # ✅ 3. NuScenesGeneratedDataset에 전달
+    return [
+        NuScenesGeneratedDataset(
+            scene_name=s,
+            labels_dir=labels_dir,
+            transform=transform,
+            object_counter=object_counter,
+        ) for s in split_scenes
+    ]
+
 
 
 class NuScenesGeneratedDataset(torch.utils.data.Dataset):
