@@ -104,14 +104,16 @@ class NuScenesGeneratedDataset(torch.utils.data.Dataset):
 
         if nusc_idx is None:
             # 토큰 못찾으면 기본값 처리
-            object_count = 0
+            object_count = -1
         else:
             sample_from_nusc = self.nusc_dataset[nusc_idx]
             object_count = sample_from_nusc.object_count
 
         print("nuscenes_dataset_generated object_count:", object_count)
-        
-        sample_dict['object_count'] = object_count
+
+        if object_count != -1:
+            sample_dict['object_count'] = object_count
+            
         data = Sample(**sample_dict)
 
         if self.transform is not None:
