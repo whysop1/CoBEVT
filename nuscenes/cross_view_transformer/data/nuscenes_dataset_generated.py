@@ -54,20 +54,23 @@ class NuScenesGeneratedDataset(torch.utils.data.Dataset):
 
         return data
 '''
-
 import json
 import torch
 import numpy as np
 import cv2
 
 from pathlib import Path
+from functools import lru_cache
 from pyquaternion import Quaternion
 
-from .common import get_split, INTERPOLATION
+from .common import get_split, get_view_matrix, get_pose  # get_pose 추가
 from .transforms import Sample, LoadDataTransform
 
-STATIC = ['lane', 'road_segment']
-DIVIDER = ['road_divider', 'lane_divider']
+from nuscenes.utils import data_classes  # 내부에서 필요
+from shapely.geometry import MultiPolygon
+
+INTERPOLATION = cv2.INTER_NEAREST
+
 DYNAMIC = [
     'car', 'truck', 'bus',
     'trailer', 'construction',
@@ -103,7 +106,8 @@ def get_data(
 
 class NuScenesGeneratedDataset(torch.utils.data.Dataset):
     """
-    Lightweight dataset wrapper around contents of a JSON file.
+    Lightweight dataset wrapper around contents of a JSON file
+
     Contains all camera info, image_paths, label_paths ...
     that are to be loaded in the transform
     """
@@ -117,80 +121,41 @@ class NuScenesGeneratedDataset(torch.utils.data.Dataset):
     def __getitem__(self, idx):
         data = Sample(**self.samples[idx])
 
-        # object_count 계산 시 키 존재 여부 확인
-        try:
-            if all(k in data for k in ["pose_inverse", "bev_shape", "annotations", "view"]):
-                _, _, object_count = get_dynamic_objects(
-                    data,
-                    data["annotations"],
-                    data["bev_shape"],
-                    data["view"]
-                )
-                data["object_count"] = object_count
-            else:
-                data["object_count"] = 0
-        except Exception as e:
-            print(f"[object_count error] scene: {data.get('scene', 'unknown')} / error: {e}")
-            data["object_count"] = 0
+        # object_count 계산
+        if hasattr(data, "aux") and hasattr(data, "visibility"):
+            try:
+                object_count = self.compute_object_count(data)
+                data.object_count = object_count
+            except Exception as e:
+                print(f"[Warning] object_count 계산 실패: {e}")
+                data.object_count = 0  # fallback
 
         if self.transform is not None:
             data = self.transform(data)
 
         return data
 
+    def compute_object_count(self, data):
+        """aux 정보로부터 BEV 상에서 객체 수를 유추"""
+        if not hasattr(data, 'aux') or data.aux is None:
+            return 0
 
-def get_dynamic_objects(sample, annotations, bev_shape, view):
-    h, w = bev_shape[:2]
+        # aux: (H, W, C) 형태 (C >= 2 이상일 것)
+        aux = data.aux
+        center_score = aux[..., 1]  # center score channel
+        threshold = 0.5  # 감지된 객체로 판단할 최소 score
 
-    segmentation = np.zeros((h, w), dtype=np.uint8)
-    center_score = np.zeros((h, w), dtype=np.float32)
-    center_offset = np.zeros((h, w, 2), dtype=np.float32)
-    center_ohw = np.zeros((h, w, 4), dtype=np.float32)
-    buf = np.zeros((h, w), dtype=np.uint8)
-    visibility = np.full((h, w), 255, dtype=np.uint8)
-    coords = np.stack(np.meshgrid(np.arange(w), np.arange(h)), -1).astype(np.float32)
+        # 연산량 줄이기 위해 threshold 초과 영역만 봄
+        mask = center_score > threshold
+        num_objects = np.count_nonzero(mask)
 
-    object_count = 0
-
-    for ann, p in zip(annotations, convert_to_box(sample, annotations, view)):
-        box = p[:2, :4]
-        center = p[:2, 4]
-        front = p[:2, 5]
-        left = p[:2, 6]
-
-        buf.fill(0)
-        cv2.fillPoly(buf, [box.round().astype(np.int32).T], 1, INTERPOLATION)
-        mask = buf > 0
-
-        if not np.count_nonzero(mask):
-            continue
-
-        sigma = 1
-        segmentation[mask] = 255
-        center_offset[mask] = center[None] - coords[mask]
-        center_score[mask] = np.exp(-(center_offset[mask] ** 2).sum(-1) / (sigma ** 2))
-
-        center_ohw[mask, 0:2] = ((front - center) / (np.linalg.norm(front - center) + 1e-6))[None]
-        center_ohw[mask, 2:3] = np.linalg.norm(front - center)
-        center_ohw[mask, 3:4] = np.linalg.norm(left - center)
-
-        visibility[mask] = ann.get('visibility_token', 255)
-
-        object_count += 1
-
-    segmentation = np.float32(segmentation[..., None])
-    center_score = center_score[..., None]
-
-    result = np.concatenate((segmentation, center_score, center_offset, center_ohw), 2)
-
-    return result, visibility, object_count
+        return int(num_objects)
 
 
-def convert_to_box(sample, annotations, view):
-    from nuscenes.utils import data_classes
-
-    V = np.array(view)
-    M_inv = np.array(sample.pose_inverse)
+# 추후 다른 용도로 필요할 수 있으므로, 변환 함수도 추가해 둠
+def convert_to_box(sample, annotations, view_matrix):
+    V = view_matrix
+    M_inv = np.array(sample['pose_inverse'])
     S = np.array([
         [1, 0, 0, 0],
         [0, 1, 0, 0],
@@ -210,4 +175,3 @@ def convert_to_box(sample, annotations, view):
         p = V @ S @ M_inv @ p
 
         yield p
-
