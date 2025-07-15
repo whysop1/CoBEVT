@@ -93,17 +93,23 @@ class NuScenesGeneratedDataset(torch.utils.data.Dataset):
         return len(self.samples)
 
     def __getitem__(self, idx):
-        # JSON에서 읽어온 샘플
         sample_dict = self.samples[idx]
+        token = sample_dict['token']
 
-        # 1번 코드의 NuScenesDataset에서 object_count만 얻기
-        # __getitem__은 Sample(view, bev, aux, visibility, object_count 등 모두 반환
-        sample_from_nusc = self.nusc_dataset[idx]
+        # nusc_dataset.samples에서 token이 일치하는 인덱스 찾기
+        nusc_idx = None
+        for i, sample in enumerate(self.nusc_dataset.samples):
+            if sample['token'] == token:
+                nusc_idx = i
+                break
+        if nusc_idx is None:
+            raise ValueError(f"Token {token} not found in NuScenesDataset samples")
+
+        # nusc_dataset에서 해당 인덱스 가져와 object_count 추출
+        sample_from_nusc = self.nusc_dataset[nusc_idx]
         object_count = sample_from_nusc.object_count
 
-        # JSON 샘플에 object_count를 붙임
         sample_dict['object_count'] = object_count
-
         data = Sample(**sample_dict)
 
         if self.transform is not None:
