@@ -54,7 +54,6 @@ class NuScenesGeneratedDataset(torch.utils.data.Dataset):
 
         return data
 '''
-
 import json
 import torch
 
@@ -69,7 +68,6 @@ from pyquaternion import Quaternion
 from .common import INTERPOLATION, get_view_matrix, get_pose, get_split
 
 
-
 class ObjectCounter:
     def __init__(self, bev_shape, view_matrix):
         self.bev_shape = bev_shape  # (h, w)
@@ -78,14 +76,10 @@ class ObjectCounter:
     def count_objects(self, sample, annotations):
         h, w = self.bev_shape[:2]
         buf = np.zeros((h, w), dtype=np.uint8)
-        coords = np.stack(np.meshgrid(np.arange(w), np.arange(h)), -1).astype(np.float32)
 
         object_count = 0
         for ann, p in zip(annotations, self._convert_to_box(sample, annotations)):
             box = p[:2, :4]
-            center = p[:2, 4]
-            front = p[:2, 5]
-            left = p[:2, 6]
 
             buf.fill(0)
             cv2.fillPoly(buf, [box.round().astype(np.int32).T], 1, cv2.INTER_LINEAR)
@@ -111,15 +105,14 @@ class ObjectCounter:
 
         for a in annotations:
             box = data_classes.Box(a['translation'], a['size'], Quaternion(a['rotation']))
-
-            corners = box.bottom_corners()  # 3x4
+            corners = box.bottom_corners()
             center = corners.mean(-1)
             front = (corners[:, 0] + corners[:, 1]) / 2.0
             left = (corners[:, 0] + corners[:, 3]) / 2.0
 
-            p = np.concatenate((corners, np.stack((center, front, left), -1)), -1)  # 3x7
-            p = np.pad(p, ((0, 1), (0, 0)), constant_values=1.0)  # 4x7
-            p = V @ S @ M_inv @ p  # 3x7
+            p = np.concatenate((corners, np.stack((center, front, left), -1)), -1)
+            p = np.pad(p, ((0, 1), (0, 0)), constant_values=1.0)
+            p = V @ S @ M_inv @ p
 
             yield p
 
@@ -146,15 +139,12 @@ def get_data(
     split = f'mini_{split}' if version == 'v1.0-mini' else split
     split_scenes = get_split(split, 'nuscenes')
 
-    # ✅ 1. BEV 설정
+    # ✅ ObjectCounter 구성
     bev_shape = (200, 200)
     bev_meters = {'h_meters': 100, 'w_meters': 100, 'offset': 0.0}
     view_matrix = get_view_matrix(h=bev_shape[0], w=bev_shape[1], **bev_meters)
-
-    # ✅ 2. ObjectCounter 생성
     object_counter = ObjectCounter(bev_shape, view_matrix)
 
-    # ✅ 3. NuScenesGeneratedDataset에 전달
     return [
         NuScenesGeneratedDataset(
             scene_name=s,
@@ -165,18 +155,16 @@ def get_data(
     ]
 
 
-
 class NuScenesGeneratedDataset(torch.utils.data.Dataset):
     """
     Lightweight dataset wrapper around contents of a JSON file
-
     Contains all camera info, image_paths, label_paths ...
     that are to be loaded in the transform
     """
-    def __init__(self, scene_name, labels_dir, transform=None):
+    def __init__(self, scene_name, labels_dir, transform=None, object_counter=None):
         self.samples = json.loads((Path(labels_dir) / f'{scene_name}.json').read_text())
         self.transform = transform
-        self.object_counter = object_counter
+        self.object_counter = object_counter  # ✅ 여기에 저장
 
     def __len__(self):
         return len(self.samples)
@@ -184,11 +172,15 @@ class NuScenesGeneratedDataset(torch.utils.data.Dataset):
     def __getitem__(self, idx):
         data = Sample(**self.samples[idx])
 
+        # ✅ 객체 수 계산 및 추가
         if self.object_counter is not None:
             annotations = data['annotations'] if 'annotations' in data else []
-            object_count = self.object_counter.count_objects(data, annotations)
+            try:
+                object_count = self.object_counter.count_objects(data, annotations)
+            except Exception as e:
+                object_count = 0  # 예외 발생 시 0으로 설정
             data['object_count'] = object_count
-        
+
         if self.transform is not None:
             data = self.transform(data)
 
