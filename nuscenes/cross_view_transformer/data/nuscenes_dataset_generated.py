@@ -117,16 +117,21 @@ class NuScenesGeneratedDataset(torch.utils.data.Dataset):
     def __getitem__(self, idx):
         data = Sample(**self.samples[idx])
 
-        # If annotation and pose info exists, compute object_count
-        if hasattr(data, "pose_inverse") and hasattr(data, "bev_shape") and hasattr(data, "annotations"):
-            try:
-                _, _, object_count = get_dynamic_objects(data, data.annotations, data.bev_shape, data.view)
-                data.object_count = object_count
-            except Exception as e:
-                print(f"Failed to compute object_count: {e}")
-                data.object_count = 0
-        else:
-            data.object_count = 0
+        # object_count 계산 시 키 존재 여부 확인
+        try:
+            if all(k in data for k in ["pose_inverse", "bev_shape", "annotations", "view"]):
+                _, _, object_count = get_dynamic_objects(
+                    data,
+                    data["annotations"],
+                    data["bev_shape"],
+                    data["view"]
+                )
+                data["object_count"] = object_count
+            else:
+                data["object_count"] = 0
+        except Exception as e:
+            print(f"[object_count error] scene: {data.get('scene', 'unknown')} / error: {e}")
+            data["object_count"] = 0
 
         if self.transform is not None:
             data = self.transform(data)
