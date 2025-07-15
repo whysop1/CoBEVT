@@ -55,12 +55,14 @@ class NuScenesGeneratedDataset(torch.utils.data.Dataset):
         return data
 '''
 
+
 import json
 import torch
 import numpy as np
 import cv2
 
 from pathlib import Path
+from functools import lru_cache
 from pyquaternion import Quaternion
 from nuscenes.utils import data_classes
 
@@ -68,6 +70,7 @@ from .common import get_split
 from .transforms import Sample, LoadDataTransform
 
 INTERPOLATION = cv2.INTER_NEAREST
+
 
 def get_data(
     dataset_dir,
@@ -94,7 +97,7 @@ def get_data(
 
 class NuScenesGeneratedDataset(torch.utils.data.Dataset):
     """
-    Loads JSON and recomputes object_count on-the-fly.
+    Loads JSON and recomputes object_count exactly like NuScenesDataset
     """
 
     def __init__(self, scene_name, labels_dir, transform=None):
@@ -109,18 +112,18 @@ class NuScenesGeneratedDataset(torch.utils.data.Dataset):
         # load sample as dict
         data_dict = dict(self.samples[idx])
 
-        # get object_count
-        annotations = data_dict.get('annotations', [])
+        # Extract fields needed
         view = np.array(data_dict['view'])
-        pose = np.array(data_dict['pose'])
         pose_inverse = np.array(data_dict['pose_inverse'])
+        annotations = data_dict.get('annotations', [])
 
-        object_count = self.compute_object_count(annotations, view, pose, pose_inverse)
+        # Compute object_count
+        object_count = self.get_dynamic_objects(view, pose_inverse, annotations)
 
-        # add it back
+        # Add back
         data_dict['object_count'] = object_count
 
-        # wrap in Sample
+        # Wrap
         data = Sample(**data_dict)
 
         if self.transform is not None:
@@ -128,16 +131,24 @@ class NuScenesGeneratedDataset(torch.utils.data.Dataset):
 
         return data
 
-    def compute_object_count(self, annotations, view, pose, pose_inverse):
+    def get_dynamic_objects(self, view, pose_inverse, annotations):
+        """
+        Matches original NuScenesDataset.get_dynamic_objects() logic
+        """
         h, w = self.bev_shape
 
         # Preallocate
         buf = np.zeros((h, w), dtype=np.uint8)
         object_count = 0
 
-        # convert annotations to BEV polygons
-        for ann, p in zip(annotations, self.convert_to_box(annotations, view, pose_inverse)):
+        coords = np.stack(np.meshgrid(np.arange(w), np.arange(h)), -1).astype(np.float32)
+
+        # For each annotation, project to BEV and rasterize
+        for ann, p in zip(annotations, self.convert_to_box(view, pose_inverse, annotations)):
             box = p[:2, :4]
+            center = p[:2, 4]
+            front = p[:2, 5]
+            left = p[:2, 6]
 
             buf.fill(0)
             cv2.fillPoly(buf, [box.round().astype(np.int32).T], 1, INTERPOLATION)
@@ -148,10 +159,12 @@ class NuScenesGeneratedDataset(torch.utils.data.Dataset):
 
             object_count += 1
 
-        print(object_count)
         return object_count
 
-    def convert_to_box(self, annotations, view, pose_inverse):
+    def convert_to_box(self, view, pose_inverse, annotations):
+        """
+        Matches NuScenesDataset.convert_to_box() logic
+        """
         M_inv = np.array(pose_inverse)
         S = np.array([
             [1, 0, 0, 0],
@@ -162,14 +175,13 @@ class NuScenesGeneratedDataset(torch.utils.data.Dataset):
         for ann in annotations:
             box = data_classes.Box(ann['translation'], ann['size'], Quaternion(ann['rotation']))
 
-            corners = box.bottom_corners()
-            center = corners.mean(-1)
+            corners = box.bottom_corners()         # 3 x 4
+            center = corners.mean(-1)              # 3
             front = (corners[:, 0] + corners[:, 1]) / 2.0
             left = (corners[:, 0] + corners[:, 3]) / 2.0
 
-            p = np.concatenate((corners, np.stack((center, front, left), -1)), -1)
-            p = np.pad(p, ((0, 1), (0, 0)), constant_values=1.0)
-            p = view @ S @ M_inv @ p
+            p = np.concatenate((corners, np.stack((center, front, left), -1)), -1)  # 3 x 7
+            p = np.pad(p, ((0, 1), (0, 0)), constant_values=1.0)                    # 4 x 7
+            p = view @ S @ M_inv @ p                                                # 3 x 7
 
             yield p
-
