@@ -158,6 +158,7 @@ class NuScenesGeneratedDataset(torch.utils.data.Dataset):
     def __init__(self, scene_name, labels_dir, transform=None):
         self.samples = json.loads((Path(labels_dir) / f'{scene_name}.json').read_text())
         self.transform = transform
+        self.object_counter = object_counter
 
     def __len__(self):
         return len(self.samples)
@@ -165,6 +166,11 @@ class NuScenesGeneratedDataset(torch.utils.data.Dataset):
     def __getitem__(self, idx):
         data = Sample(**self.samples[idx])
 
+        if self.object_counter is not None:
+            annotations = data['annotations'] if 'annotations' in data else []
+            object_count = self.object_counter.count_objects(data, annotations)
+            data['object_count'] = object_count
+        
         if self.transform is not None:
             data = self.transform(data)
 
