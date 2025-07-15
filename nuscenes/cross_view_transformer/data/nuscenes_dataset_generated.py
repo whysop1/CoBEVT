@@ -96,18 +96,18 @@ class NuScenesGeneratedDataset(torch.utils.data.Dataset):
         sample_dict = self.samples[idx]
         token = sample_dict['token']
 
-        # nusc_dataset.samples에서 token이 일치하는 인덱스 찾기
         nusc_idx = None
         for i, sample in enumerate(self.nusc_dataset.samples):
             if sample['token'] == token:
                 nusc_idx = i
                 break
-        if nusc_idx is None:
-            raise ValueError(f"Token {token} not found in NuScenesDataset samples")
 
-        # nusc_dataset에서 해당 인덱스 가져와 object_count 추출
-        sample_from_nusc = self.nusc_dataset[nusc_idx]
-        object_count = sample_from_nusc.object_count
+        if nusc_idx is None:
+            # 토큰 못찾으면 기본값 처리
+            object_count = 0
+        else:
+            sample_from_nusc = self.nusc_dataset[nusc_idx]
+            object_count = sample_from_nusc.object_count
 
         sample_dict['object_count'] = object_count
         data = Sample(**sample_dict)
@@ -116,6 +116,7 @@ class NuScenesGeneratedDataset(torch.utils.data.Dataset):
             data = self.transform(data)
 
         return data
+
 
 
 def get_data(
