@@ -89,7 +89,7 @@ def get_data(
     version,
     dataset='unused',                   # ignore
     augment='unused',                   # ignore
-    image='unused',                     # ignore
+    image=None,                     # ignore
     label_indices='unused',             # ignore
     num_classes=NUM_CLASSES,            # in here to make config consistent
     **dataset_kwargs
