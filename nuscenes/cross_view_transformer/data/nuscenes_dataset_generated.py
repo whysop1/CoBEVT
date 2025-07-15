@@ -109,6 +109,8 @@ class NuScenesGeneratedDataset(torch.utils.data.Dataset):
             sample_from_nusc = self.nusc_dataset[nusc_idx]
             object_count = sample_from_nusc.object_count
 
+        print("nuscenes_dataset_generated object_count:", object_count)
+        
         sample_dict['object_count'] = object_count
         data = Sample(**sample_dict)
 
