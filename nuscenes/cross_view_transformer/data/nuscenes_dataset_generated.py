@@ -1,4 +1,4 @@
-
+'''
 import json
 import torch
 
@@ -156,4 +156,4 @@ def get_data(
         for s in split_scenes
     ]
 
-'''
+
