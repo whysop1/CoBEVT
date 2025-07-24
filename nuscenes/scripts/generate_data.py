@@ -88,7 +88,6 @@ if __name__ == '__main__':
     main()
 
 '''
-
 import torch
 import json
 import hydra
@@ -102,7 +101,7 @@ from cross_view_transformer.data.transforms import LoadDataTransform
 from cross_view_transformer.common import setup_config, setup_data_module, setup_viz
 
 # 추가된 부분: NuScenesDataset 임포트
-from nuscenes_dataset import NuScenesDataset
+from nuscenes_dataset import NuScenesDataset, NuScenesSingleton
 
 
 def setup(cfg):
@@ -171,7 +170,11 @@ def main(cfg):
                     anns_vehicle = dataset.get_annotations_by_category(sample, ['vehicle'])[0]
                     _, _, object_count = dataset.get_dynamic_objects(sample, anns_vehicle)
 
-                    sample['object_count'] = object_count  # 샘플에 object_count 추가
+                    # object_count를 샘플에 추가
+                    sample['object_count'] = object_count
+
+                    # object_count가 제대로 계산되었는지 확인
+                    print(f"Sample Token: {sample['token']} -> object_count: {object_count}")
 
                 # Load data from disk to test if it was saved correctly
                 if i == 0 and viz_fn is not None:
