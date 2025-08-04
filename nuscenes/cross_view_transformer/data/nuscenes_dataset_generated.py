@@ -92,7 +92,7 @@ class NuScenesGeneratedDataset(torch.utils.data.Dataset):
     def __len__(self):
         return len(self.samples)
 
-    '''
+    
     def __getitem__(self, idx):
         sample_dict = self.samples[idx]
         token = sample_dict['token']
@@ -121,39 +121,7 @@ class NuScenesGeneratedDataset(torch.utils.data.Dataset):
             data = self.transform(data)
 
         return data
-    '''
-
-    def __getitem__(self, idx):
-        sample_dict = self.samples[idx]
-        token = sample_dict['token']
-
-        nusc_idx = None
-        for i, sample in enumerate(self.nusc_dataset.samples):
-            if sample['token'] == token:
-                nusc_idx = i
-                break
-
-        if nusc_idx is None:
-            object_count = -1
-        else:
-            sample_from_nusc = self.nusc_dataset[nusc_idx]
-            object_count = sample_from_nusc.object_count
-
-        sample_dict['object_count'] = object_count
-
-        # Load base Sample object
-        data = Sample(**sample_dict)
-
-        if self.transform is not None:
-            data = self.transform(data)
-
-        # ✅ object_count를 dict로 함께 전달
-        return {
-            "data": data,
-            "object_count": torch.tensor(object_count, dtype=torch.float32)
-        }
-
-
+    
 
 def get_data(
     dataset_dir,
