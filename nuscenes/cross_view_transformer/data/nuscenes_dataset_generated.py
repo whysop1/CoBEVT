@@ -207,6 +207,10 @@ class NuScenesGeneratedDataset(torch.utils.data.Dataset):
             cameras=[[0, 1, 2, 3, 4, 5]],
             bev={'h': 200, 'w': 200, 'h_meters': 100, 'w_meters': 100, 'offset': 0.0}
         )
+
+
+
+
         
         # object_count를 미리 계산하여 self.samples에 저장
         self._precompute_object_counts()
