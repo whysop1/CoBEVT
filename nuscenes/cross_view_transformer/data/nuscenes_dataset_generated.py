@@ -179,17 +179,7 @@ class NuScenesGeneratedDataset(torch.utils.data.Dataset):
         # 1번 코드의 NuScenesSingleton 생성
         self.nusc_helper = NuScenesSingleton(dataset_dir, version)
 
-        '''
-        # 1번 코드의 NuScenesDataset 생성
-        # cameras, bev 설정은 1번 파일에서 쓰던 기본값과 동일
-        self.nusc_dataset = NuScenesDataset(
-            scene_name=scene_name,
-            scene_record=self.nusc_helper.nusc.get('scene', self.nusc_helper.nusc.scene[0]['token']),
-            helper=self.nusc_helper,
-            cameras=[[0, 1, 2, 3, 4, 5]],
-            bev={'h': 200, 'w': 200, 'h_meters': 100, 'w_meters': 100, 'offset': 0.0}
-        )
-        '''
+        
 
         scene_record = None
         for s_rec in self.nusc_helper.nusc.scene:
