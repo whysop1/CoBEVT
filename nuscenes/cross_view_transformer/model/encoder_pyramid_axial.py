@@ -589,7 +589,15 @@ class CrossViewSwapAttention(nn.Module):
             print(">> object_count(crossviewswapattention) is None")
 
         b, n, _, _, _ = feature.shape
-        _, _, H, W = x.shape
+        
+        # --- 패딩을 위한 원본 크기 저장 ---
+        orig_H, orig_W = x.shape[-2:]
+        
+        # --- 입력 텐서 패딩 ---
+        win_h, win_w = self.q_win_size
+        pad_h = (win_h - orig_H % win_h) % win_h
+        pad_w = (win_w - orig_W % win_w) % win_w
+        x = F.pad(x, (0, pad_w, 0, pad_h))
 
         pixel = self.image_plane
         _, _, _, h, w = pixel.shape
@@ -613,11 +621,14 @@ class CrossViewSwapAttention(nn.Module):
         elif index == 2: world = bev.grid2[:2]
         elif index == 3: world = bev.grid3[:2]
 
+        query_pos = None
         if self.bev_embed_flag:
             w_embed = self.bev_embed(world[None])
             bev_embed = w_embed - c_embed
             bev_embed = bev_embed / (bev_embed.norm(dim=1, keepdim=True) + 1e-7)
             query_pos = rearrange(bev_embed, '(b n) ... -> b n ...', b=b, n=n)
+            # 위치 임베딩도 동일하게 패딩
+            query_pos = F.pad(query_pos, (0, pad_w, 0, pad_h))
 
         feature_flat = rearrange(feature, 'b n ... -> (b n) ...')
 
@@ -633,7 +644,6 @@ class CrossViewSwapAttention(nn.Module):
         key = self.pad_divisble(key, self.feat_win_size[0], self.feat_win_size[1])
         val = self.pad_divisble(val, self.feat_win_size[0], self.feat_win_size[1])
 
-        # `object_count`에 따라 반복 횟수 결정
         if object_count is not None:
             total_objects = torch.sum(object_count)
             if total_objects <= 10:
@@ -643,11 +653,11 @@ class CrossViewSwapAttention(nn.Module):
             else:
                 num_repeats = 6
         else:
-            num_repeats = 2  # 기본값
+            num_repeats = 2
 
         num_sequences = num_repeats // 2
         
-        bev_feature = x # 반복 업데이트될 BEV 피처
+        bev_feature = x # 패딩된 x로 시작
 
         for i in range(num_sequences):
             bev_feature_input = bev_feature
@@ -657,7 +667,6 @@ class CrossViewSwapAttention(nn.Module):
             else:
                 query = bev_feature_input[:, None]
             
-            # --- 로컬 어텐션 블록 ---
             q_local = rearrange(query, 'b n d (x w1) (y w2) -> b n x y w1 w2 d', w1=self.q_win_size[0], w2=self.q_win_size[1])
             k_local = rearrange(key, 'b n d (x w1) (y w2) -> b n x y w1 w2 d', w1=self.feat_win_size[0], w2=self.feat_win_size[1])
             v_local = rearrange(val, 'b n d (x w1) (y w2) -> b n x y w1 w2 d', w1=self.feat_win_size[0], w2=self.feat_win_size[1])
@@ -668,7 +677,6 @@ class CrossViewSwapAttention(nn.Module):
             x_local_out = rearrange(x_local_out, 'b x y w1 w2 d -> b (x w1) (y w2) d')
             x_local_out = x_local_out + self.local_mlps[i](self.local_norms[i](x_local_out))
 
-            # --- 글로벌 어텐션 블록 ---
             x_skip_global = x_local_out
             q_global = repeat(x_local_out, 'b x y d -> b n x y d', n=n)
             q_global = rearrange(q_global, 'b n (x w1) (y w2) d -> b n x y w1 w2 d', w1=self.q_win_size[0], w2=self.q_win_size[1])
@@ -685,9 +693,14 @@ class CrossViewSwapAttention(nn.Module):
             
             bev_feature = x_global_out + self.global_mlps[i](self.global_norms[i](x_global_out))
         
-        # --- 최종 처리 ---
-        final_query = self.postnorm(bev_feature)
-        final_query = rearrange(final_query, 'b H W d -> b d H W')
+        # --- 패딩 제거 및 최종 처리 ---
+        # 원본 크기로 잘라내기
+        final_query = bev_feature[..., :orig_H, :orig_W]
+
+        # LayerNorm을 위해 차원 순서 변경 후 복원
+        final_query = final_query.permute(0, 2, 3, 1) # -> (b, H, W, d)
+        final_query = self.postnorm(final_query)
+        final_query = final_query.permute(0, 3, 1, 2) # -> (b, d, H, W)
 
         return final_query
 
