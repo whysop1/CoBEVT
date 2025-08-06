@@ -484,152 +484,175 @@ class CrossViewSwapAttention(nn.Module):
         return query
 '''
 
-        def forward(
-            self,
-            index: int,
-            x: torch.FloatTensor,
-            bev: BEVEmbedding,
-            feature: torch.FloatTensor,
-            I_inv: torch.FloatTensor,
-            E_inv: torch.FloatTensor,
-            object_count: Optional[torch.Tensor] = None, # object_count
-        ):
-    """
-    x: (b, c, H, W)
-    feature: (b, n, dim_in, h, w)
-    I_inv: (b, n, 3, 3)
-    E_inv: (b, n, 4, 4)
-    object_count: (b,)
+    def forward(
+        self,
+        index: int,
+        x: torch.FloatTensor,
+        bev: BEVEmbedding,
+        feature: torch.FloatTensor,
+        I_inv: torch.FloatTensor,
+        E_inv: torch.FloatTensor,
+        object_count: Optional[torch.Tensor] = None, # object_count
+    ):
+        """
+        x: (b, c, H, W)
+        feature: (b, n, dim_in, h, w)
+        I_inv: (b, n, 3, 3)
+        E_inv: (b, n, 4, 4)
+        object_count: (b,)
 
-    Returns: (b, d, H, W)
-    """
+        Returns: (b, d, H, W)
+        """
 
-            # --- 1. Key, Value, Positional Embedding 준비 (루프 외부에서 한 번만 실행) ---
-            b, n, _, _, _ = feature.shape
-            _, _, H, W = x.shape
+        # --- 1. Key, Value, Positional Embedding 준비 (루프 외부에서 한 번만 실행) ---
+        b, n, _, _, _ = feature.shape
+        _, _, H, W = x.shape
 
-            pixel = self.image_plane                                                      # b n 3 h w
-            _, _, _, h, w = pixel.shape
+        pixel = self.image_plane
+        _, _, _, h, w = pixel.shape
 
-            c = E_inv[..., -1:]                                                           # b n 4 1
-            c_flat = rearrange(c, 'b n ... -> (b n) ...')[..., None]                       # (b n) 4 1 1
-            c_embed = self.cam_embed(c_flat)                                              # (b n) d 1 1
+        c = E_inv[..., -1:]
+        c_flat = rearrange(c, 'b n ... -> (b n) ...')[..., None]
+        c_embed = self.cam_embed(c_flat)
 
-            pixel_flat = rearrange(pixel, '... h w -> ... (h w)')                         # 1 1 3 (h w)
-            cam = I_inv @ pixel_flat                                                      # b n 3 (h w)
-            cam = F.pad(cam, (0, 0, 0, 1, 0, 0, 0, 0), value=1)                            # b n 4 (h w)
-            d = E_inv @ cam                                                               # b n 4 (h w)
-            d_flat = rearrange(d, 'b n d (h w) -> (b n) d h w', h=h, w=w)                  # (b n) 4 h w
-            d_embed = self.img_embed(d_flat)                                              # (b n) d h w
+        pixel_flat = rearrange(pixel, '... h w -> ... (h w)')
+        cam = I_inv @ pixel_flat
+        cam = F.pad(cam, (0, 0, 0, 1, 0, 0, 0, 0), value=1)
+        d = E_inv @ cam
+        d_flat = rearrange(d, 'b n d (h w) -> (b n) d h w', h=h, w=w)
+        d_embed = self.img_embed(d_flat)
 
-            img_embed = d_embed - c_embed                                                 # (b n) d h w
-            img_embed = img_embed / (img_embed.norm(dim=1, keepdim=True) + 1e-7)           # (b n) d h w
+        img_embed = d_embed - c_embed
+        img_embed = img_embed / (img_embed.norm(dim=1, keepdim=True) + 1e-7)
 
-            if index == 0:
-                world = bev.grid0[:2]
-            elif index == 1:
-                world = bev.grid1[:2]
-            elif index == 2:
-                world = bev.grid2[:2]
-            elif index == 3:
-                world = bev.grid3[:2]
+        if index == 0:
+            world = bev.grid0[:2]
+        elif index == 1:
+            world = bev.grid1[:2]
+        elif index == 2:
+            world = bev.grid2[:2]
+        elif index == 3:
+            world = bev.grid3[:2]
 
+        if self.bev_embed_flag:
+            w_embed = self.bev_embed(world[None])
+            bev_embed = w_embed - c_embed
+            bev_embed = bev_embed / (bev_embed.norm(dim=1, keepdim=True) + 1e-7)
+            query_pos = rearrange(bev_embed, '(b n) ... -> b n ...', b=b, n=n)
+
+        feature_flat = rearrange(feature, 'b n ... -> (b n) ...')
+
+        if self.feature_proj is not None:
+            key_flat = img_embed + self.feature_proj(feature_flat)
+        else:
+            key_flat = img_embed
+
+        val_flat = self.feature_linear(feature_flat)
+
+        key = rearrange(key_flat, '(b n) ... -> b n ...', b=b, n=n)
+        val = rearrange(val_flat, '(b n) ... -> b n ...', b=b, n=n)
+
+        key = self.pad_divisble(key, self.feat_win_size[0], self.feat_win_size[1])
+        val = self.pad_divisble(val, self.feat_win_size[0], self.feat_win_size[1])
+
+
+        # --- 2. 동적 반복 횟수 결정 ---
+        # ✅ object_count가 (b,) 형태의 텐서이므로, sum 없이 바로 사용합니다.
+        if object_count is not None:
+            # 배치 내에서 가장 객체 수가 많은 샘플을 기준으로 반복 횟수를 통일합니다.
+            # (GPU 연산 효율성을 위해 배치 내 루프 횟수는 동일해야 함)
+            max_objects_in_batch = object_count.max().item()
+
+            if max_objects_in_batch > 30: # 객체가 30개 초과로 많으면
+                num_iterations = 6
+            elif max_objects_in_batch > 10: # 객체가 10개 초과면
+                num_iterations = 4
+            else: # 그 외
+                num_iterations = 2
+        else:
+            num_iterations = 2 # 기본값
+
+
+        # --- 3. Attention Block 반복 수행 ---
+        refined_x = x # 루프를 돌며 업데이트될 BEV 피처
+
+        for _ in range(num_iterations):
+            # 루프의 시작에서 BEV 피처(refined_x)를 Query로 사용합니다.
             if self.bev_embed_flag:
-                w_embed = self.bev_embed(world[None])                                     # 1 d H W
-                bev_embed = w_embed - c_embed                                             # (b n) d H W
-                bev_embed = bev_embed / (bev_embed.norm(dim=1, keepdim=True) + 1e-7)      # (b n) d H W
-                query_pos = rearrange(bev_embed, '(b n) ... -> b n ...', b=b, n=n)        # b n d H W
-
-            feature_flat = rearrange(feature, 'b n ... -> (b n) ...')                     # (b n) d h w
-
-            if self.feature_proj is not None:
-                key_flat = img_embed + self.feature_proj(feature_flat)                    # (b n) d h w
+                query = query_pos + refined_x[:, None]
             else:
-                key_flat = img_embed                                                      # (b n) d h w
+                query = refined_x[:, None] # b n d H W
 
-            val_flat = self.feature_linear(feature_flat)                                  # (b n) d h w
+            # --- Single Attention Block Start ---
+            # 1. Local-to-Local Cross-Attention
+            query_L = rearrange(
+                query, 
+                'b n d (x w1) (y w2) -> b n x y w1 w2 d',
+                w1=self.q_win_size[0], w2=self.q_win_size[1]
+            )
+            key_L = rearrange(
+                key, 
+                'b n d (x w1) (y w2) -> b n x y w1 w2 d',
+                w1=self.feat_win_size[0], w2=self.feat_win_size[1]
+            )
+            val_L = rearrange(
+                val, 
+                'b n d (x w1) (y w2) -> b n x y w1 w2 d',
+                w1=self.feat_win_size[0], w2=self.feat_win_size[1]
+            )
 
-            key = rearrange(key_flat, '(b n) ... -> b n ...', b=b, n=n)                   # b n d h w
-            val = rearrange(val_flat, '(b n) ... -> b n ...', b=b, n=n)                   # b n d h w
+            skip_L = rearrange(
+                refined_x, 
+                'b d (x w1) (y w2) -> b x y w1 w2 d',
+                w1=self.q_win_size[0], w2=self.q_win_size[1]
+            ) if self.skip else None
 
-            key = self.pad_divisble(key, self.feat_win_size[0], self.feat_win_size[1])
-            val = self.pad_divisble(val, self.feat_win_size[0], self.feat_win_size[1])
+            attended_x = self.cross_win_attend_1(query_L, key_L, val_L, skip=skip_L)
+            attended_x = rearrange(attended_x, 'b x y w1 w2 d -> b (x w1) (y w2) d')
+            attended_x = attended_x + self.mlp_1(self.prenorm_1(attended_x))
+
+            # 2. Local-to-Global Cross-Attention
+            x_skip = attended_x
+            query_G = repeat(attended_x, 'b x y d -> b n x y d', n=n)
+            query_G = rearrange(
+                query_G, 
+                'b n (x w1) (y w2) d -> b n x y w1 w2 d',
+                w1=self.q_win_size[0], w2=self.q_win_size[1]
+            )
+
+            key_G = rearrange(key, 'b n x y w1 w2 d -> b n (x w1) (y w2) d')
+            key_G = rearrange(
+                key_G, 
+                'b n (w1 x) (w2 y) d -> b n x y w1 w2 d',
+                w1=self.feat_win_size[0], w2=self.feat_win_size[1]
+            )
+            val_G = rearrange(val, 'b n x y w1 w2 d -> b n (x w1) (y w2) d')
+            val_G = rearrange(
+                val, 
+                'b n (w1 x) (w2 y) d -> b n x y w1 w2 d',
+                w1=self.feat_win_size[0], w2=self.feat_win_size[1]
+            )
+
+            skip_G = rearrange(
+                x_skip, 
+                'b (x w1) (y w2) d -> b x y w1 w2 d',
+                w1=self.q_win_size[0], w2=self.q_win_size[1]
+            ) if self.skip else None
+
+            attended_x = self.cross_win_attend_2(query_G, key_G, val_G, skip=skip_G)
+            attended_x = rearrange(attended_x, 'b x y w1 w2 d -> b (x w1) (y w2) d')
+            attended_x = attended_x + self.mlp_2(self.prenorm_2(attended_x))
+
+            # ✅ BEV 피처 업데이트: 현재 루프의 결과를 다음 루프의 입력으로
+            refined_x = attended_x
+            # --- Single Attention Block End ---
 
 
-            # --- 2. 동적 반복 횟수 결정 ---
-            # ✅ object_count가 (b,) 형태의 텐서이므로, sum 없이 바로 사용합니다.
-            if object_count is not None:
-                # 배치 내에서 가장 객체 수가 많은 샘플을 기준으로 반복 횟수를 통일합니다.
-                # (GPU 연산 효율성을 위해 배치 내 루프 횟수는 동일해야 함)
-                max_objects_in_batch = object_count.max().item()
+        # --- 4. 최종 결과 반환 ---
+        query = self.postnorm(refined_x)
+        query = rearrange(query, 'b H W d -> b d H W')
 
-                if max_objects_in_batch > 20:   # 객체가 20개 초과로 많으면
-                    num_iterations = 3
-                elif max_objects_in_batch > 5:  # 객체가 5개 초과면
-                    num_iterations = 2
-                else:                           # 그 외
-                    num_iterations = 1
-            else:
-                num_iterations = 1 # 기본값
-
-
-            # --- 3. Attention Block 반복 수행 ---
-            refined_x = x # 루프를 돌며 업데이트될 BEV 피처
-
-            for _ in range(num_iterations):
-                # 루프의 시작에서 BEV 피처(refined_x)를 Query로 사용합니다.
-                if self.bev_embed_flag:
-                    query = query_pos + refined_x[:, None]
-                else:
-                    query = refined_x[:, None]  # b n d H W
-        
-                # --- Single Attention Block Start ---
-        
-                # 1. Local-to-Local Cross-Attention
-                query_L = rearrange(query, 'b n d (x w1) (y w2) -> b n x y w1 w2 d',
-                                      w1=self.q_win_size[0], w2=self.q_win_size[1])
-                key_L = rearrange(key, 'b n d (x w1) (y w2) -> b n x y w1 w2 d',
-                                      w1=self.feat_win_size[0], w2=self.feat_win_size[1])
-                val_L = rearrange(val, 'b n d (x w1) (y w2) -> b n x y w1 w2 d',
-                                      w1=self.feat_win_size[0], w2=self.feat_win_size[1])
-        
-                skip_L = rearrange(refined_x, 'b d (x w1) (y w2) -> b x y w1 w2 d', 
-                                   w1=self.q_win_size[0], w2=self.q_win_size[1]) if self.skip else None
-        
-                attended_x = self.cross_win_attend_1(query_L, key_L, val_L, skip=skip_L)
-                attended_x = rearrange(attended_x, 'b x y w1 w2 d -> b (x w1) (y w2) d')
-                attended_x = attended_x + self.mlp_1(self.prenorm_1(attended_x))
-
-                # 2. Local-to-Global Cross-Attention
-                x_skip = attended_x
-                query_G = repeat(attended_x, 'b x y d -> b n x y d', n=n)
-                query_G = rearrange(query_G, 'b n (x w1) (y w2) d -> b n x y w1 w2 d',
-                                      w1=self.q_win_size[0], w2=self.q_win_size[1])
-
-                key_G = rearrange(key, 'b n x y w1 w2 d -> b n (x w1) (y w2) d')
-                key_G = rearrange(key_G, 'b n (w1 x) (w2 y) d -> b n x y w1 w2 d',
-                                      w1=self.feat_win_size[0], w2=self.feat_win_size[1])
-                val_G = rearrange(val, 'b n x y w1 w2 d -> b n (x w1) (y w2) d')
-                val_G = rearrange(val, 'b n (w1 x) (w2 y) d -> b n x y w1 w2 d',
-                                      w1=self.feat_win_size[0], w2=self.feat_win_size[1])
-
-                skip_G = rearrange(x_skip, 'b (x w1) (y w2) d -> b x y w1 w2 d',
-                                   w1=self.q_win_size[0], w2=self.q_win_size[1]) if self.skip else None
-        
-                attended_x = self.cross_win_attend_2(query_G, key_G, val_G, skip=skip_G)
-                attended_x = rearrange(attended_x, 'b x y w1 w2 d -> b (x w1) (y w2) d')
-                attended_x = attended_x + self.mlp_2(self.prenorm_2(attended_x))
-        
-                # --- Single Attention Block End ---
-
-                # ✅ BEV 피처 업데이트: 현재 루프의 결과를 다음 루프의 입력으로
-                refined_x = attended_x
-
-            # --- 4. 최종 결과 반환 ---
-            query = self.postnorm(refined_x)
-            query = rearrange(query, 'b H W d -> b d H W')
-
-            return query
+        return query
 
 
 
