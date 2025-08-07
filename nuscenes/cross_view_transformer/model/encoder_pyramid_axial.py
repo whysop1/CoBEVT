@@ -643,7 +643,8 @@ class CrossViewSwapAttention(nn.Module):
         query_batches = torch.unbind(query, dim=0)
         key_batches = torch.unbind(key, dim=0)
         val_batches = torch.unbind(val, dim=0)
-
+        x_skip_batches = rearrange(x, 'b d H W -> b H W d').unbind(dim=0)
+        
         for i in range(b):  # b는 배치 크기
             if object_count is None:
                 num_attentions = 2
@@ -660,6 +661,7 @@ class CrossViewSwapAttention(nn.Module):
             current_query = query_batches[i].unsqueeze(0)
             current_key = key_batches[i].unsqueeze(0)
             current_val = val_batches[i].unsqueeze(0)
+            current_x_skip = x_skip_batches[i].unsqueeze(0)
 
             # Iteratively apply attention based on object count
             for j in range(num_attentions):
@@ -672,15 +674,15 @@ class CrossViewSwapAttention(nn.Module):
                                                w1=self.feat_win_size[0], w2=self.feat_win_size[1])
                     
                     if j == 0:
-                        x_skip = rearrange(x[i].unsqueeze(0), 'b d (x w1) (y w2) -> b x y w1 w2 d',
+                        current_x_skip = rearrange(current_x_skip, 'b (x w1) (y w2) d -> b x y w1 w2 d',
                                            w1=self.q_win_size[0], w2=self.q_win_size[1])
                     else:
-                        x_skip = rearrange(x_skip, 'b (x w1) (y w2) d -> b x y w1 w2 d',
+                        current_x_skip = rearrange(current_x_skip, 'b (x w1) (y w2) d -> b x y w1 w2 d',
                                            w1=self.q_win_size[0], w2=self.q_win_size[1])
                     
                     query_attn = self.cross_win_attentions[j](
                         query_attn_input, key_attn_input, val_attn_input,
-                        skip=x_skip if self.skip else None
+                        skip=current_x_skip if self.skip else None
                     )
                     query_attn = rearrange(query_attn, 'b x y w1 w2 d -> b (x w1) (y w2) d')
                 else:  # Odd index (1, 3, 5): Local-to-global attention
@@ -691,27 +693,30 @@ class CrossViewSwapAttention(nn.Module):
                     val_attn_input = rearrange(current_val, 'b n (w1 x) (w2 y) d -> b n x y w1 w2 d',
                                                w1=self.feat_win_size[0], w2=self.feat_win_size[1])
                     
-                    x_skip = rearrange(x_skip, 'b (x w1) (y w2) d -> b x y w1 w2 d',
+                    current_x_skip = rearrange(current_x_skip, 'b (x w1) (y w2) d -> b x y w1 w2 d',
                                        w1=self.q_win_size[0], w2=self.q_win_size[1])
 
                     query_attn = self.cross_win_attentions[j](
                         query_attn_input, key_attn_input, val_attn_input,
-                        skip=x_skip if self.skip else None
+                        skip=current_x_skip if self.skip else None
                     )
                     query_attn = rearrange(query_attn, 'b x y w1 w2 d -> b (x w1) (y w2) d')
 
+                # MLP and prenorm after each attention block
                 query_attn = query_attn + self.mlps[j](self.prenorms[j](query_attn))
 
-                x_skip = query_attn
+                # Update for the next iteration
+                current_x_skip = query_attn
                 current_query = repeat(query_attn, 'b h w d -> b n h w d', n=n)
 
-            output_list.append(current_query)
+            output_list.append(current_x_skip)
 
         final_output = torch.cat(output_list, dim=0)
         query = self.postnorm(final_output)
         query = rearrange(query, 'b H W d -> b d H W')
 
         return query
+
 
 
 
