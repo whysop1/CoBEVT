@@ -484,6 +484,7 @@ class CrossViewSwapAttention(nn.Module):
         return query
 '''
 
+
 class CrossViewSwapAttention(nn.Module):
     def __init__(
         self,
@@ -536,7 +537,6 @@ class CrossViewSwapAttention(nn.Module):
         self.feat_win_size = feat_win_size[index]
         self.rel_pos_emb = rel_pos_emb
 
-        # Attention modules from 1 to 6
         self.cross_win_attentions = nn.ModuleList([
             CrossWinAttention(dim, heads[index], dim_head[index], qkv_bias) for _ in range(6)
         ])
@@ -569,7 +569,7 @@ class CrossViewSwapAttention(nn.Module):
         object_count: Optional[torch.Tensor] = None,
     ):
         """
-        x: (b, c, H, W)
+        x: (b, d, H, W)
         feature: (b, n, dim_in, h, w)
         I_inv: (b, n, 3, 3)
         E_inv: (b, n, 4, 4)
@@ -641,56 +641,65 @@ class CrossViewSwapAttention(nn.Module):
             query = query_pos + x[:, None]
         else:
             query = x[:, None]
+        
+        # key, val, query를 loop 밖에서 초기화합니다.
         key = rearrange(key_flat, '(b n) ... -> b n ...', b=b, n=n)
         val = rearrange(val_flat, '(b n) ... -> b n ...', b=b, n=n)
 
         key = self.pad_divisble(key, self.feat_win_size[0], self.feat_win_size[1])
         val = self.pad_divisble(val, self.feat_win_size[0], self.feat_win_size[1])
-        
-        # Initial query for the loop
-        query = rearrange(query, 'b n d (x w1) (y w2) -> b n x y w1 w2 d',
-                          w1=self.q_win_size[0], w2=self.q_win_size[1])
+
+        query = rearrange(query, 'b n d H W -> b n H W d')
+        key = rearrange(key, 'b n d h w -> b n h w d')
+        val = rearrange(val, 'b n d h w -> b n h w d')
 
         # Iteratively apply attention based on object count
         for i in range(num_attentions):
             if i % 2 == 0:  # Even index (0, 2, 4): Local-to-local attention
-                key_attn = rearrange(key, 'b n d (x w1) (y w2) -> b n x y w1 w2 d',
-                                      w1=self.feat_win_size[0], w2=self.feat_win_size[1])
-                val_attn = rearrange(val, 'b n d (x w1) (y w2) -> b n x y w1 w2 d',
-                                      w1=self.feat_win_size[0], w2=self.feat_win_size[1])
+                query_attn_input = rearrange(query, 'b n (x w1) (y w2) d -> b n x y w1 w2 d',
+                                             w1=self.q_win_size[0], w2=self.q_win_size[1])
+                key_attn_input = rearrange(key, 'b n (x w1) (y w2) d -> b n x y w1 w2 d',
+                                           w1=self.feat_win_size[0], w2=self.feat_win_size[1])
+                val_attn_input = rearrange(val, 'b n (x w1) (y w2) d -> b n x y w1 w2 d',
+                                           w1=self.feat_win_size[0], w2=self.feat_win_size[1])
+                
+                # skip connection
+                if i == 0:
+                    x_skip = rearrange(x, 'b d (x w1) (y w2) -> b x y w1 w2 d',
+                                       w1=self.q_win_size[0], w2=self.q_win_size[1])
+                else:
+                    x_skip = rearrange(x_skip, 'b (x w1) (y w2) d -> b x y w1 w2 d',
+                                       w1=self.q_win_size[0], w2=self.q_win_size[1])
                 
                 query_attn = self.cross_win_attentions[i](
-                    query, key_attn, val_attn,
-                    skip=rearrange(x if i == 0 else x_skip,
-                                   'b d (x w1) (y w2) -> b x y w1 w2 d',
-                                   w1=self.q_win_size[0], w2=self.q_win_size[1]) if self.skip else None
+                    query_attn_input, key_attn_input, val_attn_input,
+                    skip=x_skip if self.skip else None
                 )
-
+                query_attn = rearrange(query_attn, 'b x y w1 w2 d -> b (x w1) (y w2) d')
             else:  # Odd index (1, 3, 5): Local-to-global attention
-                key_attn = rearrange(key, 'b n x y w1 w2 d -> b n (x w1) (y w2) d')
-                key_attn = rearrange(key_attn, 'b n (w1 x) (w2 y) d -> b n x y w1 w2 d',
-                                      w1=self.feat_win_size[0], w2=self.feat_win_size[1])
+                query_attn_input = rearrange(query, 'b n (x w1) (y w2) d -> b n x y w1 w2 d',
+                                             w1=self.q_win_size[0], w2=self.q_win_size[1])
+                key_attn_input = rearrange(key, 'b n (w1 x) (w2 y) d -> b n x y w1 w2 d',
+                                           w1=self.feat_win_size[0], w2=self.feat_win_size[1])
+                val_attn_input = rearrange(val, 'b n (w1 x) (w2 y) d -> b n x y w1 w2 d',
+                                           w1=self.feat_win_size[0], w2=self.feat_win_size[1])
                 
-                val_attn = rearrange(val, 'b n x y w1 w2 d -> b n (x w1) (y w2) d')
-                val_attn = rearrange(val_attn, 'b n (w1 x) (w2 y) d -> b n x y w1 w2 d',
-                                      w1=self.feat_win_size[0], w2=self.feat_win_size[1])
-                
-                query_attn = self.cross_win_attentions[i](
-                    query, key_attn, val_attn,
-                    skip=rearrange(x_skip,
-                                   'b (x w1) (y w2) d -> b x y w1 w2 d',
-                                   w1=self.q_win_size[0], w2=self.q_win_size[1]) if self.skip else None
-                )
+                x_skip = rearrange(x_skip, 'b (x w1) (y w2) d -> b x y w1 w2 d',
+                                   w1=self.q_win_size[0], w2=self.q_win_size[1])
 
-            query_attn = rearrange(query_attn, 'b x y w1 w2 d -> b (x w1) (y w2) d')
+                query_attn = self.cross_win_attentions[i](
+                    query_attn_input, key_attn_input, val_attn_input,
+                    skip=x_skip if self.skip else None
+                )
+                query_attn = rearrange(query_attn, 'b x y w1 w2 d -> b (x w1) (y w2) d')
+
+            # MLP and prenorm after each attention block
             query_attn = query_attn + self.mlps[i](self.prenorms[i](query_attn))
 
+            # Update for the next iteration
             x_skip = query_attn
-            query = repeat(query_attn, 'b x y d -> b n x y d', n=n)
-            query = rearrange(query, 'b n (x w1) (y w2) d -> b n x y w1 w2 d',
-                              w1=self.q_win_size[0], w2=self.q_win_size[1])
+            query = repeat(query_attn, 'b h w d -> b n h w d', n=n)
 
-        query = rearrange(query, 'b n x y w1 w2 d -> b (x w1) (y w2) d')
         query = self.postnorm(query)
         query = rearrange(query, 'b H W d -> b d H W')
 
