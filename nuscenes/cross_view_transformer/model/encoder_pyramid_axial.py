@@ -280,7 +280,7 @@ class CrossWinAttention(nn.Module):
             z = z + skip
         return z
 
-
+'''
 class CrossViewSwapAttention(nn.Module):
     def __init__(
         self,
@@ -482,7 +482,219 @@ class CrossViewSwapAttention(nn.Module):
         query = rearrange(query, 'b H W d -> b d H W')
 
         return query
+'''
 
+class CrossViewSwapAttention(nn.Module):
+    def __init__(
+        self,
+        feat_height: int,
+        feat_width: int,
+        feat_dim: int,
+        dim: int,
+        index: int,
+        image_height: int,
+        image_width: int,
+        qkv_bias: bool,
+        q_win_size: list,
+        feat_win_size: list,
+        heads: list,
+        dim_head: list,
+        bev_embedding_flag: list,
+        rel_pos_emb: bool = False,
+        no_image_features: bool = False,
+        skip: bool = True,
+        norm=nn.LayerNorm,
+    ):
+        super().__init__()
+
+        image_plane = generate_grid(feat_height, feat_width)[None]
+        image_plane[:, :, 0] *= image_width
+        image_plane[:, :, 1] *= image_height
+
+        self.register_buffer('image_plane', image_plane, persistent=False)
+
+        self.feature_linear = nn.Sequential(
+            nn.BatchNorm2d(feat_dim),
+            nn.ReLU(),
+            nn.Conv2d(feat_dim, dim, 1, bias=False))
+
+        if no_image_features:
+            self.feature_proj = None
+        else:
+            self.feature_proj = nn.Sequential(
+                nn.BatchNorm2d(feat_dim),
+                nn.ReLU(),
+                nn.Conv2d(feat_dim, dim, 1, bias=False))
+
+        self.bev_embed_flag = bev_embedding_flag[index]
+        if self.bev_embed_flag:
+            self.bev_embed = nn.Conv2d(2, dim, 1)
+        self.img_embed = nn.Conv2d(4, dim, 1, bias=False)
+        self.cam_embed = nn.Conv2d(4, dim, 1, bias=False)
+
+        self.q_win_size = q_win_size[index]
+        self.feat_win_size = feat_win_size[index]
+        self.rel_pos_emb = rel_pos_emb
+
+        # Attention modules from 1 to 6
+        self.cross_win_attentions = nn.ModuleList([
+            CrossWinAttention(dim, heads[index], dim_head[index], qkv_bias) for _ in range(6)
+        ])
+        self.skip = skip
+
+        self.prenorms = nn.ModuleList([norm(dim) for _ in range(6)])
+        self.mlps = nn.ModuleList([
+            nn.Sequential(nn.Linear(dim, 2 * dim), nn.GELU(), nn.Linear(2 * dim, dim))
+            for _ in range(6)
+        ])
+        
+        self.postnorm = norm(dim)
+
+    def pad_divisble(self, x, win_h, win_w):
+        """Pad the x to be divible by window size."""
+        _, _, _, h, w = x.shape
+        h_pad, w_pad = ((h + win_h) // win_h) * win_h, ((w + win_w) // win_w) * win_w
+        padh = h_pad - h if h % win_h != 0 else 0
+        padw = w_pad - w if w % win_w != 0 else 0
+        return F.pad(x, (0, padw, 0, padh), value=0)
+
+    def forward(
+        self,
+        index: int,
+        x: torch.FloatTensor,
+        bev: BEVEmbedding,
+        feature: torch.FloatTensor,
+        I_inv: torch.FloatTensor,
+        E_inv: torch.FloatTensor,
+        object_count: Optional[torch.Tensor] = None,
+    ):
+        """
+        x: (b, c, H, W)
+        feature: (b, n, dim_in, h, w)
+        I_inv: (b, n, 3, 3)
+        E_inv: (b, n, 4, 4)
+
+        Returns: (b, d, H, W)
+        """
+        
+        if object_count is None:
+            print(">> object_count(crossviewswapattention) is None. Using default 2 attentions.")
+            num_attentions = 2
+        else:
+            # object_count는 (batch_size, num_object_types) 형태의 텐서이므로,
+            # 모든 객체 수를 합산하여 전체 객체 수를 구합니다.
+            total_objects = object_count.sum(dim=-1).item() 
+            print(">> object_count(crossviewswapattention):", object_count.shape, object_count, "Total objects:", total_objects)
+            
+            if total_objects < 10:
+                num_attentions = 2
+            elif 10 <= total_objects < 30:
+                num_attentions = 4
+            else:
+                num_attentions = 6
+        
+        b, n, _, _, _ = feature.shape
+        _, _, H, W = x.shape
+
+        pixel = self.image_plane
+        _, _, _, h, w = pixel.shape
+
+        c = E_inv[..., -1:]
+        c_flat = rearrange(c, 'b n ... -> (b n) ...')[..., None]
+        c_embed = self.cam_embed(c_flat)
+
+        pixel_flat = rearrange(pixel, '... h w -> ... (h w)')
+        cam = I_inv @ pixel_flat
+        cam = F.pad(cam, (0, 0, 0, 1, 0, 0, 0, 0), value=1)
+        d = E_inv @ cam
+        d_flat = rearrange(d, 'b n d (h w) -> (b n) d h w', h=h, w=w)
+        d_embed = self.img_embed(d_flat)
+
+        img_embed = d_embed - c_embed
+        img_embed = img_embed / (img_embed.norm(dim=1, keepdim=True) + 1e-7)
+
+        if index == 0:
+            world = bev.grid0[:2]
+        elif index == 1:
+            world = bev.grid1[:2]
+        elif index == 2:
+            world = bev.grid2[:2]
+        elif index == 3:
+            world = bev.grid3[:2]
+
+        if self.bev_embed_flag:
+            w_embed = self.bev_embed(world[None])
+            bev_embed = w_embed - c_embed
+            bev_embed = bev_embed / (bev_embed.norm(dim=1, keepdim=True) + 1e-7)
+            query_pos = rearrange(bev_embed, '(b n) ... -> b n ...', b=b, n=n)
+
+        feature_flat = rearrange(feature, 'b n ... -> (b n) ...')
+
+        if self.feature_proj is not None:
+            key_flat = img_embed + self.feature_proj(feature_flat)
+        else:
+            key_flat = img_embed
+
+        val_flat = self.feature_linear(feature_flat)
+
+        if self.bev_embed_flag:
+            query = query_pos + x[:, None]
+        else:
+            query = x[:, None]
+        key = rearrange(key_flat, '(b n) ... -> b n ...', b=b, n=n)
+        val = rearrange(val_flat, '(b n) ... -> b n ...', b=b, n=n)
+
+        key = self.pad_divisble(key, self.feat_win_size[0], self.feat_win_size[1])
+        val = self.pad_divisble(val, self.feat_win_size[0], self.feat_win_size[1])
+        
+        # Initial query for the loop
+        query = rearrange(query, 'b n d (x w1) (y w2) -> b n x y w1 w2 d',
+                          w1=self.q_win_size[0], w2=self.q_win_size[1])
+
+        # Iteratively apply attention based on object count
+        for i in range(num_attentions):
+            if i % 2 == 0:  # Even index (0, 2, 4): Local-to-local attention
+                key_attn = rearrange(key, 'b n d (x w1) (y w2) -> b n x y w1 w2 d',
+                                      w1=self.feat_win_size[0], w2=self.feat_win_size[1])
+                val_attn = rearrange(val, 'b n d (x w1) (y w2) -> b n x y w1 w2 d',
+                                      w1=self.feat_win_size[0], w2=self.feat_win_size[1])
+                
+                query_attn = self.cross_win_attentions[i](
+                    query, key_attn, val_attn,
+                    skip=rearrange(x if i == 0 else x_skip,
+                                   'b d (x w1) (y w2) -> b x y w1 w2 d',
+                                   w1=self.q_win_size[0], w2=self.q_win_size[1]) if self.skip else None
+                )
+
+            else:  # Odd index (1, 3, 5): Local-to-global attention
+                key_attn = rearrange(key, 'b n x y w1 w2 d -> b n (x w1) (y w2) d')
+                key_attn = rearrange(key_attn, 'b n (w1 x) (w2 y) d -> b n x y w1 w2 d',
+                                      w1=self.feat_win_size[0], w2=self.feat_win_size[1])
+                
+                val_attn = rearrange(val, 'b n x y w1 w2 d -> b n (x w1) (y w2) d')
+                val_attn = rearrange(val_attn, 'b n (w1 x) (w2 y) d -> b n x y w1 w2 d',
+                                      w1=self.feat_win_size[0], w2=self.feat_win_size[1])
+                
+                query_attn = self.cross_win_attentions[i](
+                    query, key_attn, val_attn,
+                    skip=rearrange(x_skip,
+                                   'b (x w1) (y w2) d -> b x y w1 w2 d',
+                                   w1=self.q_win_size[0], w2=self.q_win_size[1]) if self.skip else None
+                )
+
+            query_attn = rearrange(query_attn, 'b x y w1 w2 d -> b (x w1) (y w2) d')
+            query_attn = query_attn + self.mlps[i](self.prenorms[i](query_attn))
+
+            x_skip = query_attn
+            query = repeat(query_attn, 'b x y d -> b n x y d', n=n)
+            query = rearrange(query, 'b n (x w1) (y w2) d -> b n x y w1 w2 d',
+                              w1=self.q_win_size[0], w2=self.q_win_size[1])
+
+        query = rearrange(query, 'b n x y w1 w2 d -> b (x w1) (y w2) d')
+        query = self.postnorm(query)
+        query = rearrange(query, 'b H W d -> b d H W')
+
+        return query
 
 
 
