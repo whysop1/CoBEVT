@@ -484,6 +484,7 @@ class CrossViewSwapAttention(nn.Module):
         return query
 '''
 
+'''
 class CrossViewSwapAttention(nn.Module):
     def __init__(
         self,
@@ -766,7 +767,258 @@ class CrossViewSwapAttention(nn.Module):
         query = rearrange(query, 'b H W d -> b d H W')
 
         return query
+'''
 
+
+class CrossViewSwapAttention(nn.Module):
+    # __init__ 메서드 및 다른 메서드들은 제공된 코드와 동일하게 유지합니다.
+    # ...
+    # get_attention_rounds 메서드도 그대로 유지합니다.
+    # ...
+    
+    def __init__(
+        self,
+        feat_height: int,
+        feat_width: int,
+        feat_dim: int,
+        dim: int,
+        index: int,
+        image_height: int,
+        image_width: int,
+        qkv_bias: bool,
+        q_win_size: list,
+        feat_win_size: list,
+        heads: list,
+        dim_head: list,
+        bev_embedding_flag: list,
+        rel_pos_emb: bool = False,
+        no_image_features: bool = False,
+        skip: bool = True,
+        norm=nn.LayerNorm,
+    ):
+        super().__init__()
+
+        # 이 부분은 제공된 코드와 동일합니다.
+        image_plane = generate_grid(feat_height, feat_width)[None]
+        image_plane[:, :, 0] *= image_width
+        image_plane[:, :, 1] *= image_height
+        self.register_buffer('image_plane', image_plane, persistent=False)
+        self.feature_linear = nn.Sequential(
+            nn.BatchNorm2d(feat_dim),
+            nn.ReLU(),
+            nn.Conv2d(feat_dim, dim, 1, bias=False))
+        if no_image_features:
+            self.feature_proj = None
+        else:
+            self.feature_proj = nn.Sequential(
+                nn.BatchNorm2d(feat_dim),
+                nn.ReLU(),
+                nn.Conv2d(feat_dim, dim, 1, bias=False))
+        self.bev_embed_flag = bev_embedding_flag[index]
+        if self.bev_embed_flag:
+            self.bev_embed = nn.Conv2d(2, dim, 1)
+        self.img_embed = nn.Conv2d(4, dim, 1, bias=False)
+        self.cam_embed = nn.Conv2d(4, dim, 1, bias=False)
+        self.q_win_size = q_win_size[index]
+        self.feat_win_size = feat_win_size[index]
+        self.rel_pos_emb = rel_pos_emb
+        self.cross_win_attend_1 = CrossWinAttention(dim, heads[index], dim_head[index], qkv_bias)
+        self.cross_win_attend_2 = CrossWinAttention(dim, heads[index], dim_head[index], qkv_bias)
+        self.skip = skip
+        self.prenorm_1 = norm(dim)
+        self.prenorm_2 = norm(dim)
+        self.mlp_1 = nn.Sequential(nn.Linear(dim, 2 * dim), nn.GELU(), nn.Linear(2 * dim, dim))
+        self.mlp_2 = nn.Sequential(nn.Linear(dim, 2 * dim), nn.GELU(), nn.Linear(2 * dim, dim))
+        self.postnorm = norm(dim)
+
+    def pad_divisble(self, x, win_h, win_w):
+        _, _, _, h, w = x.shape
+        h_pad, w_pad = ((h + win_h) // win_h) * win_h, ((w + win_w) // win_w) * win_w
+        padh = h_pad - h if h % win_h != 0 else 0
+        padw = w_pad - w if w % win_w != 0 else 0
+        return F.pad(x, (0, padw, 0, padh), value=0)
+
+    def get_attention_rounds(self, object_count):
+        if object_count < 10:
+            return 1
+        elif object_count < 30:
+            return 2
+        else:
+            return 3
+
+    def forward(
+        self,
+        index: int,
+        x: torch.FloatTensor,
+        bev: BEVEmbedding,
+        feature: torch.FloatTensor,
+        I_inv: torch.FloatTensor,
+        E_inv: torch.FloatTensor,
+        object_count: Optional[torch.Tensor] = None,
+    ):
+        """
+        x: (b, c, H, W)
+        feature: (b, n, dim_in, h, w)
+        I_inv: (b, n, 3, 3)
+        E_inv: (b, n, 4, 4)
+        object_count: (b,) - 각 배치의 객체 수
+
+        Returns: (b, d, H, W)
+        """
+        # ... (forward 메서드의 초기 설정 부분은 동일) ...
+        b, n, _, _, _ = feature.shape
+        _, d, H, W = x.shape
+        pixel = self.image_plane
+        _, _, _, h, w = pixel.shape
+        c = E_inv[..., -1:]
+        c_flat = rearrange(c, 'b n ... -> (b n) ...')[..., None]
+        c_embed = self.cam_embed(c_flat)
+        pixel_flat = rearrange(pixel, '... h w -> ... (h w)')
+        cam = I_inv @ pixel_flat
+        cam = F.pad(cam, (0, 0, 0, 1, 0, 0, 0, 0), value=1)
+        d = E_inv @ cam
+        d_flat = rearrange(d, 'b n d (h w) -> (b n) d h w', h=h, w=w)
+        d_embed = self.img_embed(d_flat)
+        img_embed = d_embed - c_embed
+        img_embed = img_embed / (img_embed.norm(dim=1, keepdim=True) + 1e-7)
+        
+        if index == 0: world = bev.grid0[:2]
+        elif index == 1: world = bev.grid1[:2]
+        elif index == 2: world = bev.grid2[:2]
+        elif index == 3: world = bev.grid3[:2]
+
+        if self.bev_embed_flag:
+            w_embed = self.bev_embed(world[None])
+            bev_embed = w_embed - c_embed
+            bev_embed = bev_embed / (bev_embed.norm(dim=1, keepdim=True) + 1e-7)
+            query_pos = rearrange(bev_embed, '(b n) ... -> b n ...', b=b, n=n)
+
+        feature_flat = rearrange(feature, 'b n ... -> (b n) ...')
+
+        if self.feature_proj is not None:
+            key_flat = img_embed + self.feature_proj(feature_flat)
+        else:
+            key_flat = img_embed
+
+        val_flat = self.feature_linear(feature_flat)
+
+        if self.bev_embed_flag:
+            initial_query = query_pos + x[:, None]
+        else:
+            initial_query = x[:, None]
+
+        key = rearrange(key_flat, '(b n) ... -> b n ...', b=b, n=n)
+        val = rearrange(val_flat, '(b n) ... -> b n ...', b=b, n=n)
+        key = self.pad_divisble(key, self.feat_win_size[0], self.feat_win_size[1])
+        val = self.pad_divisble(val, self.feat_win_size[0], self.feat_win_size[1])
+
+        if object_count is not None:
+            # 각 데이터에 대한 attention 라운드 횟수를 계산
+            # [1, 3, 2, 1, ...] 형태의 텐서가 됨
+            attention_rounds_per_item = torch.tensor([self.get_attention_rounds(oc) for oc in object_count], device=x.device)
+            max_rounds = attention_rounds_per_item.max().item()
+
+            # 최종 결과를 저장할 텐서. 초기값은 원본 x
+            final_query_result = rearrange(x, 'b d H W -> b H W d')
+            # 현재 라운드의 입력을 저장할 텐서
+            current_query_input = initial_query
+
+            # 최대 라운드 횟수만큼 반복
+            for round_idx in range(max_rounds):
+                # 이번 라운드에서 attention을 수행해야 할 데이터의 인덱스를 찾음
+                # 예: round_idx가 1(두 번째 라운드)일 때, attention_rounds_per_item이 2 또는 3인 데이터
+                active_indices = (attention_rounds_per_item > round_idx).nonzero(as_tuple=True)[0]
+
+                # 처리할 데이터가 없으면 다음 라운드로
+                if len(active_indices) == 0:
+                    continue
+                
+                # Attention을 적용할 데이터(query, key, val)를 선택
+                active_query = current_query_input[active_indices]
+                active_key = key[active_indices]
+                active_val = val[active_indices]
+                active_x = x[active_indices]
+                
+                b_active, n_active = active_query.shape[0], active_query.shape[1]
+                
+                # ------------------ Attention 1: Local-to-Local ------------------
+                # 윈도우 형태로 변경
+                query_win = rearrange(active_query, 'b n d (x w1) (y w2) -> b n x y w1 w2 d', 
+                                      w1=self.q_win_size[0], w2=self.q_win_size[1])
+                key_win = rearrange(active_key, 'b n d (x w1) (y w2) -> b n x y w1 w2 d', 
+                                    w1=self.feat_win_size[0], w2=self.feat_win_size[1])
+                val_win = rearrange(active_val, 'b n d (x w1) (y w2) -> b n x y w1 w2 d', 
+                                    w1=self.feat_win_size[0], w2=self.feat_win_size[1])
+
+                # 첫 라운드에만 skip connection 적용
+                skip1 = rearrange(active_x, 'b d (x w1) (y w2) -> b x y w1 w2 d', 
+                                  w1=self.q_win_size[0], w2=self.q_win_size[1]) if self.skip and round_idx == 0 else None
+
+                # Cross-attention 수행
+                query_res = self.cross_win_attend_1(query_win, key_win, val_win, skip=skip1)
+                query_res = rearrange(query_res, 'b x y w1 w2 d -> b (x w1) (y w2) d')
+                
+                query_res = query_res + self.mlp_1(self.prenorm_1(query_res))
+                x_skip = query_res # for a later skip connection
+
+                # ------------------ Attention 2: Local-to-Global ------------------
+                query_exp = repeat(query_res, 'b H W d -> b n H W d', n=n_active)
+                query_exp = rearrange(query_exp, 'b n H W d -> b n d H W')
+                query_win = rearrange(query_exp, 'b n d (x w1) (y w2) -> b n x y w1 w2 d', 
+                                      w1=self.q_win_size[0], w2=self.q_win_size[1])
+                
+                # Grid 형태로 변환
+                key_grid = rearrange(key_win, 'b n x y w1 w2 d -> b n (x w1) (y w2) d')
+                key_grid = rearrange(key_grid, 'b n (w1 x) (w2 y) d -> b n x y w1 w2 d', w1=self.feat_win_size[0], w2=self.feat_win_size[1])
+                val_grid = rearrange(val_win, 'b n x y w1 w2 d -> b n (x w1) (y w2) d')
+                val_grid = rearrange(val_grid, 'b n (w1 x) (w2 y) d -> b n x y w1 w2 d', w1=self.feat_win_size[0], w2=self.feat_win_size[1])
+
+                skip2 = rearrange(x_skip, 'b (x w1) (y w2) d -> b x y w1 w2 d', 
+                                  w1=self.q_win_size[0], w2=self.q_win_size[1]) if self.skip else None
+
+                # Cross-attention 수행
+                query_res = self.cross_win_attend_2(query_win, key_grid, val_grid, skip=skip2)
+                query_res = rearrange(query_res, 'b x y w1 w2 d -> b (x w1) (y w2) d')
+
+                query_res = query_res + self.mlp_2(self.prenorm_2(query_res))
+
+                # --- 결과 업데이트 ---
+                # 최종 결과 텐서에 현재 라운드에서 계산된 데이터를 업데이트
+                final_query_result[active_indices] = query_res
+
+                # 다음 라운드의 입력으로 사용할 query 업데이트
+                # b H W d -> b n d H W
+                if round_idx < max_rounds - 1:
+                    query_res_exp = repeat(query_res, 'b H W d -> b n H W d', n=n_active)
+                    # 전체 current_query_input에서 해당 부분만 업데이트
+                    current_query_input[active_indices] = rearrange(query_res_exp, 'b n H W d -> b n d H W')
+            
+            query = final_query_result
+
+        else:
+            # ... (기존의 object_count가 None일 때의 로직은 동일) ...
+            query = initial_query
+            query = rearrange(query, 'b n d (x w1) (y w2) -> b n x y w1 w2 d', w1=self.q_win_size[0], w2=self.q_win_size[1])
+            key_w = rearrange(key, 'b n d (x w1) (y w2) -> b n x y w1 w2 d', w1=self.feat_win_size[0], w2=self.feat_win_size[1])
+            val_w = rearrange(val, 'b n d (x w1) (y w2) -> b n x y w1 w2 d', w1=self.feat_win_size[0], w2=self.feat_win_size[1])
+            skip1 = rearrange(x, 'b d (x w1) (y w2) -> b x y w1 w2 d', w1=self.q_win_size[0], w2=self.q_win_size[1]) if self.skip else None
+            query = rearrange(self.cross_win_attend_1(query, key_w, val_w, skip=skip1), 'b x y w1 w2 d -> b (x w1) (y w2) d')
+            query = query + self.mlp_1(self.prenorm_1(query))
+            x_skip = query
+            query = repeat(query, 'b x y d -> b n x y d', n=n)
+            query = rearrange(query, 'b n (x w1) (y w2) d -> b n x y w1 w2 d', w1=self.q_win_size[0], w2=self.q_win_size[1])
+            key_g = rearrange(key_w, 'b n x y w1 w2 d -> b n (x w1) (y w2) d')
+            key_g = rearrange(key_g, 'b n (w1 x) (w2 y) d -> b n x y w1 w2 d', w1=self.feat_win_size[0], w2=self.feat_win_size[1])
+            val_g = rearrange(val_w, 'b n x y w1 w2 d -> b n (x w1) (y w2) d')
+            val_g = rearrange(val_g, 'b n (w1 x) (w2 y) d -> b n x y w1 w2 d', w1=self.feat_win_size[0], w2=self.feat_win_size[1])
+            skip2 = rearrange(x_skip, 'b (x w1) (y w2) d -> b x y w1 w2 d', w1=self.q_win_size[0], w2=self.q_win_size[1]) if self.skip else None
+            query = rearrange(self.cross_win_attend_2(query, key_g, val_g, skip=skip2), 'b x y w1 w2 d -> b (x w1) (y w2) d')
+            query = query + self.mlp_2(self.prenorm_2(query))
+
+        query = self.postnorm(query)
+        query = rearrange(query, 'b H W d -> b d H W')
+
+        return query
 
 
 
