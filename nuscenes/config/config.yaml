@@ -18,7 +18,7 @@ experiment:
   log_image_interval: 500
 
 loader:
-  batch_size: 1 #원래 8
+  batch_size: 4 #원래 8
   num_workers: 2 #원래 32
   pin_memory: True
   prefetch_factor: 4
