@@ -657,34 +657,43 @@ class CrossViewSwapAttention(nn.Module):
             print(f"Max object_count: {max_object_count}, attention_rounds: {attention_rounds}")
             
             # 여러 라운드의 attention 수행
-            current_query = query
+            current_query = query  # b n d H W
             
             for round_idx in range(attention_rounds):
                 print(f"Attention round {round_idx + 1}/{attention_rounds}")
                 
                 # local-to-local cross-attention
+                # query: b n d H W -> b n d (x w1) (y w2) -> b n x y w1 w2 d
                 current_query_windowed = rearrange(current_query, 'b n d (x w1) (y w2) -> b n x y w1 w2 d',
                                           w1=self.q_win_size[0], w2=self.q_win_size[1])
+                # key, val: b n d h w -> b n d (x w1) (y w2) -> b n x y w1 w2 d  
                 key_windowed = rearrange(key, 'b n d (x w1) (y w2) -> b n x y w1 w2 d',
                                           w1=self.feat_win_size[0], w2=self.feat_win_size[1])
                 val_windowed = rearrange(val, 'b n d (x w1) (y w2) -> b n x y w1 w2 d',
                                           w1=self.feat_win_size[0], w2=self.feat_win_size[1])
                 
-                current_query_result = rearrange(self.cross_win_attend_1(current_query_windowed, 
-                                                             key_windowed, 
-                                                             val_windowed,
-                                                             skip=rearrange(x,
-                                                                       'b d (x w1) (y w2) -> b x y w1 w2 d',
-                                                                        w1=self.q_win_size[0], w2=self.q_win_size[1]) if self.skip and round_idx == 0 else None),
-                                   'b x y w1 w2 d  -> b (x w1) (y w2) d')
+                # cross attention 수행
+                current_query_result = self.cross_win_attend_1(current_query_windowed, 
+                                                     key_windowed, 
+                                                     val_windowed,
+                                                     skip=rearrange(x,
+                                                               'b d (x w1) (y w2) -> b x y w1 w2 d',
+                                                                w1=self.q_win_size[0], w2=self.q_win_size[1]) if self.skip and round_idx == 0 else None)
+                # b n x y w1 w2 d -> b (x w1) (y w2) d
+                current_query_result = rearrange(current_query_result, 'b x y w1 w2 d  -> b (x w1) (y w2) d')
 
                 current_query_result = current_query_result + self.mlp_1(self.prenorm_1(current_query_result))
                 x_skip = current_query_result
-                current_query_expanded = repeat(current_query_result, 'b x y d -> b n x y d', n=n)
+                # b H W d -> b n H W d
+                current_query_expanded = repeat(current_query_result, 'b H W d -> b n H W d', n=n)
 
                 # local-to-global cross-attention
-                current_query_windowed = rearrange(current_query_expanded, 'b n (x w1) (y w2) d -> b n x y w1 w2 d',
+                # b n H W d -> b n d H W -> b n d (x w1) (y w2) -> b n x y w1 w2 d
+                current_query_expanded = rearrange(current_query_expanded, 'b n H W d -> b n d H W')
+                current_query_windowed = rearrange(current_query_expanded, 'b n d (x w1) (y w2) -> b n x y w1 w2 d',
                                           w1=self.q_win_size[0], w2=self.q_win_size[1])
+                
+                # key, val을 grid 형태로 변환
                 key_grid = rearrange(key_windowed, 'b n x y w1 w2 d -> b n (x w1) (y w2) d')
                 key_grid = rearrange(key_grid, 'b n (w1 x) (w2 y) d -> b n x y w1 w2 d',
                                 w1=self.feat_win_size[0], w2=self.feat_win_size[1])
@@ -692,20 +701,23 @@ class CrossViewSwapAttention(nn.Module):
                 val_grid = rearrange(val_grid, 'b n (w1 x) (w2 y) d -> b n x y w1 w2 d',
                                 w1=self.feat_win_size[0], w2=self.feat_win_size[1])
                 
-                current_query_result = rearrange(self.cross_win_attend_2(current_query_windowed,
+                current_query_result = self.cross_win_attend_2(current_query_windowed,
                                                       key_grid,
                                                       val_grid,
                                                       skip=rearrange(x_skip,
                                                                 'b (x w1) (y w2) d -> b x y w1 w2 d',
                                                                 w1=self.q_win_size[0],
                                                                 w2=self.q_win_size[1])
-                                                      if self.skip else None),
-                               'b x y w1 w2 d  -> b (x w1) (y w2) d')
+                                                      if self.skip else None)
+                # b n x y w1 w2 d -> b (x w1) (y w2) d
+                current_query_result = rearrange(current_query_result, 'b x y w1 w2 d  -> b (x w1) (y w2) d')
 
                 current_query_result = current_query_result + self.mlp_2(self.prenorm_2(current_query_result))
                 
-                # 다음 라운드를 위해 query 업데이트
-                current_query = repeat(current_query_result, 'b x y d -> b n x y d', n=n)
+                # 다음 라운드를 위해 query 업데이트: b H W d -> b n d H W
+                if round_idx < attention_rounds - 1:  # 마지막 라운드가 아닌 경우
+                    current_query_result_expanded = repeat(current_query_result, 'b H W d -> b n H W d', n=n)
+                    current_query = rearrange(current_query_result_expanded, 'b n H W d -> b n d H W')
             
             query = current_query_result
             
