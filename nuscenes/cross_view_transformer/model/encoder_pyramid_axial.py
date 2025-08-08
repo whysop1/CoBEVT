@@ -840,11 +840,11 @@ class CrossViewSwapAttention(nn.Module):
 
     def get_attention_rounds(self, object_count):
         if object_count < 10:
-            return 1
-        elif object_count < 30:
             return 2
+        elif object_count < 30:
+            return 4
         else:
-            return 3
+            return 6
 
     def forward(
         self,
