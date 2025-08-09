@@ -688,16 +688,16 @@ class CrossViewSwapAttention(nn.Module):
 
     '''
 
-        def forward(
-            self,
-            index: int,
-            x: torch.FloatTensor,
-            bev: BEVEmbedding,
-            feature: torch.FloatTensor,
-            I_inv: torch.FloatTensor,
-            E_inv: torch.FloatTensor,
-            object_count: Optional[torch.Tensor] = None,
-        ):
+    def forward(
+        self,
+        index: int,
+        x: torch.FloatTensor,
+        bev: BEVEmbedding,
+        feature: torch.FloatTensor,
+        I_inv: torch.FloatTensor,
+        E_inv: torch.FloatTensor,
+        object_count: Optional[torch.Tensor] = None,
+    ):
         """
         x: (B, C, H, W)
         feature: (B, N, dim_in, h, w)
@@ -706,128 +706,129 @@ class CrossViewSwapAttention(nn.Module):
         object_count: (B,) - 각 배치 샘플의 객체 수
         """
 
-            B, N, _, _, _ = feature.shape
-            _, _, H, W = x.shape
+        B, N, _, _, _ = feature.shape
+        _, _, H, W = x.shape
 
-            pixel = self.image_plane
-            _, _, _, h, w = pixel.shape
+        pixel = self.image_plane
+        _, _, _, h, w = pixel.shape
 
-            outputs = []
+        outputs = []
 
-            # === 배치별 개별 처리 ===
-            for b_idx in range(B):
-                if object_count is not None:
-                    count_val = float(object_count[b_idx].item())
-                    min_repeat = 1
-                    count_factor = 0.2
-                    repeat_times = min_repeat + int(count_val * count_factor)
-                else:
-                    repeat_times = 1
+        # === 배치별 개별 처리 ===
+        for b_idx in range(B):
+            if object_count is not None:
+                count_val = float(object_count[b_idx].item())
+                min_repeat = 1
+                count_factor = 0.2
+                repeat_times = min_repeat + int(count_val * count_factor)
+            else:
+                repeat_times = 1
 
             # ====== b_idx 샘플 준비 ======
-                feat_b = feature[b_idx:b_idx+1]     # (1, N, d, h, w)
-                x_b = x[b_idx:b_idx+1]              # (1, C, H, W)
-                I_b = I_inv[b_idx:b_idx+1]
-                E_b = E_inv[b_idx:b_idx+1]
+            feat_b = feature[b_idx:b_idx+1]     # (1, N, d, h, w)
+            x_b = x[b_idx:b_idx+1]              # (1, C, H, W)
+            I_b = I_inv[b_idx:b_idx+1]
+            E_b = E_inv[b_idx:b_idx+1]
 
-                c = E_b[..., -1:]
-                c_flat = rearrange(c, 'b n ... -> (b n) ...')[..., None]
-                c_embed = self.cam_embed(c_flat)
+            c = E_b[..., -1:]
+            c_flat = rearrange(c, 'b n ... -> (b n) ...')[..., None]
+            c_embed = self.cam_embed(c_flat)
 
-                pixel_flat = rearrange(pixel, '... h w -> ... (h w)')
-                cam = I_b @ pixel_flat
-                cam = F.pad(cam, (0, 0, 0, 1, 0, 0, 0, 0), value=1)
-                d = E_b @ cam
-                d_flat = rearrange(d, 'b n d (h w) -> (b n) d h w', h=h, w=w)
-                d_embed = self.img_embed(d_flat)
+            pixel_flat = rearrange(pixel, '... h w -> ... (h w)')
+            cam = I_b @ pixel_flat
+            cam = F.pad(cam, (0, 0, 0, 1, 0, 0, 0, 0), value=1)
+            d = E_b @ cam
+            d_flat = rearrange(d, 'b n d (h w) -> (b n) d h w', h=h, w=w)
+            d_embed = self.img_embed(d_flat)
 
-                img_embed = d_embed - c_embed
-                img_embed = img_embed / (img_embed.norm(dim=1, keepdim=True) + 1e-7)
+            img_embed = d_embed - c_embed
+            img_embed = img_embed / (img_embed.norm(dim=1, keepdim=True) + 1e-7)
 
-                if index == 0:
-                    world = bev.grid0[:2]
-                elif index == 1:
-                    world = bev.grid1[:2]
-                elif index == 2:
-                    world = bev.grid2[:2]
-                elif index == 3:
-                    world = bev.grid3[:2]
+            if index == 0:
+                world = bev.grid0[:2]
+            elif index == 1:
+                world = bev.grid1[:2]
+            elif index == 2:
+                world = bev.grid2[:2]
+            elif index == 3:
+                world = bev.grid3[:2]
 
-                if self.bev_embed_flag:
-                    w_embed = self.bev_embed(world[None])
-                    bev_embed = w_embed - c_embed
-                    bev_embed = bev_embed / (bev_embed.norm(dim=1, keepdim=True) + 1e-7)
-                    query_pos = rearrange(bev_embed, '(b n) ... -> b n ...', b=1, n=N)
+            if self.bev_embed_flag:
+                w_embed = self.bev_embed(world[None])
+                bev_embed = w_embed - c_embed
+                bev_embed = bev_embed / (bev_embed.norm(dim=1, keepdim=True) + 1e-7)
+                query_pos = rearrange(bev_embed, '(b n) ... -> b n ...', b=1, n=N)
 
-                feature_flat = rearrange(feat_b, 'b n ... -> (b n) ...')
-                if self.feature_proj is not None:
-                    key_flat = img_embed + self.feature_proj(feature_flat)
-                else:
-                    key_flat = img_embed
+            feature_flat = rearrange(feat_b, 'b n ... -> (b n) ...')
+            if self.feature_proj is not None:
+                key_flat = img_embed + self.feature_proj(feature_flat)
+            else:
+                key_flat = img_embed
 
-                val_flat = self.feature_linear(feature_flat)
+            val_flat = self.feature_linear(feature_flat)
 
-                if self.bev_embed_flag:
-                    query = query_pos + x_b[:, None]
-                else:
-                    query = x_b[:, None]
+            if self.bev_embed_flag:
+                query = query_pos + x_b[:, None]
+            else:
+                query = x_b[:, None]
 
-                key = rearrange(key_flat, '(b n) ... -> b n ...', b=1, n=N)
-                val = rearrange(val_flat, '(b n) ... -> b n ...', b=1, n=N)
+            key = rearrange(key_flat, '(b n) ... -> b n ...', b=1, n=N)
+            val = rearrange(val_flat, '(b n) ... -> b n ...', b=1, n=N)
 
-                key = self.pad_divisble(key, self.feat_win_size[0], self.feat_win_size[1])
-                val = self.pad_divisble(val, self.feat_win_size[0], self.feat_win_size[1])
+            key = self.pad_divisble(key, self.feat_win_size[0], self.feat_win_size[1])
+            val = self.pad_divisble(val, self.feat_win_size[0], self.feat_win_size[1])
 
-                # === 반복 실행 (샘플별 다름) ===
-                for _ in range(repeat_times):
+            # === 반복 실행 (샘플별 다름) ===
+            for _ in range(repeat_times):
                 # local-to-local cross-attention
-                    q1 = rearrange(query, 'b n d (x w1) (y w2) -> b n x y w1 w2 d',
-                                   w1=self.q_win_size[0], w2=self.q_win_size[1])
-                    k1 = rearrange(key, 'b n d (x w1) (y w2) -> b n x y w1 w2 d',
-                                   w1=self.feat_win_size[0], w2=self.feat_win_size[1])
-                    v1 = rearrange(val, 'b n d (x w1) (y w2) -> b n x y w1 w2 d',
-                                   w1=self.feat_win_size[0], w2=self.feat_win_size[1])
+                q1 = rearrange(query, 'b n d (x w1) (y w2) -> b n x y w1 w2 d',
+                               w1=self.q_win_size[0], w2=self.q_win_size[1])
+                k1 = rearrange(key, 'b n d (x w1) (y w2) -> b n x y w1 w2 d',
+                               w1=self.feat_win_size[0], w2=self.feat_win_size[1])
+                v1 = rearrange(val, 'b n d (x w1) (y w2) -> b n x y w1 w2 d',
+                               w1=self.feat_win_size[0], w2=self.feat_win_size[1])
 
-                    q1 = rearrange(
-                        self.cross_win_attend_1(
-                            q1, k1, v1,
-                            skip=rearrange(x_b, 'b d (x w1) (y w2) -> b x y w1 w2 d',
-                                           w1=self.q_win_size[0], w2=self.q_win_size[1]) if self.skip else None
-                        ),
-                        'b x y w1 w2 d  -> b (x w1) (y w2) d'
-                    )
-                    q1 = q1 + self.mlp_1(self.prenorm_1(q1))
+                q1 = rearrange(
+                    self.cross_win_attend_1(
+                        q1, k1, v1,
+                        skip=rearrange(x_b, 'b d (x w1) (y w2) -> b x y w1 w2 d',
+                                       w1=self.q_win_size[0], w2=self.q_win_size[1]) if self.skip else None
+                    ),
+                    'b x y w1 w2 d  -> b (x w1) (y w2) d'
+                )
+                q1 = q1 + self.mlp_1(self.prenorm_1(q1))
 
-                    x_skip = q1
-                    q2 = repeat(q1, 'b x y d -> b n x y d', n=N)
+                x_skip = q1
+                q2 = repeat(q1, 'b x y d -> b n x y d', n=N)
 
-                    # local-to-global cross-attention
-                    q2 = rearrange(q2, 'b n (x w1) (y w2) d -> b n x y w1 w2 d',
-                                   w1=self.q_win_size[0], w2=self.q_win_size[1])
-                    k2 = rearrange(k1, 'b n x y w1 w2 d -> b n (x w1) (y w2) d')
-                    k2 = rearrange(k2, 'b n (w1 x) (w2 y) d -> b n x y w1 w2 d',
-                                   w1=self.feat_win_size[0], w2=self.feat_win_size[1])
-                    v2 = rearrange(v1, 'b n x y w1 w2 d -> b n (x w1) (y w2) d')
-                    v2 = rearrange(v2, 'b n (w1 x) (w2 y) d -> b n x y w1 w2 d',
-                                   w1=self.feat_win_size[0], w2=self.feat_win_size[1])
+                # local-to-global cross-attention
+                q2 = rearrange(q2, 'b n (x w1) (y w2) d -> b n x y w1 w2 d',
+                               w1=self.q_win_size[0], w2=self.q_win_size[1])
+                k2 = rearrange(k1, 'b n x y w1 w2 d -> b n (x w1) (y w2) d')
+                k2 = rearrange(k2, 'b n (w1 x) (w2 y) d -> b n x y w1 w2 d',
+                               w1=self.feat_win_size[0], w2=self.feat_win_size[1])
+                v2 = rearrange(v1, 'b n x y w1 w2 d -> b n (x w1) (y w2) d')
+                v2 = rearrange(v2, 'b n (w1 x) (w2 y) d -> b n x y w1 w2 d',
+                               w1=self.feat_win_size[0], w2=self.feat_win_size[1])
 
-                    q2 = rearrange(
-                        self.cross_win_attend_2(
-                            q2, k2, v2,
-                            skip=rearrange(x_skip, 'b (x w1) (y w2) d -> b x y w1 w2 d',
-                                           w1=self.q_win_size[0], w2=self.q_win_size[1]) if self.skip else None
-                        ),
-                        'b x y w1 w2 d  -> b (x w1) (y w2) d'
-                    )
-                    q2 = q2 + self.mlp_2(self.prenorm_2(q2))
-                    query = self.postnorm(q2)
+                q2 = rearrange(
+                    self.cross_win_attend_2(
+                        q2, k2, v2,
+                        skip=rearrange(x_skip, 'b (x w1) (y w2) d -> b x y w1 w2 d',
+                                       w1=self.q_win_size[0], w2=self.q_win_size[1]) if self.skip else None
+                    ),
+                    'b x y w1 w2 d  -> b (x w1) (y w2) d'
+                )
+                q2 = q2 + self.mlp_2(self.prenorm_2(q2))
+                query = self.postnorm(q2)
 
-                outputs.append(query)  # (1, H, W, d)
+            outputs.append(query)  # (1, H, W, d)
 
-            # 배치로 다시 합치기
-            outputs = torch.cat(outputs, dim=0)  # (B, H, W, d)
-            outputs = rearrange(outputs, 'b H W d -> b d H W')
-            return outputs
+        # 배치로 다시 합치기
+        outputs = torch.cat(outputs, dim=0)  # (B, H, W, d)
+        outputs = rearrange(outputs, 'b H W d -> b d H W')
+        return outputs
+
 
 
 
