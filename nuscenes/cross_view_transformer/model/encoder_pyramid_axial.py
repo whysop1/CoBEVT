@@ -565,45 +565,44 @@ class CrossViewSwapAttention(nn.Module):
         feature: torch.FloatTensor,
         I_inv: torch.FloatTensor,
         E_inv: torch.FloatTensor,
-        object_count: Optional[torch.Tensor] = None, #object_count
+        object_count: Optional[torch.Tensor] = None, # object_count
     ):
-        """
-        x: (b, c, H, W)
-        feature: (b, n, dim_in, h, w)
-        I_inv: (b, n, 3, 3)
-        E_inv: (b, n, 4, 4)
+    """
+    x: (b, c, H, W)
+    feature: (b, n, dim_in, h, w)
+    I_inv: (b, n, 3, 3)
+    E_inv: (b, n, 4, 4)
 
-        Returns: (b, d, H, W)
-        """
+    Returns: (b, d, H, W)
+    """
 
-        #디버깅
+        # 디버깅
         if object_count is not None:
-            print(">> object_count(crossviewswapattention):", object_count.shape, object_count) #각 인덱스가 특정 종류(차, 트럭, 보행자)의 객체 수임
+            print(">> object_count(crossviewswapattention):", object_count.shape, object_count)
         else:
             print(">> object_count(crossviewswapattention) is None")
 
-        
         b, n, _, _, _ = feature.shape
         _, _, H, W = x.shape
 
-        pixel = self.image_plane                                                # b n 3 h w
+        pixel = self.image_plane  # 1 1 3 h w
         _, _, _, h, w = pixel.shape
 
-        c = E_inv[..., -1:]                                                     # b n 4 1
-        c_flat = rearrange(c, 'b n ... -> (b n) ...')[..., None]                # (b n) 4 1 1
-        c_embed = self.cam_embed(c_flat)                                        # (b n) d 1 1
+        c = E_inv[..., -1:]  # b n 4 1
+        c_flat = rearrange(c, 'b n ... -> (b n) ...')[..., None]  # (b n) 4 1 1
+        c_embed = self.cam_embed(c_flat)  # (b n) d 1 1
 
-        pixel_flat = rearrange(pixel, '... h w -> ... (h w)')                   # 1 1 3 (h w)
-        cam = I_inv @ pixel_flat                                                # b n 3 (h w)
-        cam = F.pad(cam, (0, 0, 0, 1, 0, 0, 0, 0), value=1)                     # b n 4 (h w)
-        d = E_inv @ cam                                                         # b n 4 (h w)
-        d_flat = rearrange(d, 'b n d (h w) -> (b n) d h w', h=h, w=w)           # (b n) 4 h w
-        d_embed = self.img_embed(d_flat)                                        # (b n) d h w
+        pixel_flat = rearrange(pixel, '... h w -> ... (h w)')  # 1 1 3 (h w)
+        cam = I_inv @ pixel_flat  # b n 3 (h w)
+        cam = F.pad(cam, (0, 0, 0, 1, 0, 0, 0, 0), value=1)  # b n 4 (h w)
+        d = E_inv @ cam  # b n 4 (h w)
+        d_flat = rearrange(d, 'b n d (h w) -> (b n) d h w', h=h, w=w)  # (b n) 4 h w
+        d_embed = self.img_embed(d_flat)  # (b n) d h w
 
-        img_embed = d_embed - c_embed                                           # (b n) d h w
-        img_embed = img_embed / (img_embed.norm(dim=1, keepdim=True) + 1e-7)    # (b n) d h w
+        img_embed = d_embed - c_embed  # (b n) d h w
+        img_embed = img_embed / (img_embed.norm(dim=1, keepdim=True) + 1e-7)  # (b n) d h w
 
-        # todo: some hard-code for now.
+        # some hard-coded grid selection
         if index == 0:
             world = bev.grid0[:2]
         elif index == 1:
@@ -615,76 +614,115 @@ class CrossViewSwapAttention(nn.Module):
 
         if self.bev_embed_flag:
             # 2 H W
-            w_embed = self.bev_embed(world[None])                                   # 1 d H W
-            bev_embed = w_embed - c_embed                                           # (b n) d H W
-            bev_embed = bev_embed / (bev_embed.norm(dim=1, keepdim=True) + 1e-7)    # (b n) d H W
-            query_pos = rearrange(bev_embed, '(b n) ... -> b n ...', b=b, n=n)      # b n d H W
+            w_embed = self.bev_embed(world[None])  # 1 d H W
+            bev_embed = w_embed - c_embed  # (b n) d H W
+            bev_embed = bev_embed / (bev_embed.norm(dim=1, keepdim=True) + 1e-7)  # (b n) d H W
+            query_pos = rearrange(bev_embed, '(b n) ... -> b n ...', b=b, n=n)  # b n d H W
 
-        feature_flat = rearrange(feature, 'b n ... -> (b n) ...')               # (b n) d h w
+        feature_flat = rearrange(feature, 'b n ... -> (b n) ...')  # (b n) d h w
 
         if self.feature_proj is not None:
-            key_flat = img_embed + self.feature_proj(feature_flat)              # (b n) d h w
+            key_flat = img_embed + self.feature_proj(feature_flat)  # (b n) d h w
         else:
-            key_flat = img_embed                                                # (b n) d h w
+            key_flat = img_embed  # (b n) d h w
 
-        val_flat = self.feature_linear(feature_flat)                            # (b n) d h w
+        val_flat = self.feature_linear(feature_flat)  # (b n) d h w
 
         # Expand + refine the BEV embedding
         if self.bev_embed_flag:
             query = query_pos + x[:, None]
         else:
             query = x[:, None]  # b n d H W
-        key = rearrange(key_flat, '(b n) ... -> b n ...', b=b, n=n)             # b n d h w
-        val = rearrange(val_flat, '(b n) ... -> b n ...', b=b, n=n)             # b n d h w
+        key = rearrange(key_flat, '(b n) ... -> b n ...', b=b, n=n)  # b n d h w
+        val = rearrange(val_flat, '(b n) ... -> b n ...', b=b, n=n)  # b n d h w
 
-        # pad divisible
+        # -------------- 여기서 차원 확인 후 n 차원 추가 --------------
+        if query.ndim == 4:
+            query = query.unsqueeze(1)  # (b, 1, d, H, W)
+        if key.ndim == 4:
+            key = key.unsqueeze(1)
+        if val.ndim == 4:
+            val = val.unsqueeze(1)
+    # --------------------------------------------------------
+
+    # pad divisible
         key = self.pad_divisble(key, self.feat_win_size[0], self.feat_win_size[1])
         val = self.pad_divisble(val, self.feat_win_size[0], self.feat_win_size[1])
 
-        # local-to-local cross-attention
-        query = rearrange(query, 'b n d (x w1) (y w2) -> b n x y w1 w2 d',
-                          w1=self.q_win_size[0], w2=self.q_win_size[1])  # window partition
-        key = rearrange(key, 'b n d (x w1) (y w2) -> b n x y w1 w2 d',
-                          w1=self.feat_win_size[0], w2=self.feat_win_size[1])  # window partition
-        val = rearrange(val, 'b n d (x w1) (y w2) -> b n x y w1 w2 d',
-                          w1=self.feat_win_size[0], w2=self.feat_win_size[1])  # window partition
-        query = rearrange(self.cross_win_attend_1(query, key, val,
-                                                skip=rearrange(x,
-                                                            'b d (x w1) (y w2) -> b x y w1 w2 d',
-                                                             w1=self.q_win_size[0], w2=self.q_win_size[1]) if self.skip else None),
-                       'b x y w1 w2 d  -> b (x w1) (y w2) d')    # reverse window to feature
+    # local-to-local cross-attention
+        query = rearrange(
+            query,
+            'b n d (x w1) (y w2) -> b n x y w1 w2 d',
+            w1=self.q_win_size[0],
+            w2=self.q_win_size[1],
+        )  # window partition
+        key = rearrange(
+            key,
+            'b n d (x w1) (y w2) -> b n x y w1 w2 d',
+            w1=self.feat_win_size[0],
+            w2=self.feat_win_size[1],
+        )  # window partition
+        val = rearrange(
+            val,
+            'b n d (x w1) (y w2) -> b n x y w1 w2 d',
+            w1=self.feat_win_size[0],
+            w2=self.feat_win_size[1],
+        )  # window partition
+        query = rearrange(
+            self.cross_win_attend_1(
+                query,
+                key,
+                val,
+                skip=rearrange(
+                    x,
+                    'b d (x w1) (y w2) -> b x y w1 w2 d',
+                    w1=self.q_win_size[0],
+                    w2=self.q_win_size[1],
+                )
+                if self.skip
+                else None,
+            ),
+            'b x y w1 w2 d  -> b (x w1) (y w2) d',
+        )  # reverse window to feature
 
         query = query + self.mlp_1(self.prenorm_1(query))
 
         x_skip = query
-        query = repeat(query, 'b x y d -> b n x y d', n=n)              # b n x y d
+        query = repeat(query, 'b x y d -> b n x y d', n=n)  # b n x y d
 
         # local-to-global cross-attention
-        query = rearrange(query, 'b n (x w1) (y w2) d -> b n x y w1 w2 d',
-                          w1=self.q_win_size[0], w2=self.q_win_size[1])  # window partition
+        query = rearrange(
+            query, 'b n (x w1) (y w2) d -> b n x y w1 w2 d', w1=self.q_win_size[0], w2=self.q_win_size[1]
+        )  # window partition
         key = rearrange(key, 'b n x y w1 w2 d -> b n (x w1) (y w2) d')  # reverse window to feature
-        key = rearrange(key, 'b n (w1 x) (w2 y) d -> b n x y w1 w2 d',
-                        w1=self.feat_win_size[0], w2=self.feat_win_size[1])  # grid partition
+        key = rearrange(key, 'b n (w1 x) (w2 y) d -> b n x y w1 w2 d', w1=self.feat_win_size[0], w2=self.feat_win_size[1])  # grid partition
         val = rearrange(val, 'b n x y w1 w2 d -> b n (x w1) (y w2) d')  # reverse window to feature
-        val = rearrange(val, 'b n (w1 x) (w2 y) d -> b n x y w1 w2 d',
-                        w1=self.feat_win_size[0], w2=self.feat_win_size[1])  # grid partition
-        query = rearrange(self.cross_win_attend_2(query,
-                                                  key,
-                                                  val,
-                                                  skip=rearrange(x_skip,
-                                                            'b (x w1) (y w2) d -> b x y w1 w2 d',
-                                                            w1=self.q_win_size[0],
-                                                            w2=self.q_win_size[1])
-                                                  if self.skip else None),
-                       'b x y w1 w2 d  -> b (x w1) (y w2) d')  # reverse grid to feature
+        val = rearrange(val, 'b n (w1 x) (w2 y) d -> b n x y w1 w2 d', w1=self.feat_win_size[0], w2=self.feat_win_size[1])  # grid partition
+        query = rearrange(
+            self.cross_win_attend_2(
+                query,
+                key,
+                val,
+                skip=rearrange(
+                    x_skip,
+                    'b (x w1) (y w2) d -> b x y w1 w2 d',
+                    w1=self.q_win_size[0],
+                    w2=self.q_win_size[1],
+                )
+                if self.skip
+                else None,
+            ),
+            'b x y w1 w2 d  -> b (x w1) (y w2) d',
+        )  # reverse grid to feature
 
         query = query + self.mlp_2(self.prenorm_2(query))
 
         query = self.postnorm(query)
 
         query = rearrange(query, 'b H W d -> b d H W')
-
+    
         return query
+
 
     
 
