@@ -1006,18 +1006,13 @@ class CrossViewSwapAttention(nn.Module):
             q2 = q2 + self.mlp_2(self.prenorm_2(q2))
 
             # Masked update: only update prev_result where active_mask is True
-            # q2: (b, H, W, d); prev_result: (b, H, W, d)
             mask = active_mask.view(b, 1, 1, 1).to(q2.dtype)  # (b,1,1,1)
-            # new result for all samples: active -> q2, inactive -> prev_result
             new_result = mask * q2 + (1.0 - mask) * prev_result
-
-            # Update prev_result
             prev_result = new_result
 
-            # Prepare current_query_input for next round:
-            # for active samples -> repeat q2 into camera dim ; for inactive keep previous current_query_input
-            q2_exp_for_update = rearrange(q2, 'b H W d -> b n d H W', n=n)
-            # mask over first dim broadcast to (b, n, 1, 1, 1)
+            # ---------- 여기서 오류가 났음: rearrange(q2, 'b H W d -> b n d H W', n=n)
+            # 오류 해결: einops.repeat 사용
+            q2_exp_for_update = repeat(q2, 'b H W d -> b n d H W', n=n)
             mask_bn = mask.view(b, 1, 1, 1, 1)
             current_query_input = mask_bn * q2_exp_for_update + (1.0 - mask_bn) * current_query_input
 
