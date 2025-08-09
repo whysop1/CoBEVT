@@ -602,16 +602,18 @@ class CrossViewSwapAttention(nn.Module):
             # === 카메라 위치 임베딩 ===
             c = E_b[..., -1:]
             c_flat = rearrange(c, 'b n ... -> (b n) ...')[..., None]
-            c_embed = self.cam_embed(c_flat)
+            c_embed = self.cam_embed(c_flat)  # (b*n, d_c)
     
             # === 이미지 평면 좌표 계산 ===
             pixel_flat = rearrange(pixel, '... h w -> ... (h w)')
             cam = I_b @ pixel_flat
+            # pad to homogeneous
             cam = F.pad(cam, (0, 0, 0, 1, 0, 0, 0, 0), value=1)
             d = E_b @ cam
             d_flat = rearrange(d, 'b n d (h w) -> (b n) d h w', h=h, w=w)
-            d_embed = self.img_embed(d_flat)
+            d_embed = self.img_embed(d_flat)  # ((b*n), d_img, h, w)
     
+            # normalize image embed (shape matches c_embed broadcasting)
             img_embed = d_embed - c_embed
             img_embed = img_embed / (img_embed.norm(dim=1, keepdim=True) + 1e-7)
     
@@ -629,14 +631,15 @@ class CrossViewSwapAttention(nn.Module):
     
             # === BEV positional embedding ===
             if self.bev_embed_flag:
-                w_embed = self.bev_embed(world[None])
+                w_embed = self.bev_embed(world[None])  # (1*N, d_bev, H_bev, W_bev) or similar
                 bev_embed = w_embed - c_embed
                 bev_embed = bev_embed / (bev_embed.norm(dim=1, keepdim=True) + 1e-7)
+                # ensure shape (b=1, n=N, d, H, W)
                 query_pos = rearrange(bev_embed, '(b n) ... -> b n ...', b=1, n=N)
             else:
                 query_pos = None
     
-            # === Feature projection ===
+            # === Feature projection (key/val) ===
             feature_flat = rearrange(feat_b, 'b n ... -> (b n) ...')
             if self.feature_proj is not None:
                 key_flat = img_embed + self.feature_proj(feature_flat)
@@ -644,21 +647,81 @@ class CrossViewSwapAttention(nn.Module):
                 key_flat = img_embed
             val_flat = self.feature_linear(feature_flat)
     
-            # === Query shape 보정 (차원 불일치 방지) ===
+            # === Query 초기 생성: (b, n, d, H, W) 형태를 보장 ===
+            # x_b: (1, C, H, W)
             if self.bev_embed_flag:
-                query = query_pos + x_b.unsqueeze(1)  # (1, N, D, H, W)
+                # query_pos: (1, N, d, H, W)
+                # x_b.unsqueeze(1): (1, 1, C, H, W) -> broadcast to (1, N, C, H, W)
+                query = query_pos + x_b.unsqueeze(1)  # result (1, N, D, H, W)
             else:
-                query = x_b.unsqueeze(1)              # (1, 1, D, H, W)
+                # no bev embed: use x_b as query content
+                # make it (1, N, C, H, W) by repeating along N
+                query = x_b.unsqueeze(1)
+                if N != 1:
+                    query = repeat(query, 'b 1 d h w -> b n d h w', n=N)
     
-            # === Key, Value 재구성 ===
+            # ---- 안전성 보강: 만약 어떤 연산으로 query가 (b, H, W, d) 같은 형태가 되어있다면 강제로 변환
+            # (입력 형태가 다를 수 있으므로 보호막을 둠)
+            if query.dim() == 4:
+                # assume (b, H, W, d)  -> convert to (b, 1, d, H, W) and repeat to N if needed
+                b0, h0, w0, d0 = query.shape
+                query = rearrange(query, 'b H W d -> b 1 d H W')
+                if N != 1:
+                    query = repeat(query, 'b 1 d H W -> b n d H W', n=N)
+            elif query.dim() == 5:
+                # ok, but we need channel dim to be at dim=2 (b, n, d, H, W)
+                # if channel is last (b,n,H,W,d), detect and permute
+                # handle (b, n, H, W, d) -> (b, n, d, H, W)
+                if query.shape[-1] == query.shape[2] if query.shape[2] == H or query.shape[2] == W else False:
+                    # not a safe general test; better check common pattern:
+                    # if last dim equals small d and middle dims equal H,W, do permutation
+                    pass
+                # we'll do a safer check: if query.shape[2] in (H,W) but not likely d -> permute
+                if query.shape[2] == H or query.shape[2] == W:
+                    # permute from (b,n,H,W,d) -> (b,n,d,H,W)
+                    query = rearrange(query, 'b n H W d -> b n d H W')
+    
+            # === Key / Value 재구성 ===
             key = rearrange(key_flat, '(b n) ... -> b n ...', b=1, n=N)
             val = rearrange(val_flat, '(b n) ... -> b n ...', b=1, n=N)
     
+            # ensure key/val have channel dim at axis=2: (b,n,d,H,W)
+            if key.dim() == 4:
+                # (b, H, W, d) -> (b, 1, d, H, W) -> repeat n
+                key = rearrange(key, 'b H W d -> b 1 d H W')
+                if N != 1:
+                    key = repeat(key, 'b 1 d H W -> b n d H W', n=N)
+            elif key.dim() == 5:
+                # if key is (b,n,H,W,d) -> permute
+                if key.shape[-1] == key.shape[3] or key.shape[-1] == key.shape[4] and key.shape[2] in (H, W):
+                    # try to detect and permute safely
+                    try:
+                        key = rearrange(key, 'b n H W d -> b n d H W')
+                    except Exception:
+                        pass
+    
+            if val.dim() == 4:
+                val = rearrange(val, 'b H W d -> b 1 d H W')
+                if N != 1:
+                    val = repeat(val, 'b 1 d H W -> b n d H W', n=N)
+            elif val.dim() == 5:
+                # similar permutation attempt
+                if val.shape[-1] == val.shape[3] or (val.shape[-1] == val.shape[4] and val.shape[2] in (H, W)):
+                    try:
+                        val = rearrange(val, 'b n H W d -> b n d H W')
+                    except Exception:
+                        pass
+    
+            # pad key/val to be divisible by window sizes
             key = self.pad_divisble(key, self.feat_win_size[0], self.feat_win_size[1])
             val = self.pad_divisble(val, self.feat_win_size[0], self.feat_win_size[1])
     
             # === 반복 실행 (샘플별 다름) ===
             for _ in range(repeat_times):
+                # 보장: 여기서부터 query/key/val 는 (b, n, d, H, W)
+                assert query.dim() == 5, f"query must be 5D here but got {query.shape}"
+                assert key.dim() == 5 and val.dim() == 5, f"key/val must be 5D but got {key.shape}, {val.shape}"
+    
                 # local-to-local cross-attention
                 q1 = rearrange(query, 'b n d (x w1) (y w2) -> b n x y w1 w2 d',
                                w1=self.q_win_size[0], w2=self.q_win_size[1])
@@ -667,6 +730,7 @@ class CrossViewSwapAttention(nn.Module):
                 v1 = rearrange(val, 'b n d (x w1) (y w2) -> b n x y w1 w2 d',
                                w1=self.feat_win_size[0], w2=self.feat_win_size[1])
     
+                # cross attention 1 결과는 (b, x, y, w1, w2, d) -> flatten to (b, H, W, d)
                 q1 = rearrange(
                     self.cross_win_attend_1(
                         q1, k1, v1,
@@ -677,15 +741,19 @@ class CrossViewSwapAttention(nn.Module):
                 )
                 q1 = q1 + self.mlp_1(self.prenorm_1(q1))
     
+                # x_skip: (b, H, W, d)
                 x_skip = q1
+                # replicate across N for next cross stage: (b, n, H, W, d) -> we want (b, n, H, W, d)
                 q2 = repeat(q1, 'b x y d -> b n x y d', n=N)
     
-                # local-to-global cross-attention
+                # reshape q2 to window form for global cross-attention
                 q2 = rearrange(q2, 'b n (x w1) (y w2) d -> b n x y w1 w2 d',
                                w1=self.q_win_size[0], w2=self.q_win_size[1])
+    
                 k2 = rearrange(k1, 'b n x y w1 w2 d -> b n (x w1) (y w2) d')
                 k2 = rearrange(k2, 'b n (w1 x) (w2 y) d -> b n x y w1 w2 d',
                                w1=self.feat_win_size[0], w2=self.feat_win_size[1])
+    
                 v2 = rearrange(v1, 'b n x y w1 w2 d -> b n (x w1) (y w2) d')
                 v2 = rearrange(v2, 'b n (w1 x) (w2 y) d -> b n x y w1 w2 d',
                                w1=self.feat_win_size[0], w2=self.feat_win_size[1])
@@ -699,7 +767,21 @@ class CrossViewSwapAttention(nn.Module):
                     'b x y w1 w2 d  -> b (x w1) (y w2) d'
                 )
                 q2 = q2 + self.mlp_2(self.prenorm_2(q2))
-                query = self.postnorm(q2)
+    
+                # postnorm 결과는 (b, H, W, d) -> 우리는 다시 (b, n, d, H, W)으로 만들 것
+                post = self.postnorm(q2)  # likely shape (b, H, W, d)
+                # ensure post is (b, H, W, d)
+                if post.dim() == 4:
+                    # convert to (b, n, d, H, W)
+                    post = rearrange(post, 'b H W d -> b 1 d H W')
+                    if N != 1:
+                        post = repeat(post, 'b 1 d H W -> b n d H W', n=N)
+                elif post.dim() == 5:
+                    # maybe (b, n, H, W, d) -> permute
+                    if post.shape[-1] == d:
+                        post = rearrange(post, 'b n H W d -> b n d H W')
+    
+                query = post
     
             outputs.append(query)  # (1, N, D, H, W)
     
@@ -707,7 +789,7 @@ class CrossViewSwapAttention(nn.Module):
         outputs = torch.cat(outputs, dim=0)  # (B, N, D, H, W)
         outputs = rearrange(outputs, 'b n d H W -> b d H W')
         return outputs
-    
+
 
 
 
