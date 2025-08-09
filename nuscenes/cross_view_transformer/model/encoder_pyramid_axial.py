@@ -485,7 +485,7 @@ class CrossViewSwapAttention(nn.Module):
 '''
 
 
-
+'''
 class CrossViewSwapAttention(nn.Module):
     # __init__ 메서드 및 다른 메서드들은 제공된 코드와 동일하게 유지합니다.
     # ...
@@ -735,6 +735,296 @@ class CrossViewSwapAttention(nn.Module):
         query = rearrange(query, 'b H W d -> b d H W')
 
         return query
+'''
+
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+from einops import rearrange, repeat
+
+# assume CrossWinAttention, BEVEmbedding, generate_grid exist (unchanged)
+
+class CrossViewSwapAttention(nn.Module):
+    def __init__(
+        self,
+        feat_height: int,
+        feat_width: int,
+        feat_dim: int,
+        dim: int,
+        index: int,
+        image_height: int,
+        image_width: int,
+        qkv_bias: bool,
+        q_win_size: list,
+        feat_win_size: list,
+        heads: list,
+        dim_head: list,
+        bev_embedding_flag: list,
+        rel_pos_emb: bool = False,
+        no_image_features: bool = False,
+        skip: bool = True,
+        norm=nn.LayerNorm,
+    ):
+        super().__init__()
+
+        image_plane = generate_grid(feat_height, feat_width)[None]
+        image_plane[:, :, 0] *= image_width
+        image_plane[:, :, 1] *= image_height
+        self.register_buffer('image_plane', image_plane, persistent=False)
+
+        self.feature_linear = nn.Sequential(
+            nn.BatchNorm2d(feat_dim),
+            nn.ReLU(),
+            nn.Conv2d(feat_dim, dim, 1, bias=False)
+        )
+
+        if no_image_features:
+            self.feature_proj = None
+        else:
+            self.feature_proj = nn.Sequential(
+                nn.BatchNorm2d(feat_dim),
+                nn.ReLU(),
+                nn.Conv2d(feat_dim, dim, 1, bias=False)
+            )
+
+        self.bev_embed_flag = bev_embedding_flag[index]
+        if self.bev_embed_flag:
+            self.bev_embed = nn.Conv2d(2, dim, 1)
+        self.img_embed = nn.Conv2d(4, dim, 1, bias=False)
+        self.cam_embed = nn.Conv2d(4, dim, 1, bias=False)
+
+        self.q_win_size = q_win_size[index]
+        self.feat_win_size = feat_win_size[index]
+        self.rel_pos_emb = rel_pos_emb
+
+        self.cross_win_attend_1 = CrossWinAttention(dim, heads[index], dim_head[index], qkv_bias)
+        self.cross_win_attend_2 = CrossWinAttention(dim, heads[index], dim_head[index], qkv_bias)
+        self.skip = skip
+
+        self.prenorm_1 = norm(dim)
+        self.prenorm_2 = norm(dim)
+        self.mlp_1 = nn.Sequential(nn.Linear(dim, 2 * dim), nn.GELU(), nn.Linear(2 * dim, dim))
+        self.mlp_2 = nn.Sequential(nn.Linear(dim, 2 * dim), nn.GELU(), nn.Linear(2 * dim, dim))
+        self.postnorm = norm(dim)
+
+    def pad_divisble(self, x, win_h, win_w):
+        _, _, _, h, w = x.shape
+        h_pad, w_pad = ((h + win_h) // win_h) * win_h, ((w + win_w) // win_w) * win_w
+        padh = h_pad - h if h % win_h != 0 else 0
+        padw = w_pad - w if w % win_w != 0 else 0
+        return F.pad(x, (0, padw, 0, padh), value=0)
+
+    def get_attention_rounds(self, object_count_scalar: int):
+        # 너가 말했듯이 반복 횟수는 높게 가져가도 된다고 했으니
+        # 아래는 예시 규칙 — 필요하면 더 세분화하거나 scale 기반으로 조정해봐
+        if object_count_scalar < 10:
+            return 2
+        elif object_count_scalar < 30:
+            return 4
+        elif object_count_scalar < 60:
+            return 6
+        else:
+            return 8
+
+    def forward(
+        self,
+        index: int,
+        x: torch.FloatTensor,
+        bev: 'BEVEmbedding',
+        feature: torch.FloatTensor,
+        I_inv: torch.FloatTensor,
+        E_inv: torch.FloatTensor,
+        object_count: Optional[torch.Tensor] = None,
+    ):
+        """
+        x: (b, d, H, W)
+        feature: (b, n, dim_in, h, w)
+        I_inv: (b, n, 3, 3)
+        E_inv: (b, n, 4, 4)
+        object_count: (b,) or (b, k)  - per-sample counts or per-class counts
+        """
+
+        b, n, _, _, _ = feature.shape
+        _, d, H, W = x.shape
+
+        # --- embed camera/world/image as before ---
+        pixel = self.image_plane
+        _, _, _, h, w = pixel.shape
+
+        c = E_inv[..., -1:]
+        c_flat = rearrange(c, 'b n ... -> (b n) ...')[..., None]
+        c_embed = self.cam_embed(c_flat)
+
+        pixel_flat = rearrange(pixel, '... h w -> ... (h w)')
+        cam = I_inv @ pixel_flat
+        cam = F.pad(cam, (0, 0, 0, 1, 0, 0, 0, 0), value=1)
+        d_coords = E_inv @ cam
+        d_flat = rearrange(d_coords, 'b n d (h w) -> (b n) d h w', h=h, w=w)
+        d_embed = self.img_embed(d_flat)
+        img_embed = d_embed - c_embed
+        img_embed = img_embed / (img_embed.norm(dim=1, keepdim=True) + 1e-7)
+
+        if index == 0:
+            world = bev.grid0[:2]
+        elif index == 1:
+            world = bev.grid1[:2]
+        elif index == 2:
+            world = bev.grid2[:2]
+        elif index == 3:
+            world = bev.grid3[:2]
+
+        if self.bev_embed_flag:
+            w_embed = self.bev_embed(world[None])
+            bev_embed = w_embed - c_embed
+            bev_embed = bev_embed / (bev_embed.norm(dim=1, keepdim=True) + 1e-7)
+            query_pos = rearrange(bev_embed, '(b n) ... -> b n ...', b=b, n=n)
+
+        feature_flat = rearrange(feature, 'b n ... -> (b n) ...')
+        if self.feature_proj is not None:
+            key_flat = img_embed + self.feature_proj(feature_flat)
+        else:
+            key_flat = img_embed
+        val_flat = self.feature_linear(feature_flat)
+
+        if self.bev_embed_flag:
+            current_query_input = query_pos + x[:, None]  # b n d H W
+        else:
+            current_query_input = x[:, None]  # b n d H W
+
+        key = rearrange(key_flat, '(b n) ... -> b n ...', b=b, n=n)
+        val = rearrange(val_flat, '(b n) ... -> b n ...', b=b, n=n)
+
+        key = self.pad_divisble(key, self.feat_win_size[0], self.feat_win_size[1])
+        val = self.pad_divisble(val, self.feat_win_size[0], self.feat_win_size[1])
+
+        # If no object_count provided -> fall back to original fixed 2-round path
+        if object_count is None:
+            # --- original 2-round behavior (same as 1번) ---
+            query = current_query_input  # b n d H W
+
+            # local-to-local
+            query = rearrange(query, 'b n d (x w1) (y w2) -> b n x y w1 w2 d',
+                              w1=self.q_win_size[0], w2=self.q_win_size[1])
+            key_w = rearrange(key, 'b n d (x w1) (y w2) -> b n x y w1 w2 d',
+                              w1=self.feat_win_size[0], w2=self.feat_win_size[1])
+            val_w = rearrange(val, 'b n d (x w1) (y w2) -> b n x y w1 w2 d',
+                              w1=self.feat_win_size[0], w2=self.feat_win_size[1])
+
+            skip1 = rearrange(x, 'b d (x w1) (y w2) -> b x y w1 w2 d',
+                              w1=self.q_win_size[0], w2=self.q_win_size[1]) if self.skip else None
+
+            query = rearrange(self.cross_win_attend_1(query, key_w, val_w, skip=skip1),
+                              'b x y w1 w2 d -> b (x w1) (y w2) d')
+            query = query + self.mlp_1(self.prenorm_1(query))
+            x_skip = query
+
+            query = repeat(query, 'b x y d -> b n x y d', n=n)
+            query = rearrange(query, 'b n (x w1) (y w2) d -> b n x y w1 w2 d',
+                              w1=self.q_win_size[0], w2=self.q_win_size[1])
+
+            key_g = rearrange(key_w, 'b n x y w1 w2 d -> b n (x w1) (y w2) d')
+            key_g = rearrange(key_g, 'b n (w1 x) (w2 y) d -> b n x y w1 w2 d',
+                               w1=self.feat_win_size[0], w2=self.feat_win_size[1])
+            val_g = rearrange(val_w, 'b n x y w1 w2 d -> b n (x w1) (y w2) d')
+            val_g = rearrange(val_g, 'b n (w1 x) (w2 y) d -> b n x y w1 w2 d',
+                               w1=self.feat_win_size[0], w2=self.feat_win_size[1])
+
+            skip2 = rearrange(x_skip, 'b (x w1) (y w2) d -> b x y w1 w2 d',
+                              w1=self.q_win_size[0], w2=self.q_win_size[1]) if self.skip else None
+
+            query = rearrange(self.cross_win_attend_2(query, key_g, val_g, skip=skip2),
+                              'b x y w1 w2 d -> b (x w1) (y w2) d')
+            query = query + self.mlp_2(self.prenorm_2(query))
+
+            query = self.postnorm(query)
+            query = rearrange(query, 'b H W d -> b d H W')
+            return query
+
+        # ---------------- Adaptive path ----------------
+        # Normalize object_count to per-sample scalar if user passed vector (e.g., per-class counts)
+        # Expect object_count shape (b,) or (b, k)
+        oc = object_count
+        if oc.dim() > 1:
+            oc = oc.view(b, -1).sum(dim=1)  # sum across classes to get total per sample
+        else:
+            oc = oc.view(b)
+
+        # compute rounds per sample
+        rounds_tensor = torch.tensor([self.get_attention_rounds(int(o.item())) for o in oc], device=x.device)
+        max_rounds = int(rounds_tensor.max().item())
+
+        # store previous results as (b, H, W, d) for easy masked blending
+        prev_result = rearrange(x, 'b d H W -> b H W d')  # identity baseline
+
+        # ensure current_query_input shape is b n d H W
+        # loop over rounds, compute full-batch attention, then selectively update per-sample via mask
+        for round_idx in range(max_rounds):
+            # boolean mask for samples that should be updated this round
+            active_mask = (rounds_tensor > round_idx).to(x.device)  # (b,)
+            if active_mask.sum() == 0:
+                # nobody active this round
+                continue
+
+            # Prepare query for cross_win_attend_1: b n x y w1 w2 d
+            query_win = rearrange(current_query_input,
+                                  'b n d (x w1) (y w2) -> b n x y w1 w2 d',
+                                  w1=self.q_win_size[0], w2=self.q_win_size[1])
+            key_win = rearrange(key, 'b n d (x w1) (y w2) -> b n x y w1 w2 d',
+                                w1=self.feat_win_size[0], w2=self.feat_win_size[1])
+            val_win = rearrange(val, 'b n d (x w1) (y w2) -> b n x y w1 w2 d',
+                                w1=self.feat_win_size[0], w2=self.feat_win_size[1])
+
+            # only use original x as skip1 on first round, to match baseline behaviour
+            skip1 = rearrange(x, 'b d (x w1) (y w2) -> b x y w1 w2 d',
+                              w1=self.q_win_size[0], w2=self.q_win_size[1]) if (self.skip and round_idx == 0) else None
+
+            # cross attend 1 -> returns shape b x y w1 w2 d (CrossWinAttention reduces camera dim)
+            q1 = self.cross_win_attend_1(query_win, key_win, val_win, skip=skip1)
+            q1 = rearrange(q1, 'b x y w1 w2 d -> b (x w1) (y w2) d')  # -> b H W d
+            q1 = q1 + self.mlp_1(self.prenorm_1(q1))
+            x_skip = q1  # to be used as skip for second attend
+
+            # prepare for second cross-attend: expand q1 to cameras dimension
+            q_exp = repeat(q1, 'b H W d -> b n H W d', n=n)
+            q_exp = rearrange(q_exp, 'b n H W d -> b n d H W')
+            q_win2 = rearrange(q_exp, 'b n d (x w1) (y w2) -> b n x y w1 w2 d',
+                               w1=self.q_win_size[0], w2=self.q_win_size[1])
+
+            # convert key_win to grid form for second attend (same as original)
+            key_grid = rearrange(key_win, 'b n x y w1 w2 d -> b n (x w1) (y w2) d')
+            key_grid = rearrange(key_grid, 'b n (w1 x) (w2 y) d -> b n x y w1 w2 d',
+                                 w1=self.feat_win_size[0], w2=self.feat_win_size[1])
+            val_grid = rearrange(val_win, 'b n x y w1 w2 d -> b n (x w1) (y w2) d')
+            val_grid = rearrange(val_grid, 'b n (w1 x) (w2 y) d -> b n x y w1 w2 d',
+                                 w1=self.feat_win_size[0], w2=self.feat_win_size[1])
+
+            skip2 = rearrange(x_skip, 'b (x w1) (y w2) d -> b x y w1 w2 d',
+                              w1=self.q_win_size[0], w2=self.q_win_size[1]) if self.skip else None
+
+            q2 = self.cross_win_attend_2(q_win2, key_grid, val_grid, skip=skip2)
+            q2 = rearrange(q2, 'b x y w1 w2 d -> b (x w1) (y w2) d')  # -> b H W d
+            q2 = q2 + self.mlp_2(self.prenorm_2(q2))
+
+            # Masked update: only update prev_result where active_mask is True
+            # q2: (b, H, W, d); prev_result: (b, H, W, d)
+            mask = active_mask.view(b, 1, 1, 1).to(q2.dtype)  # (b,1,1,1)
+            # new result for all samples: active -> q2, inactive -> prev_result
+            new_result = mask * q2 + (1.0 - mask) * prev_result
+
+            # Update prev_result
+            prev_result = new_result
+
+            # Prepare current_query_input for next round:
+            # for active samples -> repeat q2 into camera dim ; for inactive keep previous current_query_input
+            q2_exp_for_update = rearrange(q2, 'b H W d -> b n d H W', n=n)
+            # mask over first dim broadcast to (b, n, 1, 1, 1)
+            mask_bn = mask.view(b, 1, 1, 1, 1)
+            current_query_input = mask_bn * q2_exp_for_update + (1.0 - mask_bn) * current_query_input
+
+        # after rounds, apply postnorm and reshape to b d H W
+        out = self.postnorm(prev_result)  # expects last dim to be feature dim
+        out = rearrange(out, 'b H W d -> b d H W')
+        return out
 
 
 
