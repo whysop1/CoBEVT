@@ -488,10 +488,10 @@ class CrossViewSwapAttention(nn.Module):
 
 class CrossViewSwapAttention(nn.Module):
     """
-    Aggressive adaptive CrossViewSwapAttention:
-    - 내부적으로 3 variants (low/mid/high) with different inner dims & head counts.
-    - 각 배치 샘플의 object_count에 따라 variant를 선택해 처리.
-    - 내부 결과는 final_proj로 원래 dim으로 되돌려서 일관된 출력 채널 유지.
+    Aggressive adaptive CrossViewSwapAttention (fixed):
+    - nn.ModuleDict에 모듈이 아닌 값을 넣지 않도록 수정함.
+    - inner_dim 등의 숫자 값은 self.inner_dims 리스트에 보관.
+    - 나머지 구조는 기존 구현을 따름.
     """
     def __init__(
         self,
@@ -531,13 +531,16 @@ class CrossViewSwapAttention(nn.Module):
         image_plane[:, :, 1] *= image_height
         self.register_buffer('image_plane', image_plane, persistent=False)
 
-        # base embeddings (we will also create per-variant projections)
         # create 3 scales: low, mid, high
         self.scales = [1.0, 1.3, 1.6]  # 변경하고 싶으면 여기 수정
         base_heads = heads[index]
 
-        # containers for variant modules
+        # containers for variant modules (only nn.Modules inside ModuleList)
         self.variants = nn.ModuleList()
+        # store numeric metadata outside ModuleDict (these are plain python values)
+        self.inner_dims = []
+        self.heads_variants = []
+
         for scale in self.scales:
             inner_dim = max(1, int(dim * scale))
             heads_variant = max(1, int(base_heads * scale))
@@ -550,18 +553,18 @@ class CrossViewSwapAttention(nn.Module):
                 nn.Conv2d(feat_dim, inner_dim, 1, bias=False)
             )
             if no_image_features:
-                feature_proj = None
+                feature_proj_module = nn.Identity()
             else:
-                feature_proj = nn.Sequential(
+                feature_proj_module = nn.Sequential(
                     nn.BatchNorm2d(feat_dim),
                     nn.ReLU(),
                     nn.Conv2d(feat_dim, inner_dim, 1, bias=False)
                 )
 
             # bev/img/cam embeddings to inner_dim
-            bev_embed = nn.Conv2d(2, inner_dim, 1) if self.bev_embed_flag else None
-            img_embed = nn.Conv2d(4, inner_dim, 1, bias=False)
-            cam_embed = nn.Conv2d(4, inner_dim, 1, bias=False)
+            bev_embed_module = nn.Conv2d(2, inner_dim, 1) if self.bev_embed_flag else nn.Identity()
+            img_embed_module = nn.Conv2d(4, inner_dim, 1, bias=False)
+            cam_embed_module = nn.Conv2d(4, inner_dim, 1, bias=False)
 
             # CrossWinAttention variants (two stages)
             cross_win_attend_1 = CrossWinAttention(inner_dim, heads_variant, dim_head_variant, qkv_bias)
@@ -577,13 +580,13 @@ class CrossViewSwapAttention(nn.Module):
             # final projection back to original dim
             final_proj = nn.Conv2d(inner_dim, dim, 1, bias=False)
 
+            # ONLY nn.Modules go into the ModuleDict
             variant = nn.ModuleDict({
-                'inner_dim': torch.tensor(inner_dim),
                 'feature_linear': feature_linear,
-                'feature_proj': feature_proj if feature_proj is not None else nn.Identity(),
-                'bev_embed': bev_embed if bev_embed is not None else nn.Identity(),
-                'img_embed': img_embed,
-                'cam_embed': cam_embed,
+                'feature_proj': feature_proj_module,
+                'bev_embed': bev_embed_module,
+                'img_embed': img_embed_module,
+                'cam_embed': cam_embed_module,
                 'cross_win_attend_1': cross_win_attend_1,
                 'cross_win_attend_2': cross_win_attend_2,
                 'prenorm_1': prenorm_1,
@@ -593,15 +596,15 @@ class CrossViewSwapAttention(nn.Module):
                 'postnorm': postnorm,
                 'final_proj': final_proj,
             })
-            self.variants.append(variant)
 
-        # fallback if no_image_features True we replaced with Identity above
+            self.variants.append(variant)
+            self.inner_dims.append(inner_dim)
+            self.heads_variants.append(heads_variant)
 
     def pad_divisble(self, x, win_h, win_w):
         """Pad the x to be divisible by window size."""
-        # x shape could be (n d h w) or (1 d h w), adaptively handle
+        # x shape could be (b n d h w) or (1 d h w)
         if x.ndim == 5:
-            # (b n d h w)
             _, _, _, h, w = x.shape
         else:
             _, h, w = x.shape
@@ -612,7 +615,7 @@ class CrossViewSwapAttention(nn.Module):
         return F.pad(x, (0, padw, 0, padh), value=0)
 
     def _select_variant_idx(self, cnt: int):
-        """thresholds: <=10 -> 0, 10<<=30 ->1, >30->2"""
+        """thresholds: <=10 -> 0, 10< =30 ->1, >30->2"""
         if cnt <= 10:
             return 0
         elif cnt <= 30:
@@ -630,10 +633,6 @@ class CrossViewSwapAttention(nn.Module):
         E_inv: torch.FloatTensor,        # (b, n, 4, 4)
         object_count: Optional[torch.Tensor] = None,  # (b,) or (b,1)
     ):
-        """
-        Processes each sample individually using the variant chosen by object_count.
-        Returns: (b, dim, H, W)
-        """
         device = x.device
         b, n, _, _, _ = feature.shape
         _, _, H, W = x.shape
@@ -653,6 +652,7 @@ class CrossViewSwapAttention(nn.Module):
             cnt = int(counts[bi].item())
             vidx = self._select_variant_idx(cnt)
             var = self.variants[vidx]
+            inner_dim = self.inner_dims[vidx]
 
             # per-sample slices
             x_i = x[bi:bi+1]                     # 1 dim H W
@@ -663,7 +663,7 @@ class CrossViewSwapAttention(nn.Module):
             # cam embedding
             c = E_inv_i[..., -1:]                                        # 1 n 4 1
             c_flat = rearrange(c, 'b n ... -> (b n) ...')[..., None]     # (1*n) 4 1 1
-            c_embed = var['cam_embed'](c_flat)                           # (n) inner_dim 1 1
+            c_embed = var['cam_embed'](c_flat)                           # (b*n) inner_dim 1 1
 
             # img embedding (per-sample)
             pixel_flat = rearrange(pixel, '... h w -> ... (h w)')        # 1 1 3 (h w)
@@ -671,7 +671,7 @@ class CrossViewSwapAttention(nn.Module):
             cam = F.pad(cam, (0, 0, 0, 1, 0, 0, 0, 0), value=1)           # 1 n 4 (h w)
             d = E_inv_i @ cam                                             # 1 n 4 (h w)
             d_flat = rearrange(d, 'b n d (h w) -> (b n) d h w', h=h, w=w)
-            d_embed = var['img_embed'](d_flat)                           # (n) inner_dim h w
+            d_embed = var['img_embed'](d_flat)                           # (b*n) inner_dim h w
 
             img_embed = d_embed - c_embed
             img_embed = img_embed / (img_embed.norm(dim=1, keepdim=True) + 1e-7)
@@ -706,29 +706,15 @@ class CrossViewSwapAttention(nn.Module):
             else:
                 query = x_i[:, None]   # 1 n dim H W  (note: x_i channels == final dim)
 
-            # but attention inner_dim != final dim; we need to map query into inner_dim space
-            # simplest: expand x to inner_dim by zero padding / learnable linear? 
-            # We'll project x into inner_dim by repeating through a 1x1 conv via final_proj's transpose.
-            # A more principled approach: create a small projection from final dim -> inner_dim.
-            # For simplicity, create on-the-fly linear expand via F.interpolate of channels:
-            # Here we create a temporary projection using a conv weight shape (inner_dim, dim, 1,1).
-            # But neural modules can't be created on-the-fly for training. Instead, to keep code simple
-            # we map query to inner_dim by repeating the x along channel then slicing/padding.
-            # We'll tile or zero-pad channels to inner_dim:
-
-            # Convert query (1, n, dim, H, W) -> (1, n, inner_dim, H, W)
+            # map query into inner_dim by zero-pad or truncate (simple, safe)
             q_channels = query.shape[2]
-            inner_dim = var['img_embed'].weight.shape[0] if hasattr(var['img_embed'], 'weight') else int(var['inner_dim'].item())
-            # q: 1 n dim H W -> (1 n inner_dim H W)
             if q_channels == inner_dim:
                 query_inner = query
             elif q_channels < inner_dim:
-                # pad channels with zeros
                 pad_ch = inner_dim - q_channels
                 zeros_pad = torch.zeros((1, n, pad_ch, H, W), device=device, dtype=query.dtype)
                 query_inner = torch.cat([query, zeros_pad], dim=2)
             else:
-                # truncate channels if inner_dim smaller (rare)
                 query_inner = query[:, :, :inner_dim, :, :]
 
             # rearrange to attention input shapes
@@ -749,7 +735,7 @@ class CrossViewSwapAttention(nn.Module):
 
             q_out = var['cross_win_attend_1'](
                 query_part, key_part, val_part,
-                skip=rearrange(query_inner, 'b d (x w1) (y w2) -> b x y w1 w2 d',
+                skip=rearrange(query_inner, 'b n d (x w1) (y w2) -> b x y w1 w2 d',
                                w1=self.q_win_size[0], w2=self.q_win_size[1]) if self.skip else None
             )
             q_out = rearrange(q_out, 'b x y w1 w2 d -> b (x w1) (y w2) d')  # (1, Hq, Wq, inner_dim)
