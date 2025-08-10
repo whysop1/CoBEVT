@@ -555,13 +555,20 @@ class CrossViewSwapAttention(nn.Module):
         return F.pad(x, (0, padw, 0, padh), value=0)
 
     def _compute_adaptive_scale(self, object_count: torch.Tensor):
-        """
-        object_count: (batch,) tensor
-        returns: scaling factors for each sample
-        """
-        scale = torch.ones_like(object_count, dtype=torch.float, device=object_count.device)
-        scale = torch.where(object_count > 30, 1.5, scale)  # high density → boost more
-        scale = torch.where((object_count > 10) & (object_count <= 30), 1.2, scale)  # mid density
+        dtype = object_count.dtype
+        device = object_count.device
+
+        scale = torch.ones_like(object_count, dtype=dtype, device=device)
+        scale = torch.where(
+            object_count > 30,
+            torch.full_like(object_count, 1.5, dtype=dtype, device=device),
+            scale
+        )
+        scale = torch.where(
+            (object_count > 10) & (object_count <= 30),
+            torch.full_like(object_count, 1.2, dtype=dtype, device=device),
+            scale
+        )
         return scale
 
     def forward(
@@ -632,7 +639,7 @@ class CrossViewSwapAttention(nn.Module):
         key = self.pad_divisble(key, self.feat_win_size[0], self.feat_win_size[1])
         val = self.pad_divisble(val, self.feat_win_size[0], self.feat_win_size[1])
 
-        # local-to-local
+        # local-to-local cross-attention
         query = rearrange(query, 'b n d (x w1) (y w2) -> b n x y w1 w2 d',
                           w1=self.q_win_size[0], w2=self.q_win_size[1])
         key = rearrange(key, 'b n d (x w1) (y w2) -> b n x y w1 w2 d',
@@ -649,7 +656,7 @@ class CrossViewSwapAttention(nn.Module):
         x_skip = query
         query = repeat(query, 'b x y d -> b n x y d', n=n)
 
-        # local-to-global
+        # local-to-global cross-attention
         query = rearrange(query, 'b n (x w1) (y w2) d -> b n x y w1 w2 d',
                           w1=self.q_win_size[0], w2=self.q_win_size[1])
         key = rearrange(key, 'b n x y w1 w2 d -> b n (x w1) (y w2) d')
@@ -667,12 +674,13 @@ class CrossViewSwapAttention(nn.Module):
         query = query + self.mlp_2(self.prenorm_2(query))
         query = self.postnorm(query)
 
-        # Adaptive scaling per batch
+        # Adaptive scaling per batch sample
         if adaptive_scale is not None:
-            query = query * adaptive_scale.view(-1, 1, 1, 1)  # broadcast
+            query = query * adaptive_scale.view(-1, 1, 1, 1)  # (b, 1, 1, 1) broadcast
 
         query = rearrange(query, 'b H W d -> b d H W')
         return query
+
 
 
 
