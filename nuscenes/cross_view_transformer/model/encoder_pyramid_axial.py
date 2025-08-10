@@ -486,7 +486,7 @@ class CrossViewSwapAttention(nn.Module):
 
 
 
-class CrossViewSwapAttentionAdaptiveAggressive(nn.Module):
+class CrossViewSwapAttention(nn.Module):
     """
     Aggressive adaptive CrossViewSwapAttention:
     - 내부적으로 3 variants (low/mid/high) with different inner dims & head counts.
