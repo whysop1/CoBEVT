@@ -280,7 +280,7 @@ class CrossWinAttention(nn.Module):
             z = z + skip
         return z
 
-
+'''
 class CrossViewSwapAttention(nn.Module):
     def __init__(
         self,
@@ -482,6 +482,311 @@ class CrossViewSwapAttention(nn.Module):
         query = rearrange(query, 'b H W d -> b d H W')
 
         return query
+'''
+
+
+
+class CrossViewSwapAttentionAdaptiveAggressive(nn.Module):
+    """
+    Aggressive adaptive CrossViewSwapAttention:
+    - 내부적으로 3 variants (low/mid/high) with different inner dims & head counts.
+    - 각 배치 샘플의 object_count에 따라 variant를 선택해 처리.
+    - 내부 결과는 final_proj로 원래 dim으로 되돌려서 일관된 출력 채널 유지.
+    """
+    def __init__(
+        self,
+        feat_height: int,
+        feat_width: int,
+        feat_dim: int,
+        dim: int,                     # final output dim (kept consistent)
+        index: int,
+        image_height: int,
+        image_width: int,
+        qkv_bias: bool,
+        q_win_size: list,
+        feat_win_size: list,
+        heads: list,                  # base heads list (use heads[index] as base)
+        dim_head: list,
+        bev_embedding_flag: list,
+        rel_pos_emb: bool = False,
+        no_image_features: bool = False,
+        skip: bool = True,
+        norm=nn.LayerNorm,
+    ):
+        super().__init__()
+
+        # save configs
+        self.index = index
+        self.dim = dim
+        self.feat_dim = feat_dim
+        self.q_win_size = q_win_size[index]
+        self.feat_win_size = feat_win_size[index]
+        self.skip = skip
+        self.rel_pos_emb = rel_pos_emb
+        self.bev_embed_flag = bev_embedding_flag[index]
+
+        # image plane buffer (same as original)
+        image_plane = generate_grid(feat_height, feat_width)[None]
+        image_plane[:, :, 0] *= image_width
+        image_plane[:, :, 1] *= image_height
+        self.register_buffer('image_plane', image_plane, persistent=False)
+
+        # base embeddings (we will also create per-variant projections)
+        # create 3 scales: low, mid, high
+        self.scales = [1.0, 1.3, 1.6]  # 변경하고 싶으면 여기 수정
+        base_heads = heads[index]
+
+        # containers for variant modules
+        self.variants = nn.ModuleList()
+        for scale in self.scales:
+            inner_dim = max(1, int(dim * scale))
+            heads_variant = max(1, int(base_heads * scale))
+            dim_head_variant = max(1, inner_dim // heads_variant)
+
+            # feature linear/proj mapping from feat_dim -> inner_dim
+            feature_linear = nn.Sequential(
+                nn.BatchNorm2d(feat_dim),
+                nn.ReLU(),
+                nn.Conv2d(feat_dim, inner_dim, 1, bias=False)
+            )
+            if no_image_features:
+                feature_proj = None
+            else:
+                feature_proj = nn.Sequential(
+                    nn.BatchNorm2d(feat_dim),
+                    nn.ReLU(),
+                    nn.Conv2d(feat_dim, inner_dim, 1, bias=False)
+                )
+
+            # bev/img/cam embeddings to inner_dim
+            bev_embed = nn.Conv2d(2, inner_dim, 1) if self.bev_embed_flag else None
+            img_embed = nn.Conv2d(4, inner_dim, 1, bias=False)
+            cam_embed = nn.Conv2d(4, inner_dim, 1, bias=False)
+
+            # CrossWinAttention variants (two stages)
+            cross_win_attend_1 = CrossWinAttention(inner_dim, heads_variant, dim_head_variant, qkv_bias)
+            cross_win_attend_2 = CrossWinAttention(inner_dim, heads_variant, dim_head_variant, qkv_bias)
+
+            # prenorm / mlp / postnorm using inner_dim
+            prenorm_1 = norm(inner_dim)
+            prenorm_2 = norm(inner_dim)
+            mlp_1 = nn.Sequential(nn.Linear(inner_dim, 2 * inner_dim), nn.GELU(), nn.Linear(2 * inner_dim, inner_dim))
+            mlp_2 = nn.Sequential(nn.Linear(inner_dim, 2 * inner_dim), nn.GELU(), nn.Linear(2 * inner_dim, inner_dim))
+            postnorm = norm(inner_dim)
+
+            # final projection back to original dim
+            final_proj = nn.Conv2d(inner_dim, dim, 1, bias=False)
+
+            variant = nn.ModuleDict({
+                'inner_dim': torch.tensor(inner_dim),
+                'feature_linear': feature_linear,
+                'feature_proj': feature_proj if feature_proj is not None else nn.Identity(),
+                'bev_embed': bev_embed if bev_embed is not None else nn.Identity(),
+                'img_embed': img_embed,
+                'cam_embed': cam_embed,
+                'cross_win_attend_1': cross_win_attend_1,
+                'cross_win_attend_2': cross_win_attend_2,
+                'prenorm_1': prenorm_1,
+                'prenorm_2': prenorm_2,
+                'mlp_1': mlp_1,
+                'mlp_2': mlp_2,
+                'postnorm': postnorm,
+                'final_proj': final_proj,
+            })
+            self.variants.append(variant)
+
+        # fallback if no_image_features True we replaced with Identity above
+
+    def pad_divisble(self, x, win_h, win_w):
+        """Pad the x to be divisible by window size."""
+        # x shape could be (n d h w) or (1 d h w), adaptively handle
+        if x.ndim == 5:
+            # (b n d h w)
+            _, _, _, h, w = x.shape
+        else:
+            _, h, w = x.shape
+        h_pad = ((h + win_h) // win_h) * win_h
+        w_pad = ((w + win_w) // win_w) * win_w
+        padh = h_pad - h if h % win_h != 0 else 0
+        padw = w_pad - w if w % win_w != 0 else 0
+        return F.pad(x, (0, padw, 0, padh), value=0)
+
+    def _select_variant_idx(self, cnt: int):
+        """thresholds: <=10 -> 0, 10<<=30 ->1, >30->2"""
+        if cnt <= 10:
+            return 0
+        elif cnt <= 30:
+            return 1
+        else:
+            return 2
+
+    def forward(
+        self,
+        index: int,
+        x: torch.FloatTensor,            # (b, dim, H, W)   final dim
+        bev: 'BEVEmbedding',
+        feature: torch.FloatTensor,      # (b, n, feat_dim, h, w)
+        I_inv: torch.FloatTensor,        # (b, n, 3, 3)
+        E_inv: torch.FloatTensor,        # (b, n, 4, 4)
+        object_count: Optional[torch.Tensor] = None,  # (b,) or (b,1)
+    ):
+        """
+        Processes each sample individually using the variant chosen by object_count.
+        Returns: (b, dim, H, W)
+        """
+        device = x.device
+        b, n, _, _, _ = feature.shape
+        _, _, H, W = x.shape
+
+        # normalize object_count shape to (b,)
+        if object_count is None:
+            counts = torch.zeros(b, dtype=torch.long, device=device)
+        else:
+            counts = object_count.view(-1).to(device).long()
+
+        outputs = []
+        pixel = self.image_plane  # 1 1 3 h w
+        _, _, _, h, w = pixel.shape
+
+        # loop per sample in batch
+        for bi in range(b):
+            cnt = int(counts[bi].item())
+            vidx = self._select_variant_idx(cnt)
+            var = self.variants[vidx]
+
+            # per-sample slices
+            x_i = x[bi:bi+1]                     # 1 dim H W
+            feat_i = feature[bi:bi+1]            # 1 n feat_dim h w
+            I_inv_i = I_inv[bi:bi+1]             # 1 n 3 3
+            E_inv_i = E_inv[bi:bi+1]             # 1 n 4 4
+
+            # cam embedding
+            c = E_inv_i[..., -1:]                                        # 1 n 4 1
+            c_flat = rearrange(c, 'b n ... -> (b n) ...')[..., None]     # (1*n) 4 1 1
+            c_embed = var['cam_embed'](c_flat)                           # (n) inner_dim 1 1
+
+            # img embedding (per-sample)
+            pixel_flat = rearrange(pixel, '... h w -> ... (h w)')        # 1 1 3 (h w)
+            cam = I_inv_i @ pixel_flat                                    # 1 n 3 (h w)
+            cam = F.pad(cam, (0, 0, 0, 1, 0, 0, 0, 0), value=1)           # 1 n 4 (h w)
+            d = E_inv_i @ cam                                             # 1 n 4 (h w)
+            d_flat = rearrange(d, 'b n d (h w) -> (b n) d h w', h=h, w=w)
+            d_embed = var['img_embed'](d_flat)                           # (n) inner_dim h w
+
+            img_embed = d_embed - c_embed
+            img_embed = img_embed / (img_embed.norm(dim=1, keepdim=True) + 1e-7)
+
+            # bev embedding if needed
+            if self.bev_embed_flag:
+                if index == 0:
+                    world = bev.grid0[:2]
+                elif index == 1:
+                    world = bev.grid1[:2]
+                elif index == 2:
+                    world = bev.grid2[:2]
+                elif index == 3:
+                    world = bev.grid3[:2]
+                w_embed = var['bev_embed'](world[None])                      # 1 inner_dim H W or (inner_dim,H,W)
+                bev_embed = w_embed - c_embed
+                bev_embed = bev_embed / (bev_embed.norm(dim=1, keepdim=True) + 1e-7)
+                query_pos = rearrange(bev_embed, '(b n) ... -> b n ...', b=1, n=n)  # 1 n inner H W
+
+            feature_flat = rearrange(feat_i, 'b n ... -> (b n) ...')  # (n) feat_dim h w
+
+            # key/val
+            if isinstance(var['feature_proj'], nn.Identity):
+                key_flat = img_embed
+            else:
+                key_flat = img_embed + var['feature_proj'](feature_flat)
+            val_flat = var['feature_linear'](feature_flat)
+
+            # query
+            if self.bev_embed_flag:
+                query = query_pos + x_i[:, None]
+            else:
+                query = x_i[:, None]   # 1 n dim H W  (note: x_i channels == final dim)
+
+            # but attention inner_dim != final dim; we need to map query into inner_dim space
+            # simplest: expand x to inner_dim by zero padding / learnable linear? 
+            # We'll project x into inner_dim by repeating through a 1x1 conv via final_proj's transpose.
+            # A more principled approach: create a small projection from final dim -> inner_dim.
+            # For simplicity, create on-the-fly linear expand via F.interpolate of channels:
+            # Here we create a temporary projection using a conv weight shape (inner_dim, dim, 1,1).
+            # But neural modules can't be created on-the-fly for training. Instead, to keep code simple
+            # we map query to inner_dim by repeating the x along channel then slicing/padding.
+            # We'll tile or zero-pad channels to inner_dim:
+
+            # Convert query (1, n, dim, H, W) -> (1, n, inner_dim, H, W)
+            q_channels = query.shape[2]
+            inner_dim = var['img_embed'].weight.shape[0] if hasattr(var['img_embed'], 'weight') else int(var['inner_dim'].item())
+            # q: 1 n dim H W -> (1 n inner_dim H W)
+            if q_channels == inner_dim:
+                query_inner = query
+            elif q_channels < inner_dim:
+                # pad channels with zeros
+                pad_ch = inner_dim - q_channels
+                zeros_pad = torch.zeros((1, n, pad_ch, H, W), device=device, dtype=query.dtype)
+                query_inner = torch.cat([query, zeros_pad], dim=2)
+            else:
+                # truncate channels if inner_dim smaller (rare)
+                query_inner = query[:, :, :inner_dim, :, :]
+
+            # rearrange to attention input shapes
+            key = rearrange(key_flat, '(b n) d h w -> b n d h w', b=1, n=n)
+            val = rearrange(val_flat, '(b n) d h w -> b n d h w', b=1, n=n)
+
+            # pad divisible on key/val
+            key = self.pad_divisble(key, self.feat_win_size[0], self.feat_win_size[1])
+            val = self.pad_divisble(val, self.feat_win_size[0], self.feat_win_size[1])
+
+            # partition windows and run cross_win_attend_1
+            query_part = rearrange(query_inner, 'b n d (x w1) (y w2) -> b n x y w1 w2 d',
+                                   w1=self.q_win_size[0], w2=self.q_win_size[1])
+            key_part = rearrange(key, 'b n d (x w1) (y w2) -> b n x y w1 w2 d',
+                                 w1=self.feat_win_size[0], w2=self.feat_win_size[1])
+            val_part = rearrange(val, 'b n d (x w1) (y w2) -> b n x y w1 w2 d',
+                                 w1=self.feat_win_size[0], w2=self.feat_win_size[1])
+
+            q_out = var['cross_win_attend_1'](
+                query_part, key_part, val_part,
+                skip=rearrange(query_inner, 'b d (x w1) (y w2) -> b x y w1 w2 d',
+                               w1=self.q_win_size[0], w2=self.q_win_size[1]) if self.skip else None
+            )
+            q_out = rearrange(q_out, 'b x y w1 w2 d -> b (x w1) (y w2) d')  # (1, Hq, Wq, inner_dim)
+            q_out = q_out + var['mlp_1'](var['prenorm_1'](q_out))
+
+            x_skip = q_out
+            q_repeated = repeat(q_out, 'b x y d -> b n x y d', n=n)
+
+            # second cross-attention stage: local->global
+            q2 = rearrange(q_repeated, 'b n (x w1) (y w2) d -> b n x y w1 w2 d',
+                           w1=self.q_win_size[0], w2=self.q_win_size[1])
+            key2 = rearrange(key, 'b n x y w1 w2 d -> b n (x w1) (y w2) d')
+            key2 = rearrange(key2, 'b n (w1 x) (w2 y) d -> b n x y w1 w2 d',
+                             w1=self.feat_win_size[0], w2=self.feat_win_size[1])
+            val2 = rearrange(val, 'b n x y w1 w2 d -> b n (x w1) (y w2) d')
+            val2 = rearrange(val2, 'b n (w1 x) (w2 y) d -> b n x y w1 w2 d',
+                             w1=self.feat_win_size[0], w2=self.feat_win_size[1])
+
+            q_out2 = var['cross_win_attend_2'](
+                q2, key2, val2,
+                skip=rearrange(x_skip, 'b (x w1) (y w2) d -> b x y w1 w2 d',
+                               w1=self.q_win_size[0], w2=self.q_win_size[1]) if self.skip else None
+            )
+            q_out2 = rearrange(q_out2, 'b x y w1 w2 d -> b (x w1) (y w2) d')
+            q_out2 = q_out2 + var['mlp_2'](var['prenorm_2'](q_out2))
+            q_out2 = var['postnorm'](q_out2)
+
+            # q_out2: shape (1, H, W, inner_dim) -> (1, inner_dim, H, W)
+            q_out2 = rearrange(q_out2, 'b H W d -> b d H W')
+
+            # project back to final dim
+            q_final = var['final_proj'](q_out2)   # (1, dim, H, W)
+            outputs.append(q_final)
+
+        # stack outputs to (b, dim, H, W)
+        out = torch.cat(outputs, dim=0)
+        return out
 
 
 
