@@ -488,10 +488,9 @@ class CrossViewSwapAttention(nn.Module):
 
 class CrossViewSwapAttention(nn.Module):
     """
-    Aggressive adaptive CrossViewSwapAttention (fixed):
-    - nn.ModuleDict에 모듈이 아닌 값을 넣지 않도록 수정함.
-    - inner_dim 등의 숫자 값은 self.inner_dims 리스트에 보관.
-    - 나머지 구조는 기존 구현을 따름.
+    Aggressive adaptive CrossViewSwapAttention (fixed einops skip issue).
+    - ModuleDict에는 모듈만 들어가게 수정된 상태(숫자 메타데이터는 리스트에 보관).
+    - einops 에러 해결: skip argument로 전달하는 텐서는 n(카메라) 축을 제거(mean)한 뒤 rearrange 함.
     """
     def __init__(
         self,
@@ -532,12 +531,12 @@ class CrossViewSwapAttention(nn.Module):
         self.register_buffer('image_plane', image_plane, persistent=False)
 
         # create 3 scales: low, mid, high
-        self.scales = [1.0, 1.3, 1.6]  # 변경하고 싶으면 여기 수정
+        self.scales = [1.0, 1.3, 1.6]
         base_heads = heads[index]
 
         # containers for variant modules (only nn.Modules inside ModuleList)
         self.variants = nn.ModuleList()
-        # store numeric metadata outside ModuleDict (these are plain python values)
+        # numeric metadata kept outside ModuleDict
         self.inner_dims = []
         self.heads_variants = []
 
@@ -546,7 +545,6 @@ class CrossViewSwapAttention(nn.Module):
             heads_variant = max(1, int(base_heads * scale))
             dim_head_variant = max(1, inner_dim // heads_variant)
 
-            # feature linear/proj mapping from feat_dim -> inner_dim
             feature_linear = nn.Sequential(
                 nn.BatchNorm2d(feat_dim),
                 nn.ReLU(),
@@ -561,26 +559,21 @@ class CrossViewSwapAttention(nn.Module):
                     nn.Conv2d(feat_dim, inner_dim, 1, bias=False)
                 )
 
-            # bev/img/cam embeddings to inner_dim
             bev_embed_module = nn.Conv2d(2, inner_dim, 1) if self.bev_embed_flag else nn.Identity()
             img_embed_module = nn.Conv2d(4, inner_dim, 1, bias=False)
             cam_embed_module = nn.Conv2d(4, inner_dim, 1, bias=False)
 
-            # CrossWinAttention variants (two stages)
             cross_win_attend_1 = CrossWinAttention(inner_dim, heads_variant, dim_head_variant, qkv_bias)
             cross_win_attend_2 = CrossWinAttention(inner_dim, heads_variant, dim_head_variant, qkv_bias)
 
-            # prenorm / mlp / postnorm using inner_dim
             prenorm_1 = norm(inner_dim)
             prenorm_2 = norm(inner_dim)
             mlp_1 = nn.Sequential(nn.Linear(inner_dim, 2 * inner_dim), nn.GELU(), nn.Linear(2 * inner_dim, inner_dim))
             mlp_2 = nn.Sequential(nn.Linear(inner_dim, 2 * inner_dim), nn.GELU(), nn.Linear(2 * inner_dim, inner_dim))
             postnorm = norm(inner_dim)
 
-            # final projection back to original dim
             final_proj = nn.Conv2d(inner_dim, dim, 1, bias=False)
 
-            # ONLY nn.Modules go into the ModuleDict
             variant = nn.ModuleDict({
                 'feature_linear': feature_linear,
                 'feature_proj': feature_proj_module,
@@ -603,7 +596,6 @@ class CrossViewSwapAttention(nn.Module):
 
     def pad_divisble(self, x, win_h, win_w):
         """Pad the x to be divisible by window size."""
-        # x shape could be (b n d h w) or (1 d h w)
         if x.ndim == 5:
             _, _, _, h, w = x.shape
         else:
@@ -615,7 +607,6 @@ class CrossViewSwapAttention(nn.Module):
         return F.pad(x, (0, padw, 0, padh), value=0)
 
     def _select_variant_idx(self, cnt: int):
-        """thresholds: <=10 -> 0, 10< =30 ->1, >30->2"""
         if cnt <= 10:
             return 0
         elif cnt <= 30:
@@ -637,7 +628,6 @@ class CrossViewSwapAttention(nn.Module):
         b, n, _, _, _ = feature.shape
         _, _, H, W = x.shape
 
-        # normalize object_count shape to (b,)
         if object_count is None:
             counts = torch.zeros(b, dtype=torch.long, device=device)
         else:
@@ -647,36 +637,31 @@ class CrossViewSwapAttention(nn.Module):
         pixel = self.image_plane  # 1 1 3 h w
         _, _, _, h, w = pixel.shape
 
-        # loop per sample in batch
         for bi in range(b):
             cnt = int(counts[bi].item())
             vidx = self._select_variant_idx(cnt)
             var = self.variants[vidx]
             inner_dim = self.inner_dims[vidx]
 
-            # per-sample slices
             x_i = x[bi:bi+1]                     # 1 dim H W
             feat_i = feature[bi:bi+1]            # 1 n feat_dim h w
-            I_inv_i = I_inv[bi:bi+1]             # 1 n 3 3
-            E_inv_i = E_inv[bi:bi+1]             # 1 n 4 4
+            I_inv_i = I_inv[bi:bi+1]
+            E_inv_i = E_inv[bi:bi+1]
 
-            # cam embedding
-            c = E_inv_i[..., -1:]                                        # 1 n 4 1
-            c_flat = rearrange(c, 'b n ... -> (b n) ...')[..., None]     # (1*n) 4 1 1
-            c_embed = var['cam_embed'](c_flat)                           # (b*n) inner_dim 1 1
+            c = E_inv_i[..., -1:]
+            c_flat = rearrange(c, 'b n ... -> (b n) ...')[..., None]
+            c_embed = var['cam_embed'](c_flat)
 
-            # img embedding (per-sample)
-            pixel_flat = rearrange(pixel, '... h w -> ... (h w)')        # 1 1 3 (h w)
-            cam = I_inv_i @ pixel_flat                                    # 1 n 3 (h w)
-            cam = F.pad(cam, (0, 0, 0, 1, 0, 0, 0, 0), value=1)           # 1 n 4 (h w)
-            d = E_inv_i @ cam                                             # 1 n 4 (h w)
+            pixel_flat = rearrange(pixel, '... h w -> ... (h w)')
+            cam = I_inv_i @ pixel_flat
+            cam = F.pad(cam, (0, 0, 0, 1, 0, 0, 0, 0), value=1)
+            d = E_inv_i @ cam
             d_flat = rearrange(d, 'b n d (h w) -> (b n) d h w', h=h, w=w)
-            d_embed = var['img_embed'](d_flat)                           # (b*n) inner_dim h w
+            d_embed = var['img_embed'](d_flat)
 
             img_embed = d_embed - c_embed
             img_embed = img_embed / (img_embed.norm(dim=1, keepdim=True) + 1e-7)
 
-            # bev embedding if needed
             if self.bev_embed_flag:
                 if index == 0:
                     world = bev.grid0[:2]
@@ -686,27 +671,24 @@ class CrossViewSwapAttention(nn.Module):
                     world = bev.grid2[:2]
                 elif index == 3:
                     world = bev.grid3[:2]
-                w_embed = var['bev_embed'](world[None])                      # 1 inner_dim H W or (inner_dim,H,W)
+                w_embed = var['bev_embed'](world[None])
                 bev_embed = w_embed - c_embed
                 bev_embed = bev_embed / (bev_embed.norm(dim=1, keepdim=True) + 1e-7)
-                query_pos = rearrange(bev_embed, '(b n) ... -> b n ...', b=1, n=n)  # 1 n inner H W
+                query_pos = rearrange(bev_embed, '(b n) ... -> b n ...', b=1, n=n)
 
-            feature_flat = rearrange(feat_i, 'b n ... -> (b n) ...')  # (n) feat_dim h w
+            feature_flat = rearrange(feat_i, 'b n ... -> (b n) ...')
 
-            # key/val
             if isinstance(var['feature_proj'], nn.Identity):
                 key_flat = img_embed
             else:
                 key_flat = img_embed + var['feature_proj'](feature_flat)
             val_flat = var['feature_linear'](feature_flat)
 
-            # query
             if self.bev_embed_flag:
                 query = query_pos + x_i[:, None]
             else:
-                query = x_i[:, None]   # 1 n dim H W  (note: x_i channels == final dim)
+                query = x_i[:, None]   # 1 n dim H W
 
-            # map query into inner_dim by zero-pad or truncate (simple, safe)
             q_channels = query.shape[2]
             if q_channels == inner_dim:
                 query_inner = query
@@ -717,15 +699,12 @@ class CrossViewSwapAttention(nn.Module):
             else:
                 query_inner = query[:, :, :inner_dim, :, :]
 
-            # rearrange to attention input shapes
             key = rearrange(key_flat, '(b n) d h w -> b n d h w', b=1, n=n)
             val = rearrange(val_flat, '(b n) d h w -> b n d h w', b=1, n=n)
 
-            # pad divisible on key/val
             key = self.pad_divisble(key, self.feat_win_size[0], self.feat_win_size[1])
             val = self.pad_divisble(val, self.feat_win_size[0], self.feat_win_size[1])
 
-            # partition windows and run cross_win_attend_1
             query_part = rearrange(query_inner, 'b n d (x w1) (y w2) -> b n x y w1 w2 d',
                                    w1=self.q_win_size[0], w2=self.q_win_size[1])
             key_part = rearrange(key, 'b n d (x w1) (y w2) -> b n x y w1 w2 d',
@@ -733,18 +712,22 @@ class CrossViewSwapAttention(nn.Module):
             val_part = rearrange(val, 'b n d (x w1) (y w2) -> b n x y w1 w2 d',
                                  w1=self.feat_win_size[0], w2=self.feat_win_size[1])
 
+            # <-- FIX: skip should have camera dim removed. use mean(dim=1) to aggregate cameras -->
+            if self.skip:
+                skip_tensor = rearrange(query_inner.mean(dim=1), 'b d (x w1) (y w2) -> b x y w1 w2 d',
+                                        w1=self.q_win_size[0], w2=self.q_win_size[1])
+            else:
+                skip_tensor = None
+
             q_out = var['cross_win_attend_1'](
-                query_part, key_part, val_part,
-                skip=rearrange(query_inner, 'b n d (x w1) (y w2) -> b x y w1 w2 d',
-                               w1=self.q_win_size[0], w2=self.q_win_size[1]) if self.skip else None
+                query_part, key_part, val_part, skip=skip_tensor
             )
-            q_out = rearrange(q_out, 'b x y w1 w2 d -> b (x w1) (y w2) d')  # (1, Hq, Wq, inner_dim)
+            q_out = rearrange(q_out, 'b x y w1 w2 d -> b (x w1) (y w2) d')
             q_out = q_out + var['mlp_1'](var['prenorm_1'](q_out))
 
             x_skip = q_out
             q_repeated = repeat(q_out, 'b x y d -> b n x y d', n=n)
 
-            # second cross-attention stage: local->global
             q2 = rearrange(q_repeated, 'b n (x w1) (y w2) d -> b n x y w1 w2 d',
                            w1=self.q_win_size[0], w2=self.q_win_size[1])
             key2 = rearrange(key, 'b n x y w1 w2 d -> b n (x w1) (y w2) d')
@@ -763,14 +746,11 @@ class CrossViewSwapAttention(nn.Module):
             q_out2 = q_out2 + var['mlp_2'](var['prenorm_2'](q_out2))
             q_out2 = var['postnorm'](q_out2)
 
-            # q_out2: shape (1, H, W, inner_dim) -> (1, inner_dim, H, W)
             q_out2 = rearrange(q_out2, 'b H W d -> b d H W')
 
-            # project back to final dim
             q_final = var['final_proj'](q_out2)   # (1, dim, H, W)
             outputs.append(q_final)
 
-        # stack outputs to (b, dim, H, W)
         out = torch.cat(outputs, dim=0)
         return out
 
