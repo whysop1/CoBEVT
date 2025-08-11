@@ -495,18 +495,37 @@ class CrossViewSwapAttention(nn.Module):
         image_height: int,
         image_width: int,
         qkv_bias: bool,
-        q_win_size: list,
-        feat_win_size: list,
-        heads: list,
-        dim_head: list,
-        bev_embedding_flag: list,
-        rel_pos_emb: bool = False,
+        q_win_size: Union[list, Tuple, int, ListConfig],
+        feat_win_size: Union[list, Tuple, int, ListConfig],
+        heads: Union[list, int, ListConfig],
+        dim_head: Union[list, int, ListConfig],
+        bev_embedding_flag: Union[list, Tuple, ListConfig],
+        rel_pos_emb: bool = False,  # to-do
         no_image_features: bool = False,
         skip: bool = True,
         norm=nn.LayerNorm,
     ):
         super().__init__()
 
+        # ---------- Robust conversion for Hydra's ListConfig ----------
+        def _to_py(obj):
+            if isinstance(obj, ListConfig):
+                return list(obj)
+            return obj
+
+        q_win_size = _to_py(q_win_size)
+        feat_win_size = _to_py(feat_win_size)
+        heads = _to_py(heads)
+        dim_head = _to_py(dim_head)
+        bev_embedding_flag = _to_py(bev_embedding_flag)
+
+        # If the per-index items are lists/tuples, index into them; otherwise assume scalar
+        def _get_per_index(val, idx):
+            if isinstance(val, (list, tuple)):
+                return val[idx]
+            return val
+
+        # ---------- store basic buffers & modules ----------
         image_plane = generate_grid(feat_height, feat_width)[None]
         image_plane[:, :, 0] *= image_width
         image_plane[:, :, 1] *= image_height
@@ -515,7 +534,8 @@ class CrossViewSwapAttention(nn.Module):
         self.feature_linear = nn.Sequential(
             nn.BatchNorm2d(feat_dim),
             nn.ReLU(),
-            nn.Conv2d(feat_dim, dim, 1, bias=False))
+            nn.Conv2d(feat_dim, dim, 1, bias=False)
+        )
 
         if no_image_features:
             self.feature_proj = None
@@ -523,68 +543,85 @@ class CrossViewSwapAttention(nn.Module):
             self.feature_proj = nn.Sequential(
                 nn.BatchNorm2d(feat_dim),
                 nn.ReLU(),
-                nn.Conv2d(feat_dim, dim, 1, bias=False))
+                nn.Conv2d(feat_dim, dim, 1, bias=False)
+            )
 
-        self.bev_embed_flag = bev_embedding_flag[index]
+        # bev embedding flag per-index
+        self.bev_embed_flag = bool(_get_per_index(bev_embedding_flag, index))
         if self.bev_embed_flag:
             self.bev_embed = nn.Conv2d(2, dim, 1)
+
         self.img_embed = nn.Conv2d(4, dim, 1, bias=False)
         self.cam_embed = nn.Conv2d(4, dim, 1, bias=False)
 
-        # base params (lists -> per-index base)
-        self.base_q_win_size = tuple(q_win_size[index])
-        self.base_feat_win_size = tuple(feat_win_size[index])
-        self.base_heads = int(heads[index])
-        # keep the overall dim; dim_head will be recomputed when heads change
-        self.dim = dim
-        self.base_dim_head = int(dim_head[index]) if isinstance(dim_head, (list, tuple)) else int(dim_head)
+        # base params (ensure tuple for win sizes)
+        qwin_raw = _get_per_index(q_win_size, index)
+        if isinstance(qwin_raw, (list, tuple)):
+            self.base_q_win_size = tuple(qwin_raw)
+        else:
+            # if scalar like 8 -> make (8,8)
+            self.base_q_win_size = (int(qwin_raw), int(qwin_raw))
 
+        featwin_raw = _get_per_index(feat_win_size, index)
+        if isinstance(featwin_raw, (list, tuple)):
+            self.base_feat_win_size = tuple(featwin_raw)
+        else:
+            self.base_feat_win_size = (int(featwin_raw), int(featwin_raw))
+
+        # heads and dim_head (per-index or scalar)
+        heads_raw = _get_per_index(heads, index)
+        self.base_heads = int(heads_raw)
+
+        # dim_head may be per-index list or scalar
+        dh_raw = _get_per_index(dim_head, index)
+        self.base_dim_head = int(dh_raw)
+
+        # keep overall dim and flags
+        self.dim = int(dim)
         self.qkv_bias = qkv_bias
         self.rel_pos_emb = rel_pos_emb
         self.skip = skip
 
+        # normalization / MLP
         self.prenorm_1 = norm(dim)
         self.prenorm_2 = norm(dim)
         self.mlp_1 = nn.Sequential(nn.Linear(dim, 2 * dim), nn.GELU(), nn.Linear(2 * dim, dim))
         self.mlp_2 = nn.Sequential(nn.Linear(dim, 2 * dim), nn.GELU(), nn.Linear(2 * dim, dim))
         self.postnorm = norm(dim)
 
-    def pad_divisible_for_hw(self, x, win_h, win_w):
-        """Pad the last two spatial dims (h,w) so they are divisible by (win_h, win_w).
-           x expected shape: (..., h, w) where ... can be any leading dims.
-        """
+    # padding helper: pads last two dims (h,w) to be divisible by win_h, win_w
+    def pad_divisible_for_hw(self, x: torch.Tensor, win_h: int, win_w: int) -> torch.Tensor:
+        # x shape expected (..., h, w) where leading dims can be any
         *lead, h, w = x.shape
-        # compute padded sizes
         h_pad = ((h + win_h - 1) // win_h) * win_h
         w_pad = ((w + win_w - 1) // win_w) * win_w
         padh = h_pad - h
         padw = w_pad - w
         if padh == 0 and padw == 0:
             return x
-        # F.pad expects (left, right, top, bottom) for 2D; but for 4D tensors adjust accordingly.
-        # We'll convert to 4D if needed, apply pad, then return original shape with padded dims.
+        # F.pad takes padding in (left, right, top, bottom) order for 2D tail dims
+        # Works for tensors with >=3 dims — it pads the trailing dimensions
         return F.pad(x, (0, padw, 0, padh), value=0)
 
-    def compute_dynamic_params(self, object_count: torch.Tensor):
-        """Return (heads, win_h, win_w) computed from object_count.
-           We will use batch-average object_count to choose heads and window size,
-           and we ensure q_win and feat_win are identical (same pair).
+    def compute_dynamic_params(self, object_count: Optional[torch.Tensor]) -> Tuple[int, Tuple[int, int]]:
         """
-        # thresholds and scaling
+        Compute dynamic (heads, (qh,qw)) based on object_count.
+        Uses batch-mean of object_count to decide. Keeps q_win and feat_win synchronized.
+        """
         min_thr, max_thr = 10.0, 30.0
         min_heads = max(1, self.base_heads)
-        max_heads = max(1, self.base_heads * 2)  # cap to double
-        # using base q window single value if it's pair take first dim as base
+        max_heads = max(1, self.base_heads * 2)
+
         base_qh, base_qw = self.base_q_win_size
-        # allow increasing window up to 2x in each dimension (simple strategy)
         max_qh, max_qw = max(1, base_qh * 2), max(1, base_qw * 2)
 
         if object_count is None:
             return min_heads, (base_qh, base_qw)
 
+        # ensure tensor on CPU/float
         avg_count = float(object_count.float().mean().item())
 
-        # heads interpolation (int)
+        # linear interp for heads
         if avg_count <= min_thr:
             heads = min_heads
         elif avg_count >= max_thr:
@@ -593,7 +630,7 @@ class CrossViewSwapAttention(nn.Module):
             frac = (avg_count - min_thr) / (max_thr - min_thr)
             heads = int(round(min_heads + frac * (max_heads - min_heads)))
 
-        # window interpolation (per-dim linear)
+        # linear interp for window dims
         if avg_count <= min_thr:
             qh, qw = base_qh, base_qw
         elif avg_count >= max_thr:
@@ -602,12 +639,9 @@ class CrossViewSwapAttention(nn.Module):
             frac = (avg_count - min_thr) / (max_thr - min_thr)
             qh = int(round(base_qh + frac * (max_qh - base_qh)))
             qw = int(round(base_qw + frac * (max_qw - base_qw)))
-            # ensure at least 1
             qh = max(1, qh)
             qw = max(1, qw)
 
-        # ensure area parity: we will enforce qh*qw == some area that also matches
-        # simplest: return (heads, (qh, qw)) and we will use same for feat_win
         return heads, (qh, qw)
 
     def forward(
@@ -619,31 +653,28 @@ class CrossViewSwapAttention(nn.Module):
         I_inv: torch.FloatTensor,
         E_inv: torch.FloatTensor,
         object_count: Optional[torch.Tensor] = None,
-    ):
-        # ---------- dynamic param 결정 ----------
-        heads, q_win = self.compute_dynamic_params(object_count)  # q_win is tuple (qh, qw)
-        feat_win = q_win  # 강제 동기화: q_win과 feat_win을 동일하게 유지 (token 수 동일 보장)
+    ) -> torch.FloatTensor:
+        # get dynamic heads and window (q_win and feat_win identical)
+        heads, q_win = self.compute_dynamic_params(object_count)
+        feat_win = q_win
         qh, qw = q_win
-        f_h, f_w = feat_win
+        fh, fw = feat_win
 
-        # 안전장치: heads가 dim으로 정확히 나누어지지 않으면 floordiv + warn
+        # compute dim_head safely (floor division if needed; warn)
         if self.dim % heads != 0:
-            # recompute dim_head as floor division to avoid crash; warn for debugging
             dim_head = max(1, self.dim // heads)
-            # you could alternatively raise error to enforce design-time constraint
-            # print warning
-            print(f"[WARN] dim ({self.dim}) not divisible by heads ({heads}), using dim_head={dim_head}")
+            print(f"[WARN] self.dim ({self.dim}) not divisible by heads ({heads}). Using dim_head={dim_head}")
         else:
             dim_head = self.dim // heads
 
-        # 동적 CrossWinAttention 객체 생성 (두 단계)
+        # create CrossWinAttention instances dynamically with computed heads / dim_head
         cross_win_attend_1 = CrossWinAttention(self.dim, heads, dim_head, self.qkv_bias)
         cross_win_attend_2 = CrossWinAttention(self.dim, heads, dim_head, self.qkv_bias)
 
         b, n, _, _, _ = feature.shape
         _, _, H, W = x.shape
 
-        # ---------- embedding 생성 (원본 로직 유지) ----------
+        # ---------------- embeddings (same as original logic) ----------------
         pixel = self.image_plane
         _, _, _, h, w = pixel.shape
 
@@ -669,6 +700,9 @@ class CrossViewSwapAttention(nn.Module):
             world = bev.grid2[:2]
         elif index == 3:
             world = bev.grid3[:2]
+        else:
+            # fallback if more levels present
+            world = bev.grid0[:2]
 
         if self.bev_embed_flag:
             w_embed = self.bev_embed(world[None])
@@ -688,69 +722,49 @@ class CrossViewSwapAttention(nn.Module):
         if self.bev_embed_flag:
             query = query_pos + x[:, None]
         else:
-            query = x[:, None]
+            query = x[:, None]  # b n d H W
         key = rearrange(key_flat, '(b n) ... -> b n ...', b=b, n=n)
         val = rearrange(val_flat, '(b n) ... -> b n ...', b=b, n=n)
 
-        # ---------- 일관된 패딩 적용 (query/key/val 모두) ----------
-        # query shape: b n d H W  or x[:, None] produced that shape
-        # pad_divisible_for_hw expects last two dims to be (H, W) for padding
-        # for query: shape b n d H W -> merge leading dims to pad as (..., H, W)
-        # But pad_divisible_for_hw is written to take any shape with last two dims as h,w
+        # ---------------- consistent padding for q/k/v ----------------
         query = self.pad_divisible_for_hw(query, qh, qw)
-        key = self.pad_divisible_for_hw(key, f_h, f_w)
-        val = self.pad_divisible_for_hw(val, f_h, f_w)
+        key = self.pad_divisible_for_hw(key, fh, fw)
+        val = self.pad_divisible_for_hw(val, fh, fw)
 
-        # After padding we need to retrieve new H/W (for partitioning)
-        # query: b n d H' W'
-        _, _, _, Hq, Wq = query.shape
-        _, _, _, Hk, Wk = key.shape
-        # assert window-fit: number of windows in query and kv might differ but each window area must match
-        # since we forced q_win == feat_win, the area per-window is qh*qw and should match
+        # After pad, partition into windows
+        query = rearrange(query, 'b n d (x w1) (y w2) -> b n x y w1 w2 d', w1=qh, w2=qw)
+        key = rearrange(key, 'b n d (x w1) (y w2) -> b n x y w1 w2 d', w1=fh, w2=fw)
+        val = rearrange(val, 'b n d (x w1) (y w2) -> b n x y w1 w2 d', w1=fh, w2=fw)
 
-        # ---------- local-to-local cross-attention (window partition) ----------
-        query = rearrange(query, 'b n d (x w1) (y w2) -> b n x y w1 w2 d',
-                          w1=qh, w2=qw)
-        key = rearrange(key, 'b n d (x w1) (y w2) -> b n x y w1 w2 d',
-                          w1=f_h, w2=f_w)
-        val = rearrange(val, 'b n d (x w1) (y w2) -> b n x y w1 w2 d',
-                          w1=f_h, w2=f_w)
-
-        # cross_win_attend expects matching window token counts; we've synchronized q and feat windows
+        # local-to-local cross-attention
         attn1_out = cross_win_attend_1(
             query, key, val,
-            skip=rearrange(x,
-                           'b d (x w1) (y w2) -> b x y w1 w2 d',
-                           w1=qh, w2=qw) if self.skip else None
+            skip=rearrange(x, 'b d (x w1) (y w2) -> b x y w1 w2 d', w1=qh, w2=qw) if self.skip else None
         )
-        # attn1_out shape should be: b x y w1 w2 d
         query = rearrange(attn1_out, 'b x y w1 w2 d  -> b (x w1) (y w2) d')
         query = query + self.mlp_1(self.prenorm_1(query))
 
         x_skip = query
         query = repeat(query, 'b x y d -> b n x y d', n=n)
 
-        # ---------- local-to-global cross-attention ----------
-        query = rearrange(query, 'b n (x w1) (y w2) d -> b n x y w1 w2 d',
-                          w1=qh, w2=qw)
+        # local-to-global cross-attention
+        query = rearrange(query, 'b n (x w1) (y w2) d -> b n x y w1 w2 d', w1=qh, w2=qw)
         key = rearrange(key, 'b n x y w1 w2 d -> b n (x w1) (y w2) d')
-        key = rearrange(key, 'b n (w1 x) (w2 y) d -> b n x y w1 w2 d',
-                        w1=f_h, w2=f_w)
+        key = rearrange(key, 'b n (w1 x) (w2 y) d -> b n x y w1 w2 d', w1=fh, w2=fw)
         val = rearrange(val, 'b n x y w1 w2 d -> b n (x w1) (y w2) d')
-        val = rearrange(val, 'b n (w1 x) (w2 y) d -> b n x y w1 w2 d',
-                        w1=f_h, w2=f_w)
+        val = rearrange(val, 'b n (w1 x) (w2 y) d -> b n x y w1 w2 d', w1=fh, w2=fw)
 
         attn2_out = cross_win_attend_2(
             query, key, val,
-            skip=rearrange(x_skip,
-                           'b (x w1) (y w2) d -> b x y w1 w2 d',
-                           w1=qh, w2=qw) if self.skip else None
+            skip=rearrange(x_skip, 'b (x w1) (y w2) d -> b x y w1 w2 d', w1=qh, w2=qw) if self.skip else None
         )
         query = rearrange(attn2_out, 'b x y w1 w2 d  -> b (x w1) (y w2) d')
+
         query = query + self.mlp_2(self.prenorm_2(query))
         query = self.postnorm(query)
         query = rearrange(query, 'b H W d -> b d H W')
         return query
+
 
 
 
