@@ -376,6 +376,22 @@ class CrossViewSwapAttention(nn.Module):
         #디버깅
         if object_count is not None:
             print(">> object_count(crossviewswapattention):", object_count.shape, object_count) #각 인덱스가 특정 종류(차, 트럭, 보행자)의 객체 수임
+            value_1 = object_count[0].item()
+            value_2 = object_count[1].item()
+            value_3 = object_count[1].item()
+            value_4 = object_count[1].item()
+            value_5 = object_count[1].item()
+            value_6 = object_count[1].item()
+            value_7 = object_count[1].item()
+            value_8 = object_count[1].item()
+            print(f"Batch 0 object count: {value_1}")
+            print(f"Batch 1 object count: {value_2}")
+            print(f"Batch 2 object count: {value_3}")
+            print(f"Batch 3 object count: {value_4}")
+            print(f"Batch 4 object count: {value_5}")
+            print(f"Batch 5 object count: {value_6}")
+            print(f"Batch 6 object count: {value_7}")
+            print(f"Batch 7 object count: {value_8}")
         else:
             print(">> object_count(crossviewswapattention) is None")
 
