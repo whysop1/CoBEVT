@@ -616,7 +616,6 @@ class CrossViewSwapAttention(nn.Module):
         # feature linear/proj (apply to all then split per-sample)
         feature_flat = rearrange(feature, 'b n ... -> (b n) ...')               # (b n) d h w
         if self.feature_proj is not None:
-            # feature_proj expects (b*n, feat_dim, h, w) -> returns (b*n, dim, h, w)
             proj_feat = self.feature_proj(feature_flat)
             key_flat_all = d_embed_all + proj_feat        # (b n) d h w
         else:
@@ -637,9 +636,7 @@ class CrossViewSwapAttention(nn.Module):
 
             # per-sample slices
             x_sample = x[bi:bi+1]  # (1, d, H, W)
-            # c_embed_all is (b*n, d, 1, 1): slice sample's n cameras -> shape (n, d, 1, 1)
             c_embed_sample = c_embed_all[bi*n:(bi+1)*n]   # (n, d, 1, 1)
-            # d_embed_all is (b*n, d, h, w): slice sample's n cameras -> (n, d, h, w)
             d_embed_sample = d_embed_all[bi*n:(bi+1)*n]   # (n, d, h, w)
 
             # compute img_embed like original: (n,d,h,w) - (n,d,1,1) -> (n,d,h,w) broadcast
@@ -667,7 +664,6 @@ class CrossViewSwapAttention(nn.Module):
                 w_embed = self.bev_embed(world[None])       # 1 d H W
 
                 # subtract camera embedding (n d 1 1) from w_embed (1 d H W) -> results in (n d H W)
-                # use broadcasting: c_embed_sample (n,d,1,1) will broadcast across H,W
                 bev_embed = w_embed - c_embed_sample        # (n, d, H, W)
                 bev_embed = bev_embed / (bev_embed.norm(dim=1, keepdim=True) + 1e-7)
                 # query_pos shape: 1 n d H W
@@ -684,7 +680,10 @@ class CrossViewSwapAttention(nn.Module):
             key = self.pad_divisble(key, f_h, f_w)
             val = self.pad_divisble(val, f_h, f_w)
 
-            # local-to-local cross-attention
+            # ---------------------------------
+            # local-to-local cross-attention (CrossWinAttention 1)
+            # ---------------------------------
+            # NOTE: provide w1/w2 params explicitly so einops can infer x,y
             q_windows = rearrange(query, 'b n d (x w1) (y w2) -> b n x y w1 w2 d', w1=q_h, w2=q_w)
             k_windows = rearrange(key, 'b n d (x w1) (y w2) -> b n x y w1 w2 d', w1=f_h, w2=f_w)
             v_windows = rearrange(val, 'b n d (x w1) (y w2) -> b n x y w1 w2 d', w1=f_h, w2=f_w)
@@ -694,7 +693,7 @@ class CrossViewSwapAttention(nn.Module):
                 skip_conn = rearrange(x_sample, 'b d (x w1) (y w2) -> b x y w1 w2 d', w1=q_h, w2=q_w)
 
             q_out = self.cross_win_attend_1(q_windows, k_windows, v_windows, skip=skip_conn)
-            q_out = rearrange(q_out, 'b x y w1 w2 d  -> b (x w1) (y w2) d')
+            q_out = rearrange(q_out, 'b x y w1 w2 d  -> b (x w1) (y w2) d', w1=q_h, w2=q_w)
 
             q_out = q_out + self.mlp_1(self.prenorm_1(q_out))
             x_skip = q_out
@@ -702,12 +701,16 @@ class CrossViewSwapAttention(nn.Module):
             # expand across cameras
             q_expanded = repeat(q_out, 'b (xw) (yw) d -> b n xw yw d', n=n)
 
-            # local-to-global cross-attention
+            # ---------------------------------
+            # local-to-global cross-attention (CrossWinAttention 2)
+            # ---------------------------------
             q2 = rearrange(q_expanded, 'b n (x w1) (y w2) d -> b n x y w1 w2 d', w1=q_h, w2=q_w)
 
-            k2 = rearrange(key, 'b n d (x w1) (y w2) -> b n (x w1) (y w2) d')
+            # here we MUST tell rearrange the w1/w2 used in previous pad_divisble (f_h,f_w)
+            k2 = rearrange(key, 'b n d (x w1) (y w2) -> b n (x w1) (y w2) d', w1=f_h, w2=f_w)
             k2 = rearrange(k2, 'b n (w1 x) (w2 y) d -> b n x y w1 w2 d', w1=f_h, w2=f_w)
-            v2 = rearrange(val, 'b n d (x w1) (y w2) -> b n (x w1) (y w2) d')
+
+            v2 = rearrange(val, 'b n d (x w1) (y w2) -> b n (x w1) (y w2) d', w1=f_h, w2=f_w)
             v2 = rearrange(v2, 'b n (w1 x) (w2 y) d -> b n x y w1 w2 d', w1=f_h, w2=f_w)
 
             skip_conn2 = None
@@ -715,7 +718,7 @@ class CrossViewSwapAttention(nn.Module):
                 skip_conn2 = rearrange(x_skip, 'b (x w1) (y w2) d -> b x y w1 w2 d', w1=q_h, w2=q_w)
 
             q_out2 = self.cross_win_attend_2(q2, k2, v2, skip=skip_conn2)
-            q_out2 = rearrange(q_out2, 'b x y w1 w2 d  -> b (x w1) (y w2) d')
+            q_out2 = rearrange(q_out2, 'b x y w1 w2 d  -> b (x w1) (y w2) d', w1=q_h, w2=q_w)
 
             q_out2 = q_out2 + self.mlp_2(self.prenorm_2(q_out2))
             q_out2 = self.postnorm(q_out2)
@@ -726,6 +729,7 @@ class CrossViewSwapAttention(nn.Module):
 
         out = torch.cat(outputs, dim=0)  # (b, d, H, W)
         return out
+
 
 
 
