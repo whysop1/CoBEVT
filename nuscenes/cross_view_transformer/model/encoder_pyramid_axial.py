@@ -280,7 +280,7 @@ class CrossWinAttention(nn.Module):
             z = z + skip
         return z
 
-
+'''
 class CrossViewSwapAttention(nn.Module):
     def __init__(
         self,
@@ -482,6 +482,283 @@ class CrossViewSwapAttention(nn.Module):
         query = rearrange(query, 'b H W d -> b d H W')
 
         return query
+'''
+
+class CrossViewSwapAttention(nn.Module):
+    def __init__(
+        self,
+        feat_height: int,
+        feat_width: int,
+        feat_dim: int,
+        dim: int,
+        index: int,
+        image_height: int,
+        image_width: int,
+        qkv_bias: bool,
+        q_win_size: list,
+        feat_win_size: list,
+        heads: list,
+        dim_head: list,
+        bev_embedding_flag: list,
+        rel_pos_emb: bool = False,
+        no_image_features: bool = False,
+        skip: bool = True,
+        norm=nn.LayerNorm,
+    ):
+        super().__init__()
+
+        # 1 1 3 h w
+        image_plane = generate_grid(feat_height, feat_width)[None]
+        image_plane[:, :, 0] *= image_width
+        image_plane[:, :, 1] *= image_height
+
+        self.register_buffer('image_plane', image_plane, persistent=False)
+
+        self.feature_linear = nn.Sequential(
+            nn.BatchNorm2d(feat_dim),
+            nn.ReLU(),
+            nn.Conv2d(feat_dim, dim, 1, bias=False))
+
+        if no_image_features:
+            self.feature_proj = None
+        else:
+            self.feature_proj = nn.Sequential(
+                nn.BatchNorm2d(feat_dim),
+                nn.ReLU(),
+                nn.Conv2d(feat_dim, dim, 1, bias=False))
+
+        self.bev_embed_flag = bev_embedding_flag[index]
+        if self.bev_embed_flag:
+            self.bev_embed = nn.Conv2d(2, dim, 1)
+        self.img_embed = nn.Conv2d(4, dim, 1, bias=False)
+        self.cam_embed = nn.Conv2d(4, dim, 1, bias=False)
+
+        # NOTE: q_win_size and feat_win_size passed in are lists of lists per stage.
+        # At init we pick the one for this index (same as original).
+        self.base_q_win = q_win_size[index]       # e.g. [5,5]
+        self.base_feat_win = feat_win_size[index] # e.g. [6,12]
+
+        self.rel_pos_emb = rel_pos_emb
+
+        self.cross_win_attend_1 = CrossWinAttention(dim, heads[index], dim_head[index], qkv_bias)
+        self.cross_win_attend_2 = CrossWinAttention(dim, heads[index], dim_head[index], qkv_bias)
+        self.skip = skip
+
+        self.prenorm_1 = norm(dim)
+        self.prenorm_2 = norm(dim)
+        self.mlp_1 = nn.Sequential(nn.Linear(dim, 2 * dim), nn.GELU(), nn.Linear(2 * dim, dim))
+        self.mlp_2 = nn.Sequential(nn.Linear(dim, 2 * dim), nn.GELU(), nn.Linear(2 * dim, dim))
+        self.postnorm = norm(dim)
+
+    def pad_divisble(self, x, win_h, win_w):
+        """Pad the x to be divisible by window size."""
+        # expects x shape: b n d h w  (note: our per-sample call will be b=1)
+        _, _, _, h, w = x.shape
+        h_pad, w_pad = ((h + win_h) // win_h) * win_h, ((w + win_w) // win_w) * win_w
+        padh = h_pad - h if h % win_h != 0 else 0
+        padw = w_pad - w if w % win_w != 0 else 0
+        return F.pad(x, (0, padw, 0, padh), value=0)
+
+    def _compute_dynamic_windows(self, base_q, base_feat, obj_count, scale_div=20, min_win=4):
+        """
+        base_q: [qh, qw]
+        base_feat: [fh, fw]
+        obj_count: int
+        scale_div: larger -> slower decrease; obj_count//scale_div determines decrease
+        min_win: minimum window size
+        """
+        dec = int(obj_count // scale_div)
+        qh = max(min_win, base_q[0] - dec)
+        qw = max(min_win, base_q[1] - dec)
+        fh = max(min_win, base_feat[0] - dec)
+        fw = max(min_win, base_feat[1] - dec)
+        return (qh, qw), (fh, fw)
+
+    def forward(
+        self,
+        index: int,
+        x: torch.FloatTensor,
+        bev: BEVEmbedding,
+        feature: torch.FloatTensor,
+        I_inv: torch.FloatTensor,
+        E_inv: torch.FloatTensor,
+        object_count: Optional[torch.Tensor] = None, # shape: (B,) or None
+    ):
+        """
+        x: (b, c, H, W)
+        feature: (b, n, dim_in, h, w)
+        I_inv: (b, n, 3, 3)
+        E_inv: (b, n, 4, 4)
+        object_count: (b,) tensor with per-sample object counts
+        """
+        b, n, _, _, _ = feature.shape
+        _, _, H, W = x.shape
+
+        # debug prints kept as in your original code
+        if object_count is not None:
+            print(">> object_count(crossviewswapattention):", object_count.shape, object_count)
+        else:
+            print(">> object_count(crossviewswapattention) is None")
+
+        pixel = self.image_plane                                                # 1 1 3 h w
+        _, _, _, h, w = pixel.shape
+
+        # camera embedding (shared computation across batch but will re-index per-sample)
+        c = E_inv[..., -1:]                                                     # b n 4 1
+        c_flat = rearrange(c, 'b n ... -> (b n) ...')[..., None]                # (b n) 4 1 1
+        c_embed_all = self.cam_embed(c_flat)                                    # (b n) d 1 1
+
+        pixel_flat = rearrange(pixel, '... h w -> ... (h w)')                   # 1 1 3 (h w)
+        cam = I_inv @ pixel_flat                                                # b n 3 (h w)
+        cam = F.pad(cam, (0, 0, 0, 1, 0, 0, 0, 0), value=1)                     # b n 4 (h w)
+        d = E_inv @ cam                                                         # b n 4 (h w)
+        d_flat = rearrange(d, 'b n d (h w) -> (b n) d h w', h=h, w=w)           # (b n) 4 h w
+        d_embed_all = self.img_embed(d_flat)                                    # (b n) d h w
+
+        # normalize image embeddings
+        # reshape back to (b n d h w)
+        d_embed_all = d_embed_all  # (b n) d h w
+        # Note: c_embed_all shape: (b n) d 1 1 -> rearrange back to (b n) d 1 1
+
+        # feature linear/proj (apply to all then split per-sample)
+        feature_flat = rearrange(feature, 'b n ... -> (b n) ...')               # (b n) d h w
+        if self.feature_proj is not None:
+            key_flat_all = d_embed_all + self.feature_proj(feature_flat)        # (b n) d h w
+        else:
+            key_flat_all = d_embed_all                                         # (b n) d h w
+        val_flat_all = self.feature_linear(feature_flat)                        # (b n) d h w
+
+        # Prepare outputs list
+        outputs = []
+
+        # We'll process sample-by-sample so we can use different window sizes per sample:
+        for bi in range(b):
+            # per-sample slices
+            obj_cnt = int(object_count[bi].item()) if object_count is not None else None
+
+            # compute dynamic windows for this sample
+            if obj_cnt is not None:
+                (q_h, q_w), (f_h, f_w) = self._compute_dynamic_windows(self.base_q_win, self.base_feat_win, obj_cnt)
+            else:
+                q_h, q_w = self.base_q_win
+                f_h, f_w = self.base_feat_win
+
+            # gather per-sample tensors
+            # x_sample: (1, d, H, W)
+            x_sample = x[bi:bi+1]  # keep batch dim =1 for CrossWinAttention
+            # camera embeddings for sample: (n, d, 1, 1) -> we want (n d 1 1) in combined dim (b*n)
+            c_embed = c_embed_all[bi*n:(bi+1)*n]              # (n) entries => shape (n d 1 1) after conv
+            # reshape to (n d h w) with h=1,w=1 to match rest
+            c_embed = rearrange(c_embed, '(n) d h w -> (n) d h w', n=n)
+
+            # image embedding for this sample: key_img (n d h w)
+            d_embed = d_embed_all[bi*n:(bi+1)*n]              # (n) d h w
+
+            # combine img_embed and cam_embed to compute img_embed as in original:
+            # note: c_embed currently (n d 1 1) but earlier code used broadcasting with (b n) dims
+            # convert to (n d h w) by broadcasting
+            c_embed_broad = c_embed[..., None, None] if c_embed.dim() == 3 else c_embed
+            # ensure shapes: d_embed is (n d h w), c_embed_broad (n d 1 1)
+            img_embed = d_embed - c_embed_broad
+            img_embed = img_embed / (img_embed.norm(dim=1, keepdim=True) + 1e-7)  # (n d h w)
+
+            # build key and val for this sample
+            # key_flat_all and val_flat_all are shaped (b*n) d h w flattened by batch; extract this sample's (n d h w)
+            key_flat = key_flat_all[bi*n:(bi+1)*n]  # (n d h w)
+            val_flat = val_flat_all[bi*n:(bi+1)*n]  # (n d h w)
+
+            # If feature_proj applied earlier, key_flat already includes img_embed + proj(feature)
+            # But ensure key contains img_embed + proj(feature) shape (n d h w). If shapes mismatch, we attempt safe add
+            # In our construction key_flat was d_embed_all + proj(feature_flat) when proj exists, so it's fine.
+
+            # query_pos (if bev_embed_flag)
+            if self.bev_embed_flag:
+                # choose world grid for this index (same as original)
+                if index == 0:
+                    world = bev.grid0[:2]
+                elif index == 1:
+                    world = bev.grid1[:2]
+                elif index == 2:
+                    world = bev.grid2[:2]
+                elif index == 3:
+                    world = bev.grid3[:2]
+                else:
+                    # fallback: use grid0 if more indices not provided
+                    world = bev.grid0[:2]
+
+                w_embed = self.bev_embed(world[None])       # 1 d H W
+                bev_embed = w_embed - rearrange(c_embed_all[bi*n:(bi+1)*n], '(n) d 1 1')  # (n d H W) - broadcast
+                # The original code normalized bev_embed across dim=1; but here c_embed_all is (n,d,1,1)
+                # To be consistent, expand c_embed to H W
+                bev_embed = bev_embed / (bev_embed.norm(dim=1, keepdim=True) + 1e-7)
+                # query_pos shape expected b n d H W (here b=1)
+                query_pos = rearrange(bev_embed, '(n) d H W -> 1 n d H W', n=n)
+                query = query_pos + x_sample[:, None]   # (1 n d H W)
+            else:
+                query = x_sample[:, None]  # (1 n d H W)
+
+            # Convert key,val from (n d h w) -> (1 n d h w)
+            key = rearrange(key_flat, 'n d h w -> 1 n d h w')
+            val = rearrange(val_flat, 'n d h w -> 1 n d h w')
+
+            # pad divisible for this sample using feature window sizes
+            key = self.pad_divisble(key, f_h, f_w)
+            val = self.pad_divisble(val, f_h, f_w)
+
+            # -----------------------
+            # local-to-local cross-attention (CrossWinAttention 1)
+            # -----------------------
+
+            # partition query/key/val into windows with the per-sample q_h,q_w and f_h,f_w
+            # query shape: (1 n d H W) -> windowed: (1 n x y w1 w2 d)
+            q_windows = rearrange(query, 'b n d (x w1) (y w2) -> b n x y w1 w2 d', w1=q_h, w2=q_w)
+            k_windows = rearrange(key, 'b n d (x w1) (y w2) -> b n x y w1 w2 d', w1=f_h, w2=f_w)
+            v_windows = rearrange(val, 'b n d (x w1) (y w2) -> b n x y w1 w2 d', w1=f_h, w2=f_w)
+
+            # run first cross-window attention (skip connection uses original x partitioned to q_win)
+            skip_conn = None
+            if self.skip:
+                skip_conn = rearrange(x_sample, 'b d (x w1) (y w2) -> b x y w1 w2 d', w1=q_h, w2=q_w)
+            q_out = self.cross_win_attend_1(q_windows, k_windows, v_windows, skip=skip_conn)
+            # q_out returns (b X Y W1 W2 d) which original caller rearranged to 'b (x w1) (y w2) d'
+            q_out = rearrange(q_out, 'b x y w1 w2 d  -> b (x w1) (y w2) d')   # (1, H', W', d)
+
+            q_out = q_out + self.mlp_1(self.prenorm_1(q_out))
+            x_skip = q_out  # keep for next stage
+
+            # expand query to repeat across cameras (n)
+            q_expanded = repeat(q_out, 'b (xw) (yw) d -> b n xw yw d', n=n)
+
+            # -----------------------
+            # local-to-global cross-attention (CrossWinAttention 2)
+            # -----------------------
+            # need to partition q_expanded with q_h,q_w and prepare key/val reversed windows shape
+            q2 = rearrange(q_expanded, 'b n (x w1) (y w2) d -> b n x y w1 w2 d', w1=q_h, w2=q_w)
+            # key and val need to be rearranged into 'b n (x w1) (y w2) d' then into grid partition for cross attention:
+            k2 = rearrange(key, 'b n d (x w1) (y w2) -> b n (x w1) (y w2) d')
+            k2 = rearrange(k2, 'b n (w1 x) (w2 y) d -> b n x y w1 w2 d', w1=f_h, w2=f_w)
+            v2 = rearrange(val, 'b n d (x w1) (y w2) -> b n (x w1) (y w2) d')
+            v2 = rearrange(v2, 'b n (w1 x) (w2 y) d -> b n x y w1 w2 d', w1=f_h, w2=f_w)
+
+            skip_conn2 = None
+            if self.skip:
+                skip_conn2 = rearrange(x_skip, 'b (x w1) (y w2) d -> b x y w1 w2 d', w1=q_h, w2=q_w)
+
+            q_out2 = self.cross_win_attend_2(q2, k2, v2, skip=skip_conn2)
+            q_out2 = rearrange(q_out2, 'b x y w1 w2 d  -> b (x w1) (y w2) d')  # (1 H' W' d)
+
+            q_out2 = q_out2 + self.mlp_2(self.prenorm_2(q_out2))
+
+            q_out2 = self.postnorm(q_out2)
+
+            # final reshape to (1, d, H, W)
+            q_out2 = rearrange(q_out2, 'b H W d -> b d H W')
+
+            outputs.append(q_out2)
+
+        # concat back to (b, d, H, W)
+        out = torch.cat(outputs, dim=0)
+        return out
 
 
 
