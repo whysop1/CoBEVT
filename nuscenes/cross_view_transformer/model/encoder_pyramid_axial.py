@@ -523,119 +523,180 @@ class CrossViewSwapAttention(nn.Module):
     ):
         super().__init__()
 
+        # --- grids / buffers ---
         image_plane = generate_grid(feat_height, feat_width)[None]
         image_plane[:, :, 0] *= image_width
         image_plane[:, :, 1] *= image_height
         self.register_buffer('image_plane', image_plane, persistent=False)
 
+        # --- feature projections ---
         self.feature_linear = nn.Sequential(
             nn.BatchNorm2d(feat_dim),
             nn.ReLU(),
-            nn.Conv2d(feat_dim, dim, 1, bias=False))
-
+            nn.Conv2d(feat_dim, dim, 1, bias=False)
+        )
         if no_image_features:
             self.feature_proj = None
         else:
             self.feature_proj = nn.Sequential(
                 nn.BatchNorm2d(feat_dim),
                 nn.ReLU(),
-                nn.Conv2d(feat_dim, dim, 1, bias=False))
+                nn.Conv2d(feat_dim, dim, 1, bias=False)
+            )
 
-        self.bev_embed_flag = bev_embedding_flag[index]
+        # --- embeddings ---
+        self.bev_embed_flag = bool(bev_embedding_flag[index])
         if self.bev_embed_flag:
             self.bev_embed = nn.Conv2d(2, dim, 1)
         self.img_embed = nn.Conv2d(4, dim, 1, bias=False)
         self.cam_embed = nn.Conv2d(4, dim, 1, bias=False)
 
-        self.base_q_win_size = q_win_size[index]
-        self.base_feat_win_size = feat_win_size[index]
-        self.base_heads = heads[index]
-        self.dim_head = dim_head[index]
-        self.rel_pos_emb = rel_pos_emb
+        # --- base hyperparams ---
+        # 리스트/정수 혼용 대비: 항상 (h, w) 튜플로 보관
+        _q = q_win_size[index]
+        self.base_q_win_size: Tuple[int, int] = (int(_q[0]), int(_q[1])) if isinstance(_q, (list, tuple)) else (int(_q), int(_q))
+        _f = feat_win_size[index]
+        self.base_feat_win_size: Tuple[int, int] = (int(_f[0]), int(_f[1])) if isinstance(_f, (list, tuple)) else (int(_f), int(_f))
+        self.base_heads = int(heads[index])
+        # dim_head는 동적 heads에 따라 재계산하므로 base는 참고값으로만 둠
+        self.base_dim_head = int(dim_head[index]) if isinstance(dim_head, (list, tuple)) else int(dim_head)
 
-        # CrossWinAttention 모듈은 forward에서 재생성 (동적 heads 적용)
         self.qkv_bias = qkv_bias
-        self.dim = dim
-
+        self.rel_pos_emb = rel_pos_emb
+        self.dim = int(dim)
         self.skip = skip
+
+        # --- norms / mlps ---
         self.prenorm_1 = norm(dim)
         self.prenorm_2 = norm(dim)
         self.mlp_1 = nn.Sequential(nn.Linear(dim, 2 * dim), nn.GELU(), nn.Linear(2 * dim, dim))
         self.mlp_2 = nn.Sequential(nn.Linear(dim, 2 * dim), nn.GELU(), nn.Linear(2 * dim, dim))
         self.postnorm = norm(dim)
 
-    def pad_divisble(self, x, win_h, win_w):
-        _, _, _, h, w = x.shape
-        h_pad, w_pad = ((h + win_h) // win_h) * win_h, ((w + win_w) // win_w) * win_w
-        padh = h_pad - h if h % win_h != 0 else 0
-        padw = w_pad - w if w % win_w != 0 else 0
-        return F.pad(x, (0, padw, 0, padh), value=0)
+    # -------- helpers --------
+    @staticmethod
+    def _ceil_to_multiple(x: int, m: int) -> int:
+        return ((x + m - 1) // m) * m
 
-    def compute_dynamic_params(self, object_count: torch.Tensor):
-        min_thr, max_thr = 10, 30
-        min_heads, max_heads = self.base_heads, self.base_heads * 2
-        min_win, max_win = self.base_q_win_size[0], self.base_q_win_size[0] * 2
+    @staticmethod
+    def _pad_to_divisible_5d(x: torch.Tensor, win_h: int, win_w: int) -> torch.Tensor:
+        """
+        x: (b, n, d, H, W)
+        pad so H % win_h == 0 and W % win_w == 0
+        """
+        b, n, d, H, W = x.shape
+        H_pad = CrossViewSwapAttention._ceil_to_multiple(H, max(1, win_h))
+        W_pad = CrossViewSwapAttention._ceil_to_multiple(W, max(1, win_w))
+        pad_h = H_pad - H
+        pad_w = W_pad - W
+        if pad_h == 0 and pad_w == 0:
+            return x
+        return F.pad(x, (0, pad_w, 0, pad_h))  # pad last two dims (W, H)
 
-        # 배치 평균 객체 수 사용
-        avg_count = object_count.float().mean()
+    @staticmethod
+    def _pad_to_divisible_4d(x: torch.Tensor, win_h: int, win_w: int) -> torch.Tensor:
+        """
+        x: (b, d, H, W)
+        """
+        b, d, H, W = x.shape
+        H_pad = CrossViewSwapAttention._ceil_to_multiple(H, max(1, win_h))
+        W_pad = CrossViewSwapAttention._ceil_to_multiple(W, max(1, win_w))
+        pad_h = H_pad - H
+        pad_w = W_pad - W
+        if pad_h == 0 and pad_w == 0:
+            return x
+        return F.pad(x, (0, pad_w, 0, pad_h))
 
-        # heads 계산
+    def compute_dynamic_params(self, object_count: torch.Tensor) -> Tuple[int, Tuple[int, int]]:
+        """
+        object_count 평균값으로 heads / window size 동적 산출
+        - 기준: 10, 30
+        - heads: base ~ 2*base 선형 보간
+        - window: base_q_win ~ 2*base_q_win 선형 보간 (정수)
+        """
+        min_thr, max_thr = 10.0, 30.0
+        base_heads = max(1, self.base_heads)
+        max_heads = max(1, self.base_heads * 2)
+
+        bqh, bqw = self.base_q_win_size
+        max_qh, max_qw = max(1, bqh * 2), max(1, bqw * 2)
+
+        avg_count = float(object_count.float().mean().item())
+
+        # heads
         if avg_count <= min_thr:
-            heads = min_heads
+            heads = base_heads
         elif avg_count >= max_thr:
             heads = max_heads
         else:
-            heads = int(min_heads + (avg_count - min_thr) * (max_heads - min_heads) / (max_thr - min_thr))
+            frac = (avg_count - min_thr) / (max_thr - min_thr)
+            heads = int(round(base_heads + frac * (max_heads - base_heads)))
 
-        # window size 계산
+        # window
         if avg_count <= min_thr:
-            win_size = min_win
+            qh, qw = bqh, bqw
         elif avg_count >= max_thr:
-            win_size = max_win
+            qh, qw = max_qh, max_qw
         else:
-            win_size = int(min_win + (avg_count - min_thr) * (max_win - min_win) / (max_thr - min_thr))
+            frac = (avg_count - min_thr) / (max_thr - min_thr)
+            qh = int(round(bqh + frac * (max_qh - bqh)))
+            qw = int(round(bqw + frac * (max_qw - bqw)))
+            qh = max(1, qh)
+            qw = max(1, qw)
 
-        return heads, (win_size, win_size)
+        return heads, (qh, qw)
 
+    # -------- forward --------
     def forward(
         self,
         index: int,
-        x: torch.FloatTensor,
-        bev: BEVEmbedding,
-        feature: torch.FloatTensor,
-        I_inv: torch.FloatTensor,
-        E_inv: torch.FloatTensor,
+        x: torch.FloatTensor,              # (b, d, H, W) - BEV tokens
+        bev: 'BEVEmbedding',
+        feature: torch.FloatTensor,        # (b, n, dim_in, h, w)
+        I_inv: torch.FloatTensor,          # (b, n, 3, 3)
+        E_inv: torch.FloatTensor,          # (b, n, 4, 4)
         object_count: Optional[torch.Tensor] = None,
     ):
+        # 1) 동적 heads/window 결정 + q/kv 윈도우 완전 동기화
         if object_count is not None:
             heads, q_win_size = self.compute_dynamic_params(object_count)
-            feat_win_size = q_win_size  # 동기화
-            print(f">> Dynamic params - heads: {heads}, win_size: {q_win_size}")
+            feat_win_size = q_win_size
         else:
             heads = self.base_heads
+            # 항상 q/kv 동일 윈도우로 강제 (assert 방지)
             q_win_size = self.base_q_win_size
-            feat_win_size = self.base_feat_win_size
+            feat_win_size = q_win_size
 
-        # 동적으로 CrossWinAttention 생성
-        cross_win_attend_1 = CrossWinAttention(self.dim, heads, self.dim_head, self.qkv_bias)
-        cross_win_attend_2 = CrossWinAttention(self.dim, heads, self.dim_head, self.qkv_bias)
+        qh, qw = int(q_win_size[0]), int(q_win_size[1])
+        fh, fw = int(feat_win_size[0]), int(feat_win_size[1])
 
+        # 2) heads에 맞춰 dim_head 안전 재계산
+        if self.dim % heads != 0:
+            dim_head = max(1, self.dim // heads)
+            print(f"[WARN] dim {self.dim} not divisible by heads {heads}. Using dim_head={dim_head}.")
+        else:
+            dim_head = self.dim // heads
+
+        # 3) CrossWinAttention 인스턴스 동적 생성
+        cross_win_attend_1 = CrossWinAttention(self.dim, heads, dim_head, self.qkv_bias)
+        cross_win_attend_2 = CrossWinAttention(self.dim, heads, dim_head, self.qkv_bias)
+
+        # ---------- embeddings ----------
         b, n, _, _, _ = feature.shape
-        _, _, H, W = x.shape
 
         pixel = self.image_plane
-        _, _, _, h, w = pixel.shape
+        _, _, _, h_img, w_img = pixel.shape
 
-        c = E_inv[..., -1:]
-        c_flat = rearrange(c, 'b n ... -> (b n) ...')[..., None]
-        c_embed = self.cam_embed(c_flat)
+        c = E_inv[..., -1:]                                   # (b, n, 4, 1)
+        c_flat = rearrange(c, 'b n ... -> (b n) ...')[..., None]  # (b*n, 4, 1, 1)
+        c_embed = self.cam_embed(c_flat)                      # (b*n, d, 1, 1)
 
-        pixel_flat = rearrange(pixel, '... h w -> ... (h w)')
-        cam = I_inv @ pixel_flat
-        cam = F.pad(cam, (0, 0, 0, 1, 0, 0, 0, 0), value=1)
-        d = E_inv @ cam
-        d_flat = rearrange(d, 'b n d (h w) -> (b n) d h w', h=h, w=w)
-        d_embed = self.img_embed(d_flat)
+        pixel_flat = rearrange(pixel, '... h w -> ... (h w)') # (1,1,3,h*w)
+        cam = I_inv @ pixel_flat                              # (b,n,3,h*w)
+        cam = F.pad(cam, (0, 0, 0, 1, 0, 0, 0, 0), value=1)   # (b,n,4,h*w)
+        d = E_inv @ cam                                       # (b,n,4,h*w)
+        d_flat = rearrange(d, 'b n d (h w) -> (b n) d h w', h=h_img, w=w_img)
+        d_embed = self.img_embed(d_flat)                      # (b*n, d, h_img, w_img)
 
         img_embed = d_embed - c_embed
         img_embed = img_embed / (img_embed.norm(dim=1, keepdim=True) + 1e-7)
@@ -648,67 +709,77 @@ class CrossViewSwapAttention(nn.Module):
             world = bev.grid2[:2]
         elif index == 3:
             world = bev.grid3[:2]
+        else:
+            world = bev.grid0[:2]  # 안전 fallback
 
         if self.bev_embed_flag:
-            w_embed = self.bev_embed(world[None])
+            w_embed = self.bev_embed(world[None])             # (1, d, H, W) (per-level)
             bev_embed = w_embed - c_embed
             bev_embed = bev_embed / (bev_embed.norm(dim=1, keepdim=True) + 1e-7)
-            query_pos = rearrange(bev_embed, '(b n) ... -> b n ...', b=b, n=n)
+            query_pos = rearrange(bev_embed, '(b n) ... -> b n ...', b=b, n=n)  # (b,n,d,H,W)
 
         feature_flat = rearrange(feature, 'b n ... -> (b n) ...')
-
         if self.feature_proj is not None:
             key_flat = img_embed + self.feature_proj(feature_flat)
         else:
             key_flat = img_embed
-
         val_flat = self.feature_linear(feature_flat)
 
+        # shapes: query/key/val : (b,n,d,H,W)
         if self.bev_embed_flag:
             query = query_pos + x[:, None]
         else:
             query = x[:, None]
+
         key = rearrange(key_flat, '(b n) ... -> b n ...', b=b, n=n)
         val = rearrange(val_flat, '(b n) ... -> b n ...', b=b, n=n)
 
-        key = self.pad_divisble(key, feat_win_size[0], feat_win_size[1])
-        val = self.pad_divisble(val, feat_win_size[0], feat_win_size[1])
+        # 4) q/k/v/x 모두 동일 윈도우에 맞춰 패딩 (핵심 수정)
+        query = self._pad_to_divisible_5d(query, qh, qw)
+        key   = self._pad_to_divisible_5d(key,   fh, fw)
+        val   = self._pad_to_divisible_5d(val,   fh, fw)
+        x_for_skip1 = self._pad_to_divisible_4d(x, qh, qw)  # 첫 번째 cross에서 skip로 사용
 
-        query = rearrange(query, 'b n d (x w1) (y w2) -> b n x y w1 w2 d',
-                          w1=q_win_size[0], w2=q_win_size[1])
-        key = rearrange(key, 'b n d (x w1) (y w2) -> b n x y w1 w2 d',
-                          w1=feat_win_size[0], w2=feat_win_size[1])
-        val = rearrange(val, 'b n d (x w1) (y w2) -> b n x y w1 w2 d',
-                          w1=feat_win_size[0], w2=feat_win_size[1])
+        # ---------- local-to-local ----------
+        # 윈도우 분할
+        query_w = rearrange(query, 'b n d (x w1) (y w2) -> b n x y w1 w2 d', w1=qh, w2=qw)
+        key_w   = rearrange(key,   'b n d (x w1) (y w2) -> b n x y w1 w2 d', w1=fh, w2=fw)
+        val_w   = rearrange(val,   'b n d (x w1) (y w2) -> b n x y w1 w2 d', w1=fh, w2=fw)
 
-        query = rearrange(cross_win_attend_1(query, key, val,
-                                             skip=rearrange(x,
-                                                 'b d (x w1) (y w2) -> b x y w1 w2 d',
-                                                 w1=q_win_size[0], w2=q_win_size[1]) if self.skip else None),
-                          'b x y w1 w2 d  -> b (x w1) (y w2) d')
-        query = query + self.mlp_1(self.prenorm_1(query))
+        skip_w = rearrange(
+            x_for_skip1, 'b d (x w1) (y w2) -> b x y w1 w2 d', w1=qh, w2=qw
+        ) if self.skip else None
 
-        x_skip = query
-        query = repeat(query, 'b x y d -> b n x y d', n=n)
+        out1 = cross_win_attend_1(query_w, key_w, val_w, skip=skip_w)
+        query2d = rearrange(out1, 'b x y w1 w2 d -> b (x w1) (y w2) d')
+        query2d = query2d + self.mlp_1(self.prenorm_1(query2d))
 
-        query = rearrange(query, 'b n (x w1) (y w2) d -> b n x y w1 w2 d',
-                          w1=q_win_size[0], w2=q_win_size[1])
-        key = rearrange(key, 'b n x y w1 w2 d -> b n (x w1) (y w2) d')
-        key = rearrange(key, 'b n (w1 x) (w2 y) d -> b n x y w1 w2 d',
-                        w1=feat_win_size[0], w2=feat_win_size[1])
-        val = rearrange(val, 'b n x y w1 w2 d -> b n (x w1) (y w2) d')
-        val = rearrange(val, 'b n (w1 x) (w2 y) d -> b n x y w1 w2 d',
-                        w1=feat_win_size[0], w2=feat_win_size[1])
+        # ---------- prepare for local-to-global ----------
+        x_skip = query2d
+        query_ng = repeat(query2d, 'b x y d -> b n x y d', n=key_w.shape[1])
 
-        query = rearrange(cross_win_attend_2(query, key, val,
-                                             skip=rearrange(x_skip,
-                                                 'b (x w1) (y w2) d -> b x y w1 w2 d',
-                                                 w1=q_win_size[0], w2=q_win_size[1]) if self.skip else None),
-                          'b x y w1 w2 d  -> b (x w1) (y w2) d')
-        query = query + self.mlp_2(self.prenorm_2(query))
-        query = self.postnorm(query)
-        query = rearrange(query, 'b H W d -> b d H W')
-        return query
+        # ---------- local-to-global ----------
+        query_g = rearrange(query_ng, 'b n (x w1) (y w2) d -> b n x y w1 w2 d', w1=qh, w2=qw)
+
+        # key_w/val_w 는 이미 (b,n,x,y,w1,w2,d)
+        key_g = rearrange(key_w, 'b n x y w1 w2 d -> b n (x w1) (y w2) d')
+        key_g = rearrange(key_g, 'b n (w1 x) (w2 y) d -> b n x y w1 w2 d', w1=fh, w2=fw)
+
+        val_g = rearrange(val_w, 'b n x y w1 w2 d -> b n (x w1) (y w2) d')
+        val_g = rearrange(val_g, 'b n (w1 x) (w2 y) d -> b n x y w1 w2 d', w1=fh, w2=fw)
+
+        skip_g = rearrange(
+            x_skip, 'b (x w1) (y w2) d -> b x y w1 w2 d', w1=qh, w2=qw
+        ) if self.skip else None
+
+        out2 = cross_win_attend_2(query_g, key_g, val_g, skip=skip_g)
+        query2d = rearrange(out2, 'b x y w1 w2 d -> b (x w1) (y w2) d')
+
+        # ---------- MLP & norm ----------
+        query2d = query2d + self.mlp_2(self.prenorm_2(query2d))
+        query2d = self.postnorm(query2d)
+        query2d = rearrange(query2d, 'b H W d -> b d H W')
+        return query2d
 
 
 
