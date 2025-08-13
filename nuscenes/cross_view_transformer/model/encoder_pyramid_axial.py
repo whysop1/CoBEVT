@@ -9,7 +9,8 @@ from torchvision.models.resnet import Bottleneck
 from typing import List
 from .decoder import  DecoderBlock
 
-from typing import Optional
+from typing import Optional, Union, Tuple
+
 
 
 ResNetBottleNeck = lambda c: Bottleneck(c, c // 4)
