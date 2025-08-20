@@ -319,6 +319,9 @@ class DRRAGate(nn.Module):
             # 기타 케이스: 마지막 차원들 합
             s = obj_cnt.reshape(obj_cnt.shape[0], -1).sum(dim=1)
         # robust scaling: x / (x.mean + x.std + eps)
+
+        s = s.float()
+        
         mean = s.mean().clamp(min=1.0)
         std  = s.std().clamp(min=1.0)
         x = s / (mean + std + 1e-6)
