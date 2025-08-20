@@ -224,7 +224,8 @@ class CrossWinAttention(nn.Module):
         # flattening
         q = rearrange(q, 'b n x y w1 w2 d -> b (x y) (n w1 w2) d')
         k = rearrange(k, 'b n x y w1 w2 d -> b (x y) (n w1 w2) d')
-        v = rearrange(v, 'b (x y) (n w1 w2) d')
+        v = rearrange(v, 'b n x y w1 w2 d -> b (x y) (n w1 w2) d')
+
 
         # Project
         q = self.to_q(q)                                # b (X Y) (n W1 W2) (H*Dh)
