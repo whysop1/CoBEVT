@@ -3,6 +3,8 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
+import math
+
 from torch import einsum
 from einops import rearrange, repeat, reduce
 from torchvision.models.resnet import Bottleneck
