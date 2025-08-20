@@ -226,7 +226,6 @@ class CrossWinAttention(nn.Module):
         k = rearrange(k, 'b n x y w1 w2 d -> b (x y) (n w1 w2) d')
         v = rearrange(v, 'b n x y w1 w2 d -> b (x y) (n w1 w2) d')
 
-
         # Project
         q = self.to_q(q)                                # b (X Y) (n W1 W2) (H*Dh)
         k = self.to_k(k)                                # b (X Y) (n w1 w2) (H*Dh)
@@ -261,8 +260,13 @@ class CrossWinAttention(nn.Module):
         # Combine values (image level features).
         a = torch.einsum('b n Q K, b n K d -> b n Q d', att, v)  # (b*H) (X Y) (n W1 W2) Dh
         a = rearrange(a, '(b h) L Q d -> b L Q (h d)', h=H, d=Dh)  # b (X Y) (n W1 W2) (H*Dh)
-        a = rearrange(a, ' b (x_y) (n_w1w2) d -> b n x y w1 w2 d',
-            x=q_height, y=q_width, w1=q_win_height, w2=q_win_width, n=view_size)
+
+        # ✅ FIX: 올바른 einops 패턴 (괄호 묶기)
+        a = rearrange(
+            a,
+            'b (x y) (n w1 w2) d -> b n x y w1 w2 d',
+            x=q_height, y=q_width, w1=q_win_height, w2=q_win_width, n=view_size
+        )
 
         # Combine multiple heads
         z = self.proj(a)
