@@ -1,3 +1,4 @@
+
 import sys
 import torch
 import torch.nn as nn
@@ -282,70 +283,6 @@ class CrossWinAttention(nn.Module):
         return z
 
 
-# ===========================
-# [DRRA] 게이트 모듈
-# ===========================
-class DRRAGate(nn.Module):
-    """
-    object_count -> density -> alpha, beta 게이트 (샘플별 스칼라).
-    초기화는 alpha~0.1, beta~0 부근으로 두어 '원래 모델'과 거의 같게 시작.
-    """
-    def __init__(self, init_alpha_bias: float = -2.0, init_beta_bias: float = -3.0, temp: float = 1.0, eps: float = 1e-6):
-        super().__init__()
-        # y = sigmoid(w*(x_norm) + b)
-        self.alpha_w = nn.Parameter(torch.tensor(1.0))
-        self.alpha_b = nn.Parameter(torch.tensor(init_alpha_bias))
-        self.beta_w  = nn.Parameter(torch.tensor(1.5))
-        self.beta_b  = nn.Parameter(torch.tensor(init_beta_bias))
-        self.temp = temp
-        self.eps = eps
-
-    @staticmethod
-    def _normalize_count(obj_cnt: torch.Tensor) -> torch.Tensor:
-        """
-        다양한 포맷의 object_count를 샘플별 합계 스칼라로 변환 후 [0,1] 근사 정규화.
-        허용:
-          - shape: [B] 또는 [B, C] 또는 [B, 1] (음수 없음 가정)
-        """
-        if obj_cnt is None:
-            return None
-        if obj_cnt.dim() == 1:
-            # [B]
-            s = obj_cnt
-        elif obj_cnt.dim() == 2:
-            # [B, C] -> 합
-            s = obj_cnt.sum(dim=1)
-        else:
-            # 기타 케이스: 마지막 차원들 합
-            s = obj_cnt.reshape(obj_cnt.shape[0], -1).sum(dim=1)
-        # robust scaling: x / (x.mean + x.std + eps)
-
-        s = s.float()
-        
-        mean = s.mean().clamp(min=1.0)
-        std  = s.std().clamp(min=1.0)
-        x = s / (mean + std + 1e-6)
-        # clip to [0, 2] -> then /2 to [0,1]
-        x = x.clamp(min=0.0, max=2.0) * 0.5
-        return x
-
-    def forward(self, object_count: Optional[torch.Tensor], device=None):
-        if object_count is None:
-            return None, None, None
-        x = self._normalize_count(object_count)  # [B]
-        if x is None:
-            return None, None, None
-        if device is not None:
-            x = x.to(device)
-        # temperature
-        x = x / max(self.temp, 1e-6)
-        alpha = torch.sigmoid(self.alpha_w * x + self.alpha_b)  # [B]
-        beta  = torch.sigmoid(self.beta_w  * x + self.beta_b)   # [B]
-        # 안전장치: 너무 큰 합 방지 (원한다면 α+β<=1 soft constraint)
-        # 여기서는 soft하게만 사용: 필요시 loss에서 패널티
-        return x, alpha, beta
-
-
 class CrossViewSwapAttention(nn.Module):
     def __init__(
         self,
@@ -366,10 +303,6 @@ class CrossViewSwapAttention(nn.Module):
         no_image_features: bool = False,
         skip: bool = True,
         norm=nn.LayerNorm,
-        # [DRRA] 게이트 하이퍼파라미터
-        drra_init_alpha_bias: float = -2.0,
-        drra_init_beta_bias: float = -3.0,
-        drra_temp: float = 1.0,
     ):
         super().__init__()
 
@@ -414,13 +347,6 @@ class CrossViewSwapAttention(nn.Module):
         self.mlp_2 = nn.Sequential(nn.Linear(dim, 2 * dim), nn.GELU(), nn.Linear(2 * dim, dim))
         self.postnorm = norm(dim)
 
-        # [DRRA] 게이트
-        self.drra_gate = DRRAGate(
-            init_alpha_bias=drra_init_alpha_bias,
-            init_beta_bias=drra_init_beta_bias,
-            temp=drra_temp
-        )
-
     def pad_divisble(self, x, win_h, win_w):
         """Pad the x to be divible by window size."""
         _, _, _, h, w = x.shape
@@ -429,7 +355,7 @@ class CrossViewSwapAttention(nn.Module):
         padw = w_pad - w if w % win_w != 0 else 0
         return F.pad(x, (0, padw, 0, padh), value=0)
 
-    
+   
     def forward(
         self,
         index: int,
@@ -449,21 +375,29 @@ class CrossViewSwapAttention(nn.Module):
         Returns: (b, d, H, W)
         """
 
-        # ---[DRRA] 게이트 계산 (샘플별 스칼라)---
-        # x.shape: b, d, H, W
-        B = x.shape[0]
-        _, alpha, beta = self.drra_gate(object_count, device=x.device)
-        if alpha is None:
-            # object_count가 없으면 원래 모델과 거의 동일하게 동작하도록 설정
-            alpha = torch.zeros(B, device=x.device)
-            beta  = torch.zeros(B, device=x.device)
-        # 브로드캐스트용 형태: [B,1,1,1] 또는 [B,1,1,d]가 필요에 따라 적용
-        alpha_spat = alpha.view(B, 1, 1, 1)
-        beta_spat  = beta.view(B, 1, 1, 1)
+        #디버깅
+        if object_count is not None:
+            print(">> object_count(crossviewswapattention):", object_count.shape, object_count) #각 인덱스가 특정 종류(차, 트럭, 보행자)의 객체 수임
+            value_1 = object_count[0].item()
+            value_2 = object_count[1].item()
+            value_3 = object_count[2].item()
+            value_4 = object_count[3].item()
+            value_5 = object_count[4].item()
+            value_6 = object_count[5].item()
+            value_7 = object_count[6].item()
+            value_8 = object_count[7].item()
+            print(f"Batch 0 object count: {value_1}")
+            print(f"Batch 1 object count: {value_2}")
+            print(f"Batch 2 object count: {value_3}")
+            print(f"Batch 3 object count: {value_4}")
+            print(f"Batch 4 object count: {value_5}")
+            print(f"Batch 5 object count: {value_6}")
+            print(f"Batch 6 object count: {value_7}")
+            print(f"Batch 7 object count: {value_8}")
+        else:
+            print(">> object_count(crossviewswapattention) is None")
 
-        #디버깅(원한다면)
-        # print(f">> DRRA alpha(mean)={alpha.mean().item():.3f}, beta(mean)={beta.mean().item():.3f}")
-
+       
         b, n, _, _, _ = feature.shape
         _, _, H, W = x.shape
 
@@ -522,59 +456,50 @@ class CrossViewSwapAttention(nn.Module):
         key = self.pad_divisble(key, self.feat_win_size[0], self.feat_win_size[1])
         val = self.pad_divisble(val, self.feat_win_size[0], self.feat_win_size[1])
 
-        # -------- local-to-local cross-attention (Expert: Local) --------
-        q_local = rearrange(query, 'b n d (x w1) (y w2) -> b n x y w1 w2 d',
+        # local-to-local cross-attention
+        query = rearrange(query, 'b n d (x w1) (y w2) -> b n x y w1 w2 d',
                           w1=self.q_win_size[0], w2=self.q_win_size[1])  # window partition
-        k_local = rearrange(key, 'b n d (x w1) (y w2) -> b n x y w1 w2 d',
+        key = rearrange(key, 'b n d (x w1) (y w2) -> b n x y w1 w2 d',
                           w1=self.feat_win_size[0], w2=self.feat_win_size[1])  # window partition
-        v_local = rearrange(val, 'b n d (x w1) (y w2) -> b n x y w1 w2 d',
+        val = rearrange(val, 'b n d (x w1) (y w2) -> b n x y w1 w2 d',
                           w1=self.feat_win_size[0], w2=self.feat_win_size[1])  # window partition
-        local_out = self.cross_win_attend_1(
-            q_local, k_local, v_local,
-            skip=rearrange(x,
-                           'b d (x w1) (y w2) -> b x y w1 w2 d',
-                           w1=self.q_win_size[0], w2=self.q_win_size[1]) if self.skip else None
-        )
-        local_out = rearrange(local_out, 'b x y w1 w2 d  -> b (x w1) (y w2) d')
-        local_out = local_out + self.mlp_1(self.prenorm_1(local_out))  # b H W d
+        query = rearrange(self.cross_win_attend_1(query, key, val,
+                                                skip=rearrange(x,
+                                                            'b d (x w1) (y w2) -> b x y w1 w2 d',
+                                                             w1=self.q_win_size[0], w2=self.q_win_size[1]) if self.skip else None),
+                       'b x y w1 w2 d  -> b (x w1) (y w2) d')    # reverse window to feature
 
-        # -------- 준비: global cross-attention (Expert: Global) --------
-        x_skip = local_out
-        query_g = repeat(local_out, 'b x y d -> b n x y d', n=n)              # b n x y d
+        query = query + self.mlp_1(self.prenorm_1(query))
 
-        q_global = rearrange(query_g, 'b n (x w1) (y w2) d -> b n x y w1 w2 d',
+        x_skip = query
+        query = repeat(query, 'b x y d -> b n x y d', n=n)              # b n x y d
+
+        # local-to-global cross-attention
+        query = rearrange(query, 'b n (x w1) (y w2) d -> b n x y w1 w2 d',
                           w1=self.q_win_size[0], w2=self.q_win_size[1])  # window partition
-        k_global = rearrange(k_local, 'b n x y w1 w2 d -> b n (x w1) (y w2) d')  # reverse window to feature
-        k_global = rearrange(k_global, 'b n (w1 x) (w2 y) d -> b n x y w1 w2 d',
+        key = rearrange(key, 'b n x y w1 w2 d -> b n (x w1) (y w2) d')  # reverse window to feature
+        key = rearrange(key, 'b n (w1 x) (w2 y) d -> b n x y w1 w2 d',
                         w1=self.feat_win_size[0], w2=self.feat_win_size[1])  # grid partition
-        v_global = rearrange(v_local, 'b n x y w1 w2 d -> b n (x w1) (y w2) d')  # reverse window to feature
-        v_global = rearrange(v_global, 'b n (w1 x) (w2 y) d -> b n x y w1 w2 d',
+        val = rearrange(val, 'b n x y w1 w2 d -> b n (x w1) (y w2) d')  # reverse window to feature
+        val = rearrange(val, 'b n (w1 x) (w2 y) d -> b n x y w1 w2 d',
                         w1=self.feat_win_size[0], w2=self.feat_win_size[1])  # grid partition
+        query = rearrange(self.cross_win_attend_2(query,
+                                                  key,
+                                                  val,
+                                                  skip=rearrange(x_skip,
+                                                            'b (x w1) (y w2) d -> b x y w1 w2 d',
+                                                            w1=self.q_win_size[0],
+                                                            w2=self.q_win_size[1])
+                                                  if self.skip else None),
+                       'b x y w1 w2 d  -> b (x w1) (y w2) d')  # reverse grid to feature
 
-        global_out = self.cross_win_attend_2(
-            q_global, k_global, v_global,
-            skip=rearrange(x_skip,
-                           'b (x w1) (y w2) d -> b x y w1 w2 d',
-                           w1=self.q_win_size[0], w2=self.q_win_size[1]) if self.skip else None
-        )
-        global_out = rearrange(global_out, 'b x y w1 w2 d  -> b (x w1) (y w2) d')
-        global_out = global_out + self.mlp_2(self.prenorm_2(global_out))  # b H W d
+        query = query + self.mlp_2(self.prenorm_2(query))
 
-        # -------- [DRRA] α·Local + β·Global (원래 모델 포함) --------
-        # 최종 결합 전에 스칼라 게이트를 공간에 브로드캐스트해 적용
-        # local/global은 둘 다 (b, H, W, d) 형태
-        # residual은 아래 postnorm 전에 함께 적용되도록 합치거나, 그대로 유지 가능
-        combined = alpha_spat * local_out + beta_spat * global_out  # b H W d
+        query = self.postnorm(query)
 
-        combined = self.postnorm(combined)
-        combined = rearrange(combined, 'b H W d -> b d H W')
+        query = rearrange(query, 'b H W d -> b d H W')
 
-        # 최종 출력: 원래 잔차 형태를 보존하고 싶다면 x도 더할 수 있음
-        # 다만 위의 CrossWinAttention 내부에서 skip 잔차를 이미 사용하므로 이중 잔차가 과할 수 있어
-        # 기본은 생략. 필요 시 아래 라인 주석 해제:
-        # combined = combined + x
-
-        return combined
+        return query
 
 
 
@@ -589,7 +514,7 @@ class CrossViewSwapAttention(nn.Module):
 
 
 
-    
+   
 
 
 
@@ -611,10 +536,6 @@ class PyramidAxialEncoder(nn.Module):
             dim: list,
             middle: List[int] = [2, 2],
             scale: float = 1.0,
-            # [DRRA] 게이트 초기값/템프 설정을 상위에서 넘길 수 있도록 옵션 추가
-            drra_init_alpha_bias: float = -2.0,
-            drra_init_beta_bias: float = -3.0,
-            drra_temp: float = 1.0,
     ):
         super().__init__()
 
@@ -635,14 +556,7 @@ class PyramidAxialEncoder(nn.Module):
         for i, (feat_shape, num_layers) in enumerate(zip(self.backbone.output_shapes, middle)):
             _, feat_dim, feat_height, feat_width = self.down(torch.zeros(feat_shape)).shape
 
-            # [DRRA] CrossViewSwapAttention에 게이트 하이퍼 전달
-            cva = CrossViewSwapAttention(
-                feat_height, feat_width, feat_dim, dim[i], i,
-                drra_init_alpha_bias=drra_init_alpha_bias,
-                drra_init_beta_bias=drra_init_beta_bias,
-                drra_temp=drra_temp,
-                **cross_view, **cross_view_swap
-            )
+            cva = CrossViewSwapAttention(feat_height, feat_width, feat_dim, dim[i], i, **cross_view, **cross_view_swap)
             cross_views.append(cva)
 
             layer = nn.Sequential(*[ResNetBottleNeck(dim[i]) for _ in range(num_layers)])
@@ -670,9 +584,6 @@ class PyramidAxialEncoder(nn.Module):
         self.downsample_layers = nn.ModuleList(downsample_layers)
         # self.self_attn = Attention(dim[-1], **self_attn)
 
-        # [DRRA] FLOPs-aware 정규화를 선택적으로 사용할 때를 위한 flag/weight (필요 시 학습 루프에서 사용)
-        self.drra_reg_weight = 0.0  # 외부 config에서 세팅 가능
-
     def forward(self, batch):
         b, n, _, _, _ = batch['image'].shape
 
@@ -680,9 +591,15 @@ class PyramidAxialEncoder(nn.Module):
         I_inv = batch['intrinsics'].inverse()           # b n 3 3
         E_inv = batch['extrinsics'].inverse()           # b n 4 4
 
-        # ✅ object_count 가져오기 (형태 유연 대응: [B], [B,C], [B,1] 등)
+        # ✅ 여기서 object_count 가져오기
         object_count = batch.get('object_count', None)
 
+        #디버깅
+        if object_count is not None:
+            print(">> object_count(pyramid axial encoder):", object_count.shape, object_count) #각 인덱스가 특정 종류(차, 트럭, 보행자)의 객체 수임
+        else:
+            print(">> object_count(pyramid axial encoder) is None")
+       
         features = [self.down(y) for y in self.backbone(self.norm(image))]
 
         x = self.bev_embedding.get_prior()              # d H W
@@ -743,6 +660,21 @@ if __name__ == "__main__":
     output = block(test_q, test_k, test_v)
     print(output.shape)
 
+    # block = CrossViewSwapAttention(
+    #     feat_height=28,
+    #     feat_width=60,
+    #     feat_dim=128,
+    #     dim=128,
+    #     index=0,
+    #     image_height=25,
+    #     image_width=25,
+    #     qkv_bias=True,
+    #     q_win_size=[5, 5],
+    #     feat_win_size=[6, 12],
+    #     heads=[4,],
+    #     dim_head=[32,],
+    #     qkv_bias=True,)
+
     image = torch.rand(1, 6, 128, 28, 60)            # b n c h w
     I_inv = torch.rand(1, 6, 3, 3)           # b n 3 3
     E_inv = torch.rand(1, 6, 4, 4)           # b n 4 4
@@ -751,16 +683,19 @@ if __name__ == "__main__":
 
     x = torch.rand(1, 128, 25, 25)                     # b d H W
 
-    # 예시 config 로드
-    # params = load_yaml('config/model/cvt_pyramid_swap.yaml')
-    # print(params)
+    # output = block(0, x, self.bev_embedding, feature, I_inv, E_inv)
+    block.cuda()
+
+    ##### EncoderSwap
+    params = load_yaml('config/model/cvt_pyramid_swap.yaml')
+
+    print(params)
 
     batch = {}
     batch['image'] = image
     batch['intrinsics'] = I_inv
     batch['extrinsics'] = E_inv
-    # batch['object_count'] = torch.tensor([10])  # 예: 배치사이즈=1일 때
 
-    # 여기서 encoder 초기화/호출 예시는 실제 프로젝트 구조에 맞춰 별도 파일에서 수행하세요.
-    # out = encoder(batch)
-    # print(out.shape)
+    out = encoder(batch)
+
+    print(out.shape)
