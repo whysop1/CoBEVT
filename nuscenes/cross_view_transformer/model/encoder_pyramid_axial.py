@@ -357,7 +357,6 @@ class CrossViewSwapAttention(nn.Module):
         padw = w_pad - w if w % win_w != 0 else 0
         return F.pad(x, (0, padw, 0, padh), value=0)
 
-    # ---------------- ABR utilities ----------------
     @staticmethod
     def _normalize_count(obj_cnt: Optional[torch.Tensor]) -> Optional[torch.Tensor]:
         """accepts [B] (int/long ok) -> float [B] scaled to ~[0,1]"""
@@ -368,12 +367,17 @@ class CrossViewSwapAttention(nn.Module):
         else:
             s = obj_cnt
         s = s.to(torch.float32)
-        # robust scaling: x / (mean + std + eps)
+
+        if torch.isnan(s).any():
+            print("[Warning] NaN detected in object_count before normalization")
+            s = torch.nan_to_num(s, nan=0.0)  # Replace NaNs with 0
+
         mean = s.mean().clamp(min=1.0)
         std  = s.std().clamp(min=1.0)
         x = s / (mean + std + 1e-6)
         x = x.clamp(0.0, 2.0) * 0.5  # ~[0,1]
         return x
+
 
     def _abr_head_gates(self, object_count: Optional[torch.Tensor], device, heads: int):
         """
@@ -386,11 +390,16 @@ class CrossViewSwapAttention(nn.Module):
             frac_local = 0.5
         else:
             cnt = self._normalize_count(object_count)  # [B] in ~[0,1]
-            # use batch mean to keep tensor shapes uniform across batch
             c = float(cnt.mean().item())
-            # map c in [0,1] to [abr_min_frac, abr_max_frac] with mild slope
-            base = 0.5 + (c - 0.5) * (2 * self.abr_sharpness)  # around 0.5
-            frac_local = float(torch.tensor(base).clamp(self.abr_min_frac, self.abr_max_frac).item())
+
+            # NaN 방지 처리
+            if math.isnan(c):
+                print("[Warning] object_count normalization produced NaN. Using default 0.5.")
+                frac_local = 0.5
+            else:
+                # map c in [0,1] to [abr_min_frac, abr_max_frac] with mild slope
+                base = 0.5 + (c - 0.5) * (2 * self.abr_sharpness)
+                frac_local = float(torch.tensor(base).clamp(self.abr_min_frac, self.abr_max_frac).item())
 
         # local gets frac_local, global gets (1 - frac_local)
         h_local  = max(1, int(round(frac_local * H)))
@@ -406,6 +415,7 @@ class CrossViewSwapAttention(nn.Module):
         gate_local  = gate_local * (H / gate_local.sum().clamp(min=1.0))
         gate_global = gate_global * (H / gate_global.sum().clamp(min=1.0))
         return gate_local, gate_global, h_local, h_global
+
 
     # ---------------- forward ----------------
     def forward(
