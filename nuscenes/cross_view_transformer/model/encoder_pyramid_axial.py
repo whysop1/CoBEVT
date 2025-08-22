@@ -236,37 +236,43 @@ class CrossWinAttention(nn.Module):
 
 
 class CrossViewSwapAttention(nn.Module):
+    """
+    CrossViewSwapAttention with:
+      - original cross-window attentions (unchanged)
+      - MoE experts applied as an adapter on the BEV query output (lightweight conv experts)
+      - Safe Residual Adapter (SRA): convex blend between base output and expert output using alpha(object_count)
+    """
     def __init__(
-            self,
-            feat_height: int,
-            feat_width: int,
-            feat_dim: int,
-            dim: int,
-            index: int,
-            image_height: int,
-            image_width: int,
-            qkv_bias: bool,
-            q_win_size: list,
-            feat_win_size: list,
-            heads: list,
-            dim_head: list,
-            bev_embedding_flag: list,
-            rel_pos_emb: bool = False,  # to-do
-            no_image_features: bool = False,
-            skip: bool = True,
-            norm=nn.LayerNorm,
-            # SRA (Safe Residual Adapter) params
-            alpha_cap: float = 0.5,
-            alpha_k: float = 0.2,
-            alpha_c0: float = 16.0,
+        self,
+        feat_height: int,
+        feat_width: int,
+        feat_dim: int,
+        dim: int,
+        index: int,
+        image_height: int,
+        image_width: int,
+        qkv_bias: bool,
+        q_win_size: list,
+        feat_win_size: list,
+        heads: list,
+        dim_head: list,
+        bev_embedding_flag: list,
+        rel_pos_emb: bool = False,  # to-do
+        no_image_features: bool = False,
+        skip: bool = True,
+        norm=nn.LayerNorm,
+        # MoE / SRA params
+        num_experts: int = 4,
+        expert_hidden: int = None,
+        alpha_cap: float = 0.5,
+        alpha_k: float = 0.2,
+        alpha_c0: float = 16.0,
     ):
         super().__init__()
 
-        # 1 1 3 h w
         image_plane = generate_grid(feat_height, feat_width)[None]
         image_plane[:, :, 0] *= image_width
         image_plane[:, :, 1] *= image_height
-
         self.register_buffer('image_plane', image_plane, persistent=False)
 
         self.feature_linear = nn.Sequential(
@@ -292,6 +298,7 @@ class CrossViewSwapAttention(nn.Module):
         self.feat_win_size = feat_win_size[index]
         self.rel_pos_emb = rel_pos_emb
 
+        # original attention blocks
         self.cross_win_attend_1 = CrossWinAttention(dim, heads[index], dim_head[index], qkv_bias)
         self.cross_win_attend_2 = CrossWinAttention(dim, heads[index], dim_head[index], qkv_bias)
         self.skip = skip
@@ -302,24 +309,39 @@ class CrossViewSwapAttention(nn.Module):
         self.mlp_2 = nn.Sequential(nn.Linear(dim, 2 * dim), nn.GELU(), nn.Linear(2 * dim, dim))
         self.postnorm = norm(dim)
 
-        # --- Safe Residual Adapter (SRA) ---
-        # lightweight adapter conv block (small compute, stable)
-        self.adapter = nn.Sequential(
-            nn.Conv2d(dim, max(dim // 2, 1), kernel_size=3, padding=1, bias=False),
-            nn.BatchNorm2d(max(dim // 2, 1)),
-            nn.GELU(),
-            nn.Conv2d(max(dim // 2, 1), dim, kernel_size=1, padding=0, bias=False),
-            nn.BatchNorm2d(dim),
-            nn.GELU()
+        # ---------------- MoE experts (lightweight conv adapters) ----------------
+        self.num_experts = int(num_experts)
+        if expert_hidden is None:
+            expert_hidden = max(dim // 2, 1)
+        else:
+            expert_hidden = max(1, int(expert_hidden))
+
+        experts = []
+        for _ in range(self.num_experts):
+            experts.append(nn.Sequential(
+                nn.Conv2d(dim, expert_hidden, kernel_size=3, padding=1, bias=False),
+                nn.BatchNorm2d(expert_hidden),
+                nn.GELU(),
+                nn.Conv2d(expert_hidden, dim, kernel_size=1, padding=0, bias=False),
+                nn.BatchNorm2d(dim),
+                nn.GELU()
+            ))
+        self.experts = nn.ModuleList(experts)
+
+        # gating network: maps per-sample scalar (from object_count or pooled features) -> soft weights over experts
+        # Implementation: two-layer MLP operating on scalar feature (or pooled representation)
+        self.gate_mlp = nn.Sequential(
+            nn.Linear(1, 16),
+            nn.ReLU(),
+            nn.Linear(16, self.num_experts)
         )
 
-        # parameters controlling alpha = alpha_cap * sigmoid(alpha_k * (max_count - alpha_c0))
+        # parameters for alpha scheduling (for SRA convex blend)
         self.alpha_cap = float(alpha_cap)
         self.alpha_k = float(alpha_k)
         self.alpha_c0 = float(alpha_c0)
 
     def pad_divisble(self, x, win_h, win_w):
-        """Pad the x to be divible by window size."""
         _, _, _, h, w = x.shape
         h_pad, w_pad = ((h + win_h) // win_h) * win_h, ((w + win_w) // win_w) * win_w
         padh = h_pad - h if h % win_h != 0 else 0
@@ -328,51 +350,82 @@ class CrossViewSwapAttention(nn.Module):
 
     def _alpha_from_count(self, object_count: Optional[torch.Tensor], device: torch.device):
         """
-        Compute an alpha scalar in [0, alpha_cap] monotonically increasing with max(object_count).
-        Uses a sigmoid-shaped schedule centered at alpha_c0 with slope alpha_k.
-        If object_count is None -> return 0.0 (safe: no adapter).
+        Compute scalar alpha in [0, alpha_cap] based on object_count.
+        If object_count is None -> return 0.
         """
         if object_count is None:
             return torch.tensor(0.0, device=device, dtype=torch.float32)
-        # take max across batch to keep vectorization simple and conservative
         try:
-            max_count = float(object_count.max().item())
+            # object_count may be (b,) or (b, C). We convert to per-sample scalar: sum across last dim if needed.
+            if object_count.dim() == 1:
+                counts = object_count.float()
+            else:
+                counts = object_count.float().sum(dim=-1)
+            # use max across batch to be conservative (same as earlier design)
+            max_count = float(counts.max().item())
         except Exception:
-            # fallback: if object_count weird, return zero
             return torch.tensor(0.0, device=device, dtype=torch.float32)
         x = self.alpha_k * (max_count - self.alpha_c0)
-        # use math.exp since x is a float (avoids torch.exp on float)
         sigmoid = 1.0 / (1.0 + math.exp(-x))
         alpha = self.alpha_cap * sigmoid
         return torch.tensor(alpha, device=device, dtype=torch.float32)
 
+    def _gating_weights(self, object_count: Optional[torch.Tensor], pooled_feat: Optional[torch.Tensor] = None):
+        """
+        Return gating weights of shape (b, num_experts).
+        Priority: use object_count per-sample scalar -> MLP -> softmax.
+        If object_count is None but pooled_feat provided, use pooled_feat (b,1) input.
+        If both None, return uniform weights but zeroed by alpha later (safe).
+        """
+        device = next(self.parameters()).device
+        if object_count is not None:
+            # per-sample scalar: if object_count is (b,) or (b,C)
+            if object_count.dim() == 1:
+                scalars = object_count.float().unsqueeze(-1)  # b,1
+            else:
+                scalars = object_count.float().sum(dim=-1, keepdim=True)  # b,1
+            scalars = scalars.to(device)
+            logits = self.gate_mlp(scalars)  # b, E
+            weights = torch.softmax(logits, dim=-1)  # b, E
+            return weights
+        elif pooled_feat is not None:
+            scalars = pooled_feat.view(pooled_feat.shape[0], 1).to(device)
+            logits = self.gate_mlp(scalars)
+            weights = torch.softmax(logits, dim=-1)
+            return weights
+        else:
+            # uniform
+            b = 1
+            try:
+                # try infer batch size from gate_mlp param? fallback to 1
+                b = 1
+            except Exception:
+                b = 1
+            return torch.ones(b, self.num_experts, device=device) / float(self.num_experts)
+
     def forward(
-            self,
-            index: int,
-            x: torch.FloatTensor,
-            bev: BEVEmbedding,
-            feature: torch.FloatTensor,
-            I_inv: torch.FloatTensor,
-            E_inv: torch.FloatTensor,
-            object_count: Optional[torch.Tensor] = None,  # object_count
+        self,
+        index: int,
+        x: torch.FloatTensor,
+        bev: BEVEmbedding,
+        feature: torch.FloatTensor,
+        I_inv: torch.FloatTensor,
+        E_inv: torch.FloatTensor,
+        object_count: Optional[torch.Tensor] = None,
     ):
         """
-        x: (b, c, H, W)
+        x: (b, d, H, W)
         feature: (b, n, dim_in, h, w)
         I_inv: (b, n, 3, 3)
         E_inv: (b, n, 4, 4)
 
         Returns: (b, d, H, W)
         """
-
-        # --- debug prints (optional) ---
-        if object_count is not None:
-            try:
-                print(">> object_count(crossviewswapattention):", object_count.shape, object_count)
-            except Exception:
-                pass
-        else:
-            print(">> object_count(crossviewswapattention) is None")
+        # Optional debug (comment out to reduce logs)
+        # if object_count is not None:
+        #     print(">> object_count(crossviewswapattention):", object_count.shape, object_count)
+        # else:
+        #     print(">> object_count(crossviewswapattention) is None")
 
         b, n, _, _, _ = feature.shape
         _, _, H, W = x.shape
@@ -421,7 +474,6 @@ class CrossViewSwapAttention(nn.Module):
 
         val_flat = self.feature_linear(feature_flat)  # (b n) d h w
 
-        # Expand + refine the BEV embedding
         if self.bev_embed_flag:
             query = query_pos + x[:, None]
         else:
@@ -429,7 +481,6 @@ class CrossViewSwapAttention(nn.Module):
         key = rearrange(key_flat, '(b n) ... -> b n ...', b=b, n=n)  # b n d h w
         val = rearrange(val_flat, '(b n) ... -> b n ...', b=b, n=n)  # b n d h w
 
-        # pad divisible
         key = self.pad_divisble(key, self.feat_win_size[0], self.feat_win_size[1])
         val = self.pad_divisble(val, self.feat_win_size[0], self.feat_win_size[1])
 
@@ -437,16 +488,16 @@ class CrossViewSwapAttention(nn.Module):
         # local-to-local cross-attention
         # -------------------------
         query = rearrange(query, 'b n d (x w1) (y w2) -> b n x y w1 w2 d',
-                          w1=self.q_win_size[0], w2=self.q_win_size[1])  # window partition
-        key = rearrange(key, 'b n d (x w1) (y w2) -> b n x y w1 w2 d',
-                        w1=self.feat_win_size[0], w2=self.feat_win_size[1])
-        val = rearrange(val, 'b n d (x w1) (y w2) -> b n x y w1 w2 d',
-                        w1=self.feat_win_size[0], w2=self.feat_win_size[1])
+                          w1=self.q_win_size[0], w2=self.q_win_size[1])
+        key = rearrange(key,   'b n d (x w1) (y w2) -> b n x y w1 w2 d',
+                          w1=self.feat_win_size[0], w2=self.feat_win_size[1])
+        val = rearrange(val,   'b n d (x w1) (y w2) -> b n x y w1 w2 d',
+                          w1=self.feat_win_size[0], w2=self.feat_win_size[1])
         query = rearrange(self.cross_win_attend_1(query, key, val,
                                                   skip=rearrange(x,
                                                                  'b d (x w1) (y w2) -> b x y w1 w2 d',
                                                                  w1=self.q_win_size[0], w2=self.q_win_size[1]) if self.skip else None),
-                          'b x y w1 w2 d  -> b (x w1) (y w2) d')    # reverse window to feature
+                          'b x y w1 w2 d  -> b (x w1) (y w2) d')
 
         query = query + self.mlp_1(self.prenorm_1(query))
 
@@ -457,13 +508,13 @@ class CrossViewSwapAttention(nn.Module):
         # local-to-global cross-attention
         # -------------------------
         query = rearrange(query, 'b n (x w1) (y w2) d -> b n x y w1 w2 d',
-                          w1=self.q_win_size[0], w2=self.q_win_size[1])  # window partition
-        key = rearrange(key, 'b n x y w1 w2 d -> b n (x w1) (y w2) d')  # reverse window to feature
+                          w1=self.q_win_size[0], w2=self.q_win_size[1])
+        key = rearrange(key, 'b n x y w1 w2 d -> b n (x w1) (y w2) d')
         key = rearrange(key, 'b n (w1 x) (w2 y) d -> b n x y w1 w2 d',
-                        w1=self.feat_win_size[0], w2=self.feat_win_size[1])  # grid partition
-        val = rearrange(val, 'b n x y w1 w2 d -> b n (x w1) (y w2) d')  # reverse window to feature
+                        w1=self.feat_win_size[0], w2=self.feat_win_size[1])
+        val = rearrange(val, 'b n x y w1 w2 d -> b n (x w1) (y w2) d')
         val = rearrange(val, 'b n (w1 x) (w2 y) d -> b n x y w1 w2 d',
-                        w1=self.feat_win_size[0], w2=self.feat_win_size[1])  # grid partition
+                        w1=self.feat_win_size[0], w2=self.feat_win_size[1])
         query = rearrange(self.cross_win_attend_2(query,
                                                   key,
                                                   val,
@@ -472,7 +523,7 @@ class CrossViewSwapAttention(nn.Module):
                                                                  w1=self.q_win_size[0],
                                                                  w2=self.q_win_size[1])
                                                   if self.skip else None),
-                          'b x y w1 w2 d  -> b (x w1) (y w2) d')  # reverse grid to feature
+                          'b x y w1 w2 d  -> b (x w1) (y w2) d')
 
         query = query + self.mlp_2(self.prenorm_2(query))
         query = self.postnorm(query)
@@ -481,19 +532,44 @@ class CrossViewSwapAttention(nn.Module):
         query = rearrange(query, 'b H W d -> b d H W')
 
         # -------------------------
-        # Safe Residual Adapter (SRA): compute p_base and p_adapt, blend with alpha
+        # MoE + SRA adapter
         # -------------------------
         p_base = query  # (b, d, H, W)
 
-        # Lightweight adapter path: apply adapter conv on p_base
-        p_adapt = self.adapter(p_base)  # (b, d, H, W)
-
-        # Compute scalar alpha for this batch (device-aware)
+        # compute alpha
         alpha = self._alpha_from_count(object_count, device=p_base.device)  # scalar tensor
         alpha_ = alpha.view(1, 1, 1, 1)
 
-        # Blend safely: convex combination
-        p_out = (1.0 - alpha_) * p_base + alpha_ * p_adapt
+        if alpha.item() <= 0.0:
+            # safe path: no adapter effect
+            return p_base
+
+        # prepare gating weights per sample (b, E)
+        # prefer using object_count per-sample if available
+        device = p_base.device
+        if object_count is not None:
+            if object_count.dim() == 1:
+                scalars = object_count.float().unsqueeze(-1).to(device)
+            else:
+                scalars = object_count.float().sum(dim=-1, keepdim=True).to(device)
+            gates_logits = self.gate_mlp(scalars)  # b, E
+            gates = torch.softmax(gates_logits, dim=-1)  # b, E
+        else:
+            # fallback: uniform gating
+            gates = torch.ones(p_base.shape[0], self.num_experts, device=device) / float(self.num_experts)
+
+        # compute expert outputs: stack over experts -> (b, E, d, H, W)
+        expert_outs = []
+        for expert in self.experts:
+            expert_outs.append(expert(p_base))  # each returns (b,d,H,W)
+        expert_outs = torch.stack(expert_outs, dim=1)  # b E d H W
+
+        # weighted sum by gating per sample
+        gates = gates.view(p_base.shape[0], self.num_experts, 1, 1, 1)  # b E 1 1 1
+        adapter_out = (expert_outs * gates).sum(dim=1)  # b d H W
+
+        # final safe blend
+        p_out = (1.0 - alpha_) * p_base + alpha_ * adapter_out
 
         return p_out
 
@@ -564,14 +640,13 @@ class PyramidAxialEncoder(nn.Module):
         I_inv = batch['intrinsics'].inverse()           # b n 3 3
         E_inv = batch['extrinsics'].inverse()           # b n 4 4
 
-        # ✅ 여기서 object_count 가져오기
         object_count = batch.get('object_count', None)
 
-        #디버깅(원하면 주석처리)
-        if object_count is not None:
-            print(">> object_count(pyramid axial encoder):", object_count.shape, object_count) #각 인덱스가 특정 종류(차, 트럭, 보행자)의 객체 수임
-        else:
-            print(">> object_count(pyramid axial encoder) is None")
+        # optional debug
+        # if object_count is not None:
+        #     print(">> object_count(pyramid axial encoder):", object_count.shape, object_count)
+        # else:
+        #     print(">> object_count(pyramid axial encoder) is None")
 
         features = [self.down(y) for y in self.backbone(self.norm(image))]
 
@@ -594,9 +669,6 @@ class PyramidAxialEncoder(nn.Module):
 
 
 if __name__ == "__main__":
-    # quick smoke test
-    block = CrossWinAttention(dim=128,
-                              heads=4,
-                              dim_head=32,
-                              qkv_bias=True,)
+    # quick smoke test for module import & shapes (doesn't run full training)
+    block = CrossWinAttention(dim=128, heads=4, dim_head=32, qkv_bias=True)
     print("Module loaded.")
