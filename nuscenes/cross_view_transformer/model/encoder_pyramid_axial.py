@@ -328,7 +328,7 @@ class PyramidAxialEncoder(nn.Module):
             cross_view: dict,
             cross_view_swap: dict,
             bev_embedding: dict,
-            self_attn: dict, # ERROR FIX: Changed 'self_attn_deformable' back to 'self_attn' to match config file
+            self_attn: dict,
             dim: list,
             middle: List[int] = (2, 2),
             scale: float = 1.0,
@@ -366,10 +366,27 @@ class PyramidAxialEncoder(nn.Module):
         self.cross_views = nn.ModuleList(cross_views)
         self.layers = nn.ModuleList(layers)
         self.downsample_layers = nn.ModuleList(downsample_layers)
+        
+        # ======================================================================================
+        # ERROR FIX: Create a compatible config for MSDeformAttn from the existing self_attn config
+        # ======================================================================================
+        deformable_attn_config = {
+            'n_levels': self_attn.get('n_levels', 1),
+            'n_points': self_attn.get('n_points', 4)
+        }
 
-        # Deformable Self-Attention for BEV Feature Refinement
-        # ERROR FIX: Using 'self_attn' dictionary from the config to initialize the module
-        self.self_attn_deformable = MSDeformAttn(d_model=dim[-1], **self_attn)
+        # Calculate n_heads from dim_head if provided, to maintain compatibility
+        if 'dim_head' in self_attn:
+            assert dim[-1] % self_attn['dim_head'] == 0, "dim must be divisible by dim_head"
+            deformable_attn_config['n_heads'] = dim[-1] // self_attn['dim_head']
+        elif 'n_heads' in self_attn:
+             deformable_attn_config['n_heads'] = self_attn['n_heads']
+        else:
+            # Provide a fallback default if neither dim_head nor n_heads is in the config
+            deformable_attn_config['n_heads'] = 8 
+
+        self.self_attn_deformable = MSDeformAttn(d_model=dim[-1], **deformable_attn_config)
+        # ======================================================================================
 
     def get_reference_points(self, spatial_shapes, device):
         reference_points_list = []
