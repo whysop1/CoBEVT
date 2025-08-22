@@ -1,4 +1,5 @@
 import sys
+import math
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -294,7 +295,6 @@ class CrossViewSwapAttention(nn.Module):
         self.cross_win_attend_1 = CrossWinAttention(dim, heads[index], dim_head[index], qkv_bias)
         self.cross_win_attend_2 = CrossWinAttention(dim, heads[index], dim_head[index], qkv_bias)
         self.skip = skip
-        # self.proj = nn.Linear(2 * dim, dim)
 
         self.prenorm_1 = norm(dim)
         self.prenorm_2 = norm(dim)
@@ -305,10 +305,10 @@ class CrossViewSwapAttention(nn.Module):
         # --- Safe Residual Adapter (SRA) ---
         # lightweight adapter conv block (small compute, stable)
         self.adapter = nn.Sequential(
-            nn.Conv2d(dim, dim // 2, kernel_size=3, padding=1, bias=False),
-            nn.BatchNorm2d(dim // 2),
+            nn.Conv2d(dim, max(dim // 2, 1), kernel_size=3, padding=1, bias=False),
+            nn.BatchNorm2d(max(dim // 2, 1)),
             nn.GELU(),
-            nn.Conv2d(dim // 2, dim, kernel_size=1, padding=0, bias=False),
+            nn.Conv2d(max(dim // 2, 1), dim, kernel_size=1, padding=0, bias=False),
             nn.BatchNorm2d(dim),
             nn.GELU()
         )
@@ -335,9 +335,15 @@ class CrossViewSwapAttention(nn.Module):
         if object_count is None:
             return torch.tensor(0.0, device=device, dtype=torch.float32)
         # take max across batch to keep vectorization simple and conservative
-        max_count = float(object_count.max().item())
+        try:
+            max_count = float(object_count.max().item())
+        except Exception:
+            # fallback: if object_count weird, return zero
+            return torch.tensor(0.0, device=device, dtype=torch.float32)
         x = self.alpha_k * (max_count - self.alpha_c0)
-        alpha = self.alpha_cap * float(1.0 / (1.0 + float(torch.exp(-x))))
+        # use math.exp since x is a float (avoids torch.exp on float)
+        sigmoid = 1.0 / (1.0 + math.exp(-x))
+        alpha = self.alpha_cap * sigmoid
         return torch.tensor(alpha, device=device, dtype=torch.float32)
 
     def forward(
@@ -362,7 +368,6 @@ class CrossViewSwapAttention(nn.Module):
         # --- debug prints (optional) ---
         if object_count is not None:
             try:
-                # print a compact summary (avoid huge logging)
                 print(">> object_count(crossviewswapattention):", object_count.shape, object_count)
             except Exception:
                 pass
@@ -399,7 +404,6 @@ class CrossViewSwapAttention(nn.Module):
         elif index == 3:
             world = bev.grid3[:2]
         else:
-            # fallback if more levels exist
             world = bev.grid0[:2]
 
         if self.bev_embed_flag:
@@ -482,18 +486,15 @@ class CrossViewSwapAttention(nn.Module):
         p_base = query  # (b, d, H, W)
 
         # Lightweight adapter path: apply adapter conv on p_base
-        # Adapter expects (b, d, H, W)
         p_adapt = self.adapter(p_base)  # (b, d, H, W)
 
         # Compute scalar alpha for this batch (device-aware)
         alpha = self._alpha_from_count(object_count, device=p_base.device)  # scalar tensor
-        # Make sure alpha is broadcastable
         alpha_ = alpha.view(1, 1, 1, 1)
 
         # Blend safely: convex combination
         p_out = (1.0 - alpha_) * p_base + alpha_ * p_adapt
 
-        # (Optional) keep skip semantics: original code earlier added skip to cross attn inside.
         return p_out
 
 
@@ -568,7 +569,7 @@ class PyramidAxialEncoder(nn.Module):
 
         #디버깅(원하면 주석처리)
         if object_count is not None:
-            print(">> object_count(pyramid axial encoder):", object_count.shape, object_count)  # 각 인덱스가 특정 종류의 객체 수임
+            print(">> object_count(pyramid axial encoder):", object_count.shape, object_count) #각 인덱스가 특정 종류(차, 트럭, 보행자)의 객체 수임
         else:
             print(">> object_count(pyramid axial encoder) is None")
 
@@ -583,7 +584,7 @@ class PyramidAxialEncoder(nn.Module):
 
             x = cross_view(i, x, self.bev_embedding, feature, I_inv, E_inv, object_count)
             x = layer(x)
-            if i < len(features) - 1:
+            if i < len(features)-1:
                 down_sample_block = self.downsample_layers[i]
                 x = down_sample_block(x)
 
@@ -598,9 +599,4 @@ if __name__ == "__main__":
                               heads=4,
                               dim_head=32,
                               qkv_bias=True,)
-    # create fake batch-sized inputs to test basic forward shapes (not full training)
-    test_q = torch.rand(1, 6, 5, 5, 5, 5, 128)
-    test_k = test_v = torch.rand(1, 6, 5, 5, 6, 12, 128)
-
-    # NOTE: full integration requires backbone and config; this main is illustrative only.
     print("Module loaded.")
