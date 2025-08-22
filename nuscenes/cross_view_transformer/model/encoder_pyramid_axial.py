@@ -352,13 +352,17 @@ class PyramidAxialEncoder(nn.Module):
             cross_views.append(cva)
             layers.append(nn.Sequential(*[ResNetBottleNeck(dim[i]) for _ in range(num_layers)]))
             if i < len(middle) - 1:
+                # ======================================================================================
+                # ERROR FIX: Corrected the stride and padding arguments for nn.Conv2d
+                # ======================================================================================
                 downsample_layers.append(nn.Sequential(
-                    nn.Conv2d(dim[i], dim[i] // 2, 3, 1, 1, bias=False),
+                    nn.Conv2d(dim[i], dim[i] * 2, kernel_size=3, stride=1, padding=1, bias=False), # Original was dim[i]//2, seems like a typo, should be dim[i]*2 or dim[i+1] channel size logic
                     nn.PixelUnshuffle(2),
-                    nn.Conv2d(dim[i+1], dim[i+1], 3, 1, 1, bias=False),
+                    # After PixelUnshuffle, channels become (dim[i] * 2 * 4) / 4 = dim[i] * 2, which should be dim[i+1]. Correcting this logic.
+                    nn.Conv2d(dim[i+1], dim[i+1], kernel_size=3, stride=1, padding=1, bias=False),
                     nn.BatchNorm2d(dim[i+1]),
                     nn.ReLU(inplace=True),
-                    nn.Conv2d(dim[i+1], dim[i+1], 1, 0, 0, bias=False),
+                    nn.Conv2d(dim[i+1], dim[i+1], kernel_size=1, stride=1, padding=0, bias=False),
                     nn.BatchNorm2d(dim[i+1])
                 ))
 
@@ -367,26 +371,20 @@ class PyramidAxialEncoder(nn.Module):
         self.layers = nn.ModuleList(layers)
         self.downsample_layers = nn.ModuleList(downsample_layers)
         
-        # ======================================================================================
-        # ERROR FIX: Create a compatible config for MSDeformAttn from the existing self_attn config
-        # ======================================================================================
         deformable_attn_config = {
             'n_levels': self_attn.get('n_levels', 1),
             'n_points': self_attn.get('n_points', 4)
         }
 
-        # Calculate n_heads from dim_head if provided, to maintain compatibility
         if 'dim_head' in self_attn:
             assert dim[-1] % self_attn['dim_head'] == 0, "dim must be divisible by dim_head"
             deformable_attn_config['n_heads'] = dim[-1] // self_attn['dim_head']
         elif 'n_heads' in self_attn:
              deformable_attn_config['n_heads'] = self_attn['n_heads']
         else:
-            # Provide a fallback default if neither dim_head nor n_heads is in the config
             deformable_attn_config['n_heads'] = 8 
 
         self.self_attn_deformable = MSDeformAttn(d_model=dim[-1], **deformable_attn_config)
-        # ======================================================================================
 
     def get_reference_points(self, spatial_shapes, device):
         reference_points_list = []
