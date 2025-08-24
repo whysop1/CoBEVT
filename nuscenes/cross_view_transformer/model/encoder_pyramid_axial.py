@@ -8,7 +8,8 @@ from einops import rearrange, repeat, reduce
 from torchvision.models.resnet import Bottleneck
 from typing import List, Optional
 
-from .decoder import DecoderBlock
+# decoder 임포트는 보통 상대 경로이므로, 환경에 따라 수정이 필요할 수 있습니다.
+# from .decoder import DecoderBlock
 
 ResNetBottleNeck = lambda c: Bottleneck(c, c // 4)
 
@@ -18,8 +19,8 @@ def generate_grid(height: int, width: int):
     ys = torch.linspace(0, 1, height)
 
     indices = torch.stack(torch.meshgrid((xs, ys), indexing='xy'), 0)      # 2 h w
-    indices = F.pad(indices, (0, 0, 0, 0, 0, 1), value=1)                # 3 h w
-    indices = indices[None]                                               # 1 3 h w
+    indices = F.pad(indices, (0, 0, 0, 0, 0, 1), value=1)              # 3 h w
+    indices = indices[None]                                             # 1 3 h w
 
     return indices
 
@@ -293,7 +294,7 @@ class CrossWinAttention(nn.Module):
         a = torch.einsum('b n Q K, b n K d -> b n Q d', att, v)  # b (X Y) (n W1 W2) d
         a = rearrange(a, '(b m) ... d -> b ... (m d)', m=self.heads, d=self.dim_head)
         a = rearrange(a, ' b (x y) (n w1 w2) d -> b n x y w1 w2 d',
-                    x=q_height, y=q_width, w1=q_win_height, w2=q_win_width)
+                      x=q_height, y=q_width, w1=q_win_height, w2=q_win_width)
 
         # Combine multiple heads
         z = self.proj(a)
@@ -398,7 +399,7 @@ class CrossViewSwapAttention(nn.Module):
         Returns: (b, d, H, W)
         """
         b, n, _, _, _ = feature.shape
-        _, _, H, W = x.shape
+        _, d, H, W = x.shape
 
         pixel = self.image_plane                                                      # b n 3 h w
         _, _, _, h, w = pixel.shape
@@ -410,8 +411,8 @@ class CrossViewSwapAttention(nn.Module):
         pixel_flat = rearrange(pixel, '... h w -> ... (h w)')                         # 1 1 3 (h w)
         cam = I_inv @ pixel_flat                                                      # b n 3 (h w)
         cam = F.pad(cam, (0, 0, 0, 1, 0, 0, 0, 0), value=1)                           # b n 4 (h w)
-        d = E_inv @ cam                                                               # b n 4 (h w)
-        d_flat = rearrange(d, 'b n d (h w) -> (b n) d h w', h=h, w=w)                 # (b n) 4 h w
+        d_cam = E_inv @ cam                                                           # b n 4 (h w)
+        d_flat = rearrange(d_cam, 'b n d (h w) -> (b n) d h w', h=h, w=w)              # (b n) 4 h w
         d_embed = self.img_embed(d_flat)                                              # (b n) d h w
 
         img_embed = d_embed - c_embed                                                 # (b n) d h w
@@ -426,6 +427,10 @@ class CrossViewSwapAttention(nn.Module):
             world = bev.grid2[:2]
         elif index == 3:
             world = bev.grid3[:2]
+        else:
+            # Fallback for grids that might not be defined
+            raise ValueError(f"Invalid grid index: {index}")
+
 
         if self.bev_embed_flag:
             # 2 H W
@@ -465,47 +470,52 @@ class CrossViewSwapAttention(nn.Module):
 
         # pad divisible
         key = self.pad_divisble(key, self.feat_win_size[0], self.feat_win_size[1])
-        # Use the gated value tensor from now on
         gated_val = self.pad_divisble(gated_val, self.feat_win_size[0], self.feat_win_size[1])
 
+        # Rearrange d to the last dimension for attention
+        query = rearrange(query, 'b n d h w -> b n h w d')
+        key = rearrange(key, 'b n d h w -> b n h w d')
+        gated_val = rearrange(gated_val, 'b n d h w -> b n h w d')
+        
         # local-to-local cross-attention
-        query = rearrange(query, 'b n d (x w1) (y w2) -> b n x y w1 w2 d',
-                          w1=self.q_win_size[0], w2=self.q_win_size[1])  # window partition
-        key = rearrange(key, 'b n d (x w1) (y w2) -> b n x y w1 w2 d',
-                          w1=self.feat_win_size[0], w2=self.feat_win_size[1])  # window partition
-        val_win = rearrange(gated_val, 'b n d (x w1) (y w2) -> b n x y w1 w2 d',
-                            w1=self.feat_win_size[0], w2=self.feat_win_size[1])  # window partition
+        query_win = rearrange(query, 'b n (x w1) (y w2) d -> b n x y w1 w2 d',
+                                w1=self.q_win_size[0], w2=self.q_win_size[1])
+        key_win = rearrange(key, 'b n (x w1) (y w2) d -> b n x y w1 w2 d',
+                              w1=self.feat_win_size[0], w2=self.feat_win_size[1])
+        val_win = rearrange(gated_val, 'b n (x w1) (y w2) d -> b n x y w1 w2 d',
+                                w1=self.feat_win_size[0], w2=self.feat_win_size[1])
 
-        query = rearrange(self.cross_win_attend_1(query, key, val_win,
-                                                skip=rearrange(x,
-                                                                'b d (x w1) (y w2) -> b x y w1 w2 d',
-                                                                w1=self.q_win_size[0], w2=self.q_win_size[1]) if self.skip else None),
-                        'b x y w1 w2 d  -> b (x w1) (y w2) d')    # reverse window to feature
+        # Prepare skip connection with matching dimensions
+        x_rearranged = rearrange(x, 'b d (x w1) (y w2) -> b x y w1 w2 d', w1=self.q_win_size[0], w2=self.q_win_size[1])
+        skip_conn = x_rearranged if self.skip else None
+
+        # Perform attention
+        attended_val = self.cross_win_attend_1(query_win, key_win, val_win, skip=skip_conn)
+        query = rearrange(attended_val, 'b x y w1 w2 d -> b (x w1) (y w2) d')
 
         query = query + self.mlp_1(self.prenorm_1(query))
 
         x_skip = query
-        query = repeat(query, 'b x y d -> b n x y d', n=n)                  # b n x y d
+        query = repeat(query, 'b h w d -> b n h w d', n=n)
 
         # local-to-global cross-attention
-        query = rearrange(query, 'b n (x w1) (y w2) d -> b n x y w1 w2 d',
-                          w1=self.q_win_size[0], w2=self.q_win_size[1])  # window partition
-        key = rearrange(key, 'b n x y w1 w2 d -> b n (x w1) (y w2) d')  # reverse window to feature
-        key = rearrange(key, 'b n (w1 x) (w2 y) d -> b n x y w1 w2 d',
-                      w1=self.feat_win_size[0], w2=self.feat_win_size[1])  # grid partition
-        val_grid = rearrange(gated_val, 'b n x y w1 w2 d -> b n (x w1) (y w2) d')  # reverse window to feature
-        val_grid = rearrange(val_grid, 'b n (w1 x) (w2 y) d -> b n x y w1 w2 d',
-                       w1=self.feat_win_size[0], w2=self.feat_win_size[1])  # grid partition
+        query_win = rearrange(query, 'b n (x w1) (y w2) d -> b n x y w1 w2 d',
+                                w1=self.q_win_size[0], w2=self.q_win_size[1])
+        
+        key_rev = rearrange(key_win, 'b n x y w1 w2 d -> b n (x w1) (y w2) d')
+        key_grid = rearrange(key_rev, 'b n (w1 x) (w2 y) d -> b n x y w1 w2 d',
+                               w1=self.q_win_size[0], w2=self.q_win_size[1])
+        
+        # ERROR FIX: Handle `val` tensor the same way as `key` tensor
+        val_rev = rearrange(val_win, 'b n x y w1 w2 d -> b n (x w1) (y w2) d')
+        val_grid = rearrange(val_rev, 'b n (w1 x) (w2 y) d -> b n x y w1 w2 d',
+                               w1=self.q_win_size[0], w2=self.q_win_size[1])
 
-        query = rearrange(self.cross_win_attend_2(query,
-                                                  key,
-                                                  val_grid,
-                                                  skip=rearrange(x_skip,
-                                                                 'b (x w1) (y w2) d -> b x y w1 w2 d',
-                                                                 w1=self.q_win_size[0],
-                                                                 w2=self.q_win_size[1])
-                                                  if self.skip else None),
-                        'b x y w1 w2 d  -> b (x w1) (y w2) d')  # reverse grid to feature
+        x_skip_rearranged = rearrange(x_skip, 'b (x w1) (y w2) d -> b x y w1 w2 d', w1=self.q_win_size[0], w2=self.q_win_size[1])
+        skip_conn_2 = x_skip_rearranged if self.skip else None
+
+        attended_val_2 = self.cross_win_attend_2(query_win, key_grid, val_grid, skip=skip_conn_2)
+        query = rearrange(attended_val_2, 'b x y w1 w2 d -> b (x w1) (y w2) d')
 
         query = query + self.mlp_2(self.prenorm_2(query))
 
@@ -545,7 +555,7 @@ class PyramidAxialEncoder(nn.Module):
         downsample_layers = list()
 
         for i, (feat_shape, num_layers) in enumerate(zip(self.backbone.output_shapes, middle)):
-            _, feat_dim, feat_height, feat_width = self.down(torch.zeros(feat_shape)).shape
+            _, feat_dim, feat_height, feat_width = self.down(torch.zeros(1, *feat_shape[1:])).shape
 
             cva = CrossViewSwapAttention(feat_height, feat_width, feat_dim, dim[i], i, **cross_view, **cross_view_swap)
             cross_views.append(cva)
@@ -556,18 +566,12 @@ class PyramidAxialEncoder(nn.Module):
             if i < len(middle) - 1:
                 downsample_layers.append(nn.Sequential(
                     nn.Sequential(
-                        nn.Conv2d(dim[i], dim[i] // 2,
-                                  kernel_size=3, stride=1,
-                                  padding=1, bias=False),
-                        nn.PixelUnshuffle(2),
-                        nn.Conv2d(dim[i+1], dim[i+1],
-                                  3, padding=1, bias=False),
-                        nn.BatchNorm2d(dim[i+1]),
+                        nn.Conv2d(dim[i], dim[i] * 2, kernel_size=3, stride=2, padding=1, bias=False),
+                        nn.BatchNorm2d(dim[i] * 2),
                         nn.ReLU(inplace=True),
-                        nn.Conv2d(dim[i+1],
-                                  dim[i+1], 1, padding=0, bias=False),
-                        nn.BatchNorm2d(dim[i+1])
-                        )))
+                        nn.Conv2d(dim[i] * 2, dim[i+1], kernel_size=1, bias=False),
+                        nn.BatchNorm2d(dim[i+1]),
+                    )))
 
         self.bev_embedding = BEVEmbedding(dim[0], **bev_embedding)
         self.cross_views = nn.ModuleList(cross_views)
@@ -580,47 +584,28 @@ class PyramidAxialEncoder(nn.Module):
     def _normalize_object_count(self, object_count: Optional[torch.Tensor], b: int, n: int, device: torch.device):
         """
         Normalize various incoming object_count shapes into (b, n) on `device`.
-        Accepted inputs:
-          - None -> returns None
-          - scalar / 0-d -> expand to zeros (fallback)
-          - 1D tensor of length b      -> (b,1) -> expand to (b,n)
-          - 1D tensor of length n      -> (1,n) -> expand to (b,n)
-          - 1D tensor of length b*n    -> (b,n)
-          - 2D tensor (b,n)            -> unchanged
-          - 2D tensor (b,1) or (1,n)  -> expanded as needed
-        Fallback: zeros(b,n) if incompatible
         """
         if object_count is None:
             return None
 
         oc = object_count
-        # move to device
         if not torch.is_tensor(oc):
             oc = torch.tensor(oc, device=device)
         else:
             oc = oc.to(device)
 
-        # handle 0-d
         if oc.dim() == 0:
-            # treat as single scalar: expand to (b,n)
             return oc.view(1, 1).expand(b, n).float()
-
-        # 1-d cases
+        
         if oc.dim() == 1:
             L = oc.numel()
-            if L == b * n:
-                return oc.view(b, n).float()
             if L == b:
                 return oc.view(b, 1).expand(b, n).float()
             if L == n:
                 return oc.view(1, n).expand(b, n).float()
-            # try best effort: if divisible by n
-            if L % n == 0 and (L // n) == b:
+            if L == b * n:
                 return oc.view(b, n).float()
-            # fallback: zeros
-            return torch.zeros(b, n, device=device, dtype=torch.float32)
-
-        # 2-d cases
+        
         if oc.dim() == 2:
             r, c = oc.shape
             if r == b and c == n:
@@ -629,56 +614,44 @@ class PyramidAxialEncoder(nn.Module):
                 return oc.expand(b, n).float()
             if r == 1 and c == n:
                 return oc.expand(b, n).float()
-            if oc.numel() == b * n:
-                return oc.reshape(b, n).float()
-            # otherwise fallback slice/pad
-            out = torch.zeros(b, n, device=device, dtype=torch.float32)
-            rr = min(r, b)
-            cc = min(c, n)
-            out[:rr, :cc] = oc[:rr, :cc].float().to(device)
-            return out
 
-        # higher dims: fallback zeros
+        # Fallback for incompatible shapes
+        print(f"Warning: object_count shape {object_count.shape} is not compatible with (b={b}, n={n}). Using zeros.")
         return torch.zeros(b, n, device=device, dtype=torch.float32)
 
     def forward(self, batch):
         b, n, _, _, _ = batch['image'].shape
 
-        image = batch['image'].flatten(0, 1)        # b*n, c, h, w
-        I_inv = batch['intrinsics'].inverse()       # b n 3 3
-        E_inv = batch['extrinsics'].inverse()       # b n 4 4
+        image = batch['image'].flatten(0, 1)      # b*n, c, h, w
+        I_inv = batch['intrinsics'].inverse()     # b n 3 3
+        E_inv = batch['extrinsics'].inverse()     # b n 4 4
 
-        # Get object_count from the batch (can be flexible-shaped)
         object_count = batch.get('object_count', None)
 
-        # normalize object_count to (b,n) if present
         device = image.device
-        norm_obj = self._normalize_object_count(object_count, b, n, device) if object_count is not None else None
+        norm_obj = self._normalize_object_count(object_count, b, n, device)
 
-        # convert to gate weights via adapter if provided
         gate_weights = None
         if norm_obj is not None:
             gate_weights = self.adapter(norm_obj)  # (b, n, 1)
 
         features = [self.down(y) for y in self.backbone(self.norm(image))]
 
-        x = self.bev_embedding.get_prior()          # d H W
-        x = repeat(x, '... -> b ...', b=b)          # b d H W
+        x = self.bev_embedding.get_prior()        # d H W
+        x = repeat(x, '... -> b ...', b=b)        # b d H W
 
         for i, (cross_view, feature, layer) in \
                 enumerate(zip(self.cross_views, features, self.layers)):
             feature = rearrange(feature, '(b n) ... -> b n ...', b=b, n=n)
 
-            # Pass gate_weights to the cross_view attention module
             x = cross_view(i, x, self.bev_embedding, feature, I_inv, E_inv, gate_weights=gate_weights)
             x = layer(x)
             if i < len(features)-1:
                 down_sample_block = self.downsample_layers[i]
                 x = down_sample_block(x)
 
-        # x = self.self_attn(x)
-
         return x
+
 
 
 if __name__ == "__main__":
