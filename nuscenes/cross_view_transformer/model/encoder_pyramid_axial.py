@@ -8,13 +8,13 @@ from einops import rearrange, repeat, reduce
 from torchvision.models.resnet import Bottleneck
 from typing import List, Optional, Tuple
 
-from .decoder import DecoderBlock  # 원본에서 사용되는 경우를 위해 유지
+from .decoder import DecoderBlock  # 필요시 사용
 
 ResNetBottleNeck = lambda c: Bottleneck(c, c // 4)
 
 
 # -----------------------------
-# utils
+# Utils
 # -----------------------------
 def generate_grid(height: int, width: int):
     xs = torch.linspace(0, 1, width)
@@ -31,7 +31,7 @@ def get_view_matrix(h=200, w=200, h_meters=100.0, w_meters=100.0, offset=0.0):
     return [
         [0., -sw, w/2.],
         [-sh, 0., h*offset + h/2.],
-        [0., 0., 1.]
+        [0., 0., 1.],
     ]
 
 
@@ -42,10 +42,13 @@ def safe_obj_count_tensor(
     device: torch.device
 ) -> torch.Tensor:
     """
-    object_count를 (b, n) 모양으로 안전히 반환.
+    object_count를 (b, n) 형태로 안전하게 변환해서 반환.
+    - None -> zeros
+    - 길이 1, b, n, b*n 등 다양한 케이스를 자동 브로드캐스트
     """
     if object_count is None:
         return torch.zeros(b, n, device=device, dtype=torch.float32)
+
     x = object_count
     try:
         x = x.to(device=device, dtype=torch.float32).view(-1)
@@ -60,7 +63,7 @@ def safe_obj_count_tensor(
         return x.view(b, 1).expand(b, n)
     if x.numel() == n:
         return x.view(1, n).expand(b, n)
-    # otherwise
+
     return torch.zeros(b, n, device=device, dtype=torch.float32)
 
 
@@ -104,7 +107,6 @@ class BEVEmbedding(nn.Module):
         super().__init__()
         V = get_view_matrix(bev_height, bev_width, h_meters, w_meters, offset)
         V_inv = torch.FloatTensor(V).inverse()
-
         for i, scale in enumerate(upsample_scales):
             h = bev_height // scale
             w = bev_width // scale
@@ -113,8 +115,7 @@ class BEVEmbedding(nn.Module):
             grid[1] = bev_height * grid[1]
             grid = V_inv @ rearrange(grid, 'd h w -> d (h w)')
             grid = rearrange(grid, 'd (h w) -> d h w', h=h, w=w)
-            self.register_buffer('grid%d' % i, grid, persistent=False)
-
+            self.register_buffer(f'grid{i}', grid, persistent=False)
         self.learned_features = nn.Parameter(
             sigma * torch.randn(dim, bev_height // upsample_scales[0], bev_width // upsample_scales[0])
         )
@@ -124,7 +125,7 @@ class BEVEmbedding(nn.Module):
 
 
 # -----------------------------
-# Object-Aware Positional Encoding
+# Object-Aware Positional Encoding (OAPE)
 # -----------------------------
 class ObjectAwarePE(nn.Module):
     def __init__(self, dim: int, bias_scale: float = 1.0):
@@ -133,13 +134,13 @@ class ObjectAwarePE(nn.Module):
         self.scalar_mlp = nn.Sequential(
             nn.Linear(1, dim),
             nn.GELU(),
-            nn.Linear(dim, dim)
+            nn.Linear(dim, dim),
         )
         self.logit_bias = nn.Sequential(nn.Linear(1, 1))
 
     def forward(self, obj_count_bn: torch.Tensor, H: int, W: int) -> Tuple[torch.Tensor, torch.Tensor]:
         # obj_count_bn: (b,n)
-        x = torch.tanh(torch.log1p(obj_count_bn.clamp(min=0.0)) * 0.5)  # (b,n)
+        x = torch.tanh(torch.log1p(obj_count_bn.clamp(min=0.0)) * 0.5)  # 안정화
         s = self.scalar_mlp(x.unsqueeze(-1)).unsqueeze(-1).unsqueeze(-1)  # (b,n,d,1,1)
         s = s.expand(-1, -1, -1, H, W)  # (b,n,d,H,W)
         lb = self.logit_bias(x.unsqueeze(-1)) * self.bias_scale  # (b,n,1)
@@ -148,7 +149,7 @@ class ObjectAwarePE(nn.Module):
 
 
 # -----------------------------
-# Attention
+# Dense Attention (windowed)
 # -----------------------------
 class Attention(nn.Module):
     def __init__(self, dim, dim_head=32, dropout=0., window_size=25):
@@ -300,7 +301,7 @@ class CrossWinAttention(nn.Module):
 
 
 # -----------------------------
-# CrossViewSwapAttention (integrates OAPE + dynamic + sparse)
+# CrossViewSwapAttention (with OAPE + sparse/dynamic)
 # -----------------------------
 class CrossViewSwapAttention(nn.Module):
     def __init__(
@@ -329,6 +330,7 @@ class CrossViewSwapAttention(nn.Module):
         oape_bias_scale: float = 1.0,
     ):
         super().__init__()
+
         image_plane = generate_grid(feat_height, feat_width)[None]
         image_plane[:, :, 0] *= image_width
         image_plane[:, :, 1] *= image_height
@@ -337,7 +339,7 @@ class CrossViewSwapAttention(nn.Module):
         self.feature_linear = nn.Sequential(
             nn.BatchNorm2d(feat_dim),
             nn.ReLU(),
-            nn.Conv2d(feat_dim, dim, 1, bias=False)
+            nn.Conv2d(feat_dim, dim, 1, bias=False),
         )
 
         if no_image_features:
@@ -346,7 +348,7 @@ class CrossViewSwapAttention(nn.Module):
             self.feature_proj = nn.Sequential(
                 nn.BatchNorm2d(feat_dim),
                 nn.ReLU(),
-                nn.Conv2d(feat_dim, dim, 1, bias=False)
+                nn.Conv2d(feat_dim, dim, 1, bias=False),
             )
 
         self.bev_embed_flag = bev_embedding_flag[index]
@@ -403,7 +405,6 @@ class CrossViewSwapAttention(nn.Module):
         _, d, H, W = x.shape
         device = x.device
 
-        # OAPE tensors
         obj_bn = safe_obj_count_tensor(object_count, b, n, device)
         oape_query_bias, oape_logit_bias = self.oape(obj_bn, H, W)  # (b,n,d,H,W), (b,n,1,1)
 
@@ -434,7 +435,7 @@ class CrossViewSwapAttention(nn.Module):
             world = bev.grid3[:2]
 
         if self.bev_embed_flag:
-            w_embed = self.bev_embed(world[None])  # 1,d,H,W
+            w_embed = self.bev_embed(world[None])
             bev_embed = w_embed - c_embed
             bev_embed = bev_embed / (bev_embed.norm(dim=1, keepdim=True) + 1e-7)
             query_pos = rearrange(bev_embed, '(b n) ... -> b n ...', b=b, n=n)
@@ -523,11 +524,13 @@ class PyramidAxialEncoder(nn.Module):
         dim: list,
         middle: List[int] = [2, 2],
         scale: float = 1.0,
-        reg_coeff: float = 1e-6,  # 추가: 안전 레귤러라이저 계수
+        reg_coeff: float = 1e-6,  # 아주 작은 계수로 DDP unused parameter 방지
     ):
         super().__init__()
+
         self.norm = Normalize()
         self.backbone = backbone
+
         if scale < 1.0:
             self.down = lambda x: F.interpolate(x, scale_factor=scale, recompute_scale_factor=False)
         else:
@@ -541,8 +544,10 @@ class PyramidAxialEncoder(nn.Module):
 
         for i, (feat_shape, num_layers) in enumerate(zip(self.backbone.output_shapes, middle)):
             _, feat_dim, feat_height, feat_width = self.down(torch.zeros(feat_shape)).shape
+
             cva = CrossViewSwapAttention(feat_height, feat_width, feat_dim, dim[i], i, **cross_view, **cross_view_swap)
             cross_views.append(cva)
+
             layer = nn.Sequential(*[ResNetBottleNeck(dim[i]) for _ in range(num_layers)])
             layers.append(layer)
 
@@ -568,15 +573,16 @@ class PyramidAxialEncoder(nn.Module):
     def forward(self, batch):
         b, n, _, _, _ = batch['image'].shape
 
-        image = batch['image'].flatten(0, 1)
-        I_inv = batch['intrinsics'].inverse()
-        E_inv = batch['extrinsics'].inverse()
+        image = batch['image'].flatten(0, 1)            # (b*n, c, h, w)
+        I_inv = batch['intrinsics'].inverse()           # (b, n, 3, 3)
+        E_inv = batch['extrinsics'].inverse()           # (b, n, 4, 4)
 
         object_count = batch.get('object_count', None)
+
         features = [self.down(y) for y in self.backbone(self.norm(image))]
 
-        x = self.bev_embedding.get_prior()  # (d,H,W)
-        x = repeat(x, '... -> b ...', b=b)  # (b,d,H,W)
+        x = self.bev_embedding.get_prior()              # (d, H, W)
+        x = repeat(x, '... -> b ...', b=b)              # (b, d, H, W)
 
         for i, (cross_view, feature, layer) in enumerate(zip(self.cross_views, features, self.layers)):
             feature = rearrange(feature, '(b n) ... -> b n ...', b=b, n=n)
@@ -586,57 +592,69 @@ class PyramidAxialEncoder(nn.Module):
                 x = self.downsample_layers[i](x)
 
         # ----------------------------
-        # 안전 패치: 모든 파라미터에 대해 아주 작은 레귤러라이저 항을 추가해
-        # DistributedDataParallel에서 "unused parameter" 문제를 방지합니다.
-        # 이 항은 매우 작아서 학습 결과에 유의미한 영향을 주지 않습니다.
+        # DDP-safe tiny regularizer: 모든 파라미터에 대해 아주 작은 스칼라 기여를 만들어
+        # "unused parameter" 문제를 방지합니다.
         # ----------------------------
         if self.reg_coeff > 0.0:
             device = next(self.parameters()).device
-            reg = torch.tensor(0.0, device=device)
-            # 제곱합으로 안정적인 gradient 부여
+            reg_scalar = torch.tensor(0.0, device=device)
             for p in self.parameters():
                 if p.requires_grad:
-                    reg = reg + (p.detach() * 0.0 + (p * p).sum() * 0.0)  # dummy usage to avoid memory issues
-            # 실제 소량의 contribution (작지만 non-zero): sum of squares scaled
-            # 위에서 detach*0 로 불필요한 메모리 연결을 피하고, 아래에서 p.pow(2)로 실제 작게 사용
-            reg = (sum((p * p).sum() for p in self.parameters() if p.requires_grad) * self.reg_coeff)
-            # 브로드캐스트해서 BEV 맵에 더함 (수치적 영향 극히 작음)
-            x = x + reg.view(1, 1, 1, 1)
+                    reg_scalar = reg_scalar + p.pow(2).sum()
+            reg = reg_scalar * self.reg_coeff  # scalar tensor
+            x = x + reg  # 브로드캐스트 적용
 
         return x
 
 
 # -----------------------------
-# quick local smoke test (선택적)
+# Optional smoke test (로컬 검사용)
 # -----------------------------
 if __name__ == "__main__":
+    import os
+    import re
+    import yaml
+
+    def load_yaml(file):
+        stream = open(file, 'r')
+        loader = yaml.Loader
+        loader.add_implicit_resolver(
+            u'tag:yaml.org,2002:float',
+            re.compile(u'''^(?:
+            [-+]?(?:[0-9][0-9_]*)\\.[0-9_]*(?:[eE][-+]?[0-9]+)?
+            |[-+]?(?:[0-9][0-9_]*)(?:[eE][-+]?[0-9]+)
+            |\\.[0-9_]+(?:[eE][-+][0-9]+)?
+            |[-+]?[0-9][0-9_]*(?::[0-5]?[0-9])+\\.[0-9_]*
+            |[-+]?\\.(?:inf|Inf|INF)
+            |\\.(?:nan|NaN|NAN))$''', re.X),
+            list(u'-+0123456789.'))
+        param = yaml.load(stream, Loader=loader)
+        if "yaml_parser" in param:
+            param = eval(param["yaml_parser"])(param)
+        return param
+
+    # 간단 모형 테스트 (실제 환경에서는 config에 맞춰 초기화)
     B, N = 2, 6
     d_in = 128
     Hq, Wq = 25, 25
     hf, wf = 28, 60
 
-    image = torch.rand(B, N, 3, hf, wf)
-    I_inv = torch.eye(3).view(1, 1, 3, 3).repeat(B, N, 1, 1)
-    E_inv = torch.eye(4).view(1, 1, 4, 4).repeat(B, N, 1, 1)
-    feature = torch.rand(B, N, d_in, Hq, Wq)
-
+    # 더미 백본 (테스트용)
     class DummyBackbone(nn.Module):
         def __init__(self):
             super().__init__()
-            # output_shapes should match usage in encoder init
             self.output_shapes = [(B * N, d_in, Hq, Wq)]
-
         def forward(self, x):
             return [torch.rand(B * N, d_in, Hq, Wq)]
 
     backbone = DummyBackbone()
     cross_view = {'image_height': hf, 'image_width': wf}
     cross_view_swap = {
-        'q_win_size': [[5, 5], [5, 5], [5, 5]],
-        'feat_win_size': [[6, 12], [6, 12], [6, 12]],
-        'heads': [4, 4, 4],
-        'dim_head': [32, 32, 32],
-        'bev_embedding_flag': [True, True, True],
+        'q_win_size': [[5, 5]],
+        'feat_win_size': [[6, 12]],
+        'heads': [4],
+        'dim_head': [32],
+        'bev_embedding_flag': [True],
     }
     bev_embedding = {
         'sigma': 0.01, 'bev_height': Hq, 'bev_width': Wq,
@@ -645,6 +663,11 @@ if __name__ == "__main__":
     self_attn = {}
 
     enc = PyramidAxialEncoder(backbone, cross_view, cross_view_swap, bev_embedding, self_attn, dim=[128], middle=[1])
-    batch = {'image': image, 'intrinsics': I_inv, 'extrinsics': E_inv, 'object_count': torch.tensor([3, 5])}
+    batch = {
+        'image': torch.rand(B, N, 3, hf, wf),
+        'intrinsics': torch.eye(3).view(1,1,3,3).repeat(B,N,1,1),
+        'extrinsics': torch.eye(4).view(1,1,4,4).repeat(B,N,1,1),
+        'object_count': torch.tensor([3, 1]).repeat_interleave(N)  # 예시
+    }
     out = enc(batch)
     print('encoder out shape:', out.shape)
