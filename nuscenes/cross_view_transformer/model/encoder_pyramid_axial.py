@@ -1,4 +1,3 @@
-
 import sys
 import torch
 import torch.nn as nn
@@ -375,31 +374,30 @@ class CrossViewSwapAttention(nn.Module):
         Returns: (b, d, H, W)
         """
 
-        #디버깅
+        # --- 안전한 object_count 디버깅 출력 (고정 인덱스 제거) ---
         if object_count is not None:
-            print(">> object_count(crossviewswapattention):", object_count.shape, object_count) #각 인덱스가 특정 종류(차, 트럭, 보행자)의 객체 수임
-            value_1 = object_count[0].item()
-            value_2 = object_count[1].item()
-            value_3 = object_count[2].item()
-            value_4 = object_count[3].item()
-            value_5 = object_count[4].item()
-            value_6 = object_count[5].item()
-            value_7 = object_count[6].item()
-            value_8 = object_count[7].item()
-            print(f"Batch 0 object count: {value_1}")
-            print(f"Batch 1 object count: {value_2}")
-            print(f"Batch 2 object count: {value_3}")
-            print(f"Batch 3 object count: {value_4}")
-            print(f"Batch 4 object count: {value_5}")
-            print(f"Batch 5 object count: {value_6}")
-            print(f"Batch 6 object count: {value_7}")
-            print(f"Batch 7 object count: {value_8}")
+            try:
+                oc = object_count.view(-1)
+            except Exception:
+                oc = object_count
+            print(">> object_count(crossviewswapattention):", oc.shape, oc)
         else:
             print(">> object_count(crossviewswapattention) is None")
 
        
         b, n, _, _, _ = feature.shape
         _, _, H, W = x.shape
+
+        # 개별 배치별 object_count 출력 (가능한 범위 내에서만)
+        if object_count is not None:
+            num_print = min(b, int(oc.numel()))
+            for idx in range(num_print):
+                try:
+                    print(f"Batch {idx} object count: {int(oc[idx].item())}")
+                except Exception:
+                    pass
+            if int(oc.numel()) < b:
+                print(f"[warn] object_count has {int(oc.numel())} entries < batch_size {b} (DDP shard or dataset issue).")
 
         pixel = self.image_plane                                                # b n 3 h w
         _, _, _, h, w = pixel.shape
@@ -503,28 +501,6 @@ class CrossViewSwapAttention(nn.Module):
 
 
 
-
-
-
-
-
-
-
-
-
-
-
-   
-
-
-
-
-
-
-
-
-
-
 class PyramidAxialEncoder(nn.Module):
     def __init__(
             self,
@@ -594,9 +570,13 @@ class PyramidAxialEncoder(nn.Module):
         # ✅ 여기서 object_count 가져오기
         object_count = batch.get('object_count', None)
 
-        #디버깅
+        # 안전한 디버깅 출력
         if object_count is not None:
-            print(">> object_count(pyramid axial encoder):", object_count.shape, object_count) #각 인덱스가 특정 종류(차, 트럭, 보행자)의 객체 수임
+            try:
+                oc = object_count.view(-1)
+            except Exception:
+                oc = object_count
+            print(">> object_count(pyramid axial encoder):", oc.shape, oc) # 각 인덱스가 특정 샘플의 객체 수
         else:
             print(">> object_count(pyramid axial encoder) is None")
        
@@ -696,6 +676,8 @@ if __name__ == "__main__":
     batch['intrinsics'] = I_inv
     batch['extrinsics'] = E_inv
 
-    out = encoder(batch)
+    # encoder 변수는 예시 환경에선 정의되어 있지 않습니다.
+    # 실제 프로젝트 실행 시 외부에서 초기화된 encoder를 사용하세요.
+    # out = encoder(batch)
+    # print(out.shape)
 
-    print(out.shape)
