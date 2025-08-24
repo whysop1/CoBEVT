@@ -1,3 +1,4 @@
+# encoder_pyramid_axial.py
 import sys
 import torch
 import torch.nn as nn
@@ -8,7 +9,7 @@ from einops import rearrange, repeat, reduce
 from torchvision.models.resnet import Bottleneck
 from typing import List, Optional, Tuple
 
-from .decoder import DecoderBlock  # 필요시 사용
+from .decoder import DecoderBlock  # 원본 구성 유지
 
 ResNetBottleNeck = lambda c: Bottleneck(c, c // 4)
 
@@ -31,7 +32,7 @@ def get_view_matrix(h=200, w=200, h_meters=100.0, w_meters=100.0, offset=0.0):
     return [
         [0., -sw, w/2.],
         [-sh, 0., h*offset + h/2.],
-        [0., 0., 1.],
+        [0., 0., 1.]
     ]
 
 
@@ -42,9 +43,8 @@ def safe_obj_count_tensor(
     device: torch.device
 ) -> torch.Tensor:
     """
-    object_count를 (b, n) 형태로 안전하게 변환해서 반환.
-    - None -> zeros
-    - 길이 1, b, n, b*n 등 다양한 케이스를 자동 브로드캐스트
+    object_count를 (b, n) 형태로 안전히 반환.
+    다양한 입력 길이(1, b, n, b*n 등)를 허용.
     """
     if object_count is None:
         return torch.zeros(b, n, device=device, dtype=torch.float32)
@@ -63,7 +63,6 @@ def safe_obj_count_tensor(
         return x.view(b, 1).expand(b, n)
     if x.numel() == n:
         return x.view(1, n).expand(b, n)
-
     return torch.zeros(b, n, device=device, dtype=torch.float32)
 
 
@@ -125,7 +124,7 @@ class BEVEmbedding(nn.Module):
 
 
 # -----------------------------
-# Object-Aware Positional Encoding (OAPE)
+# Object-Aware Positional Encoding
 # -----------------------------
 class ObjectAwarePE(nn.Module):
     def __init__(self, dim: int, bias_scale: float = 1.0):
@@ -134,13 +133,12 @@ class ObjectAwarePE(nn.Module):
         self.scalar_mlp = nn.Sequential(
             nn.Linear(1, dim),
             nn.GELU(),
-            nn.Linear(dim, dim),
+            nn.Linear(dim, dim)
         )
         self.logit_bias = nn.Sequential(nn.Linear(1, 1))
 
     def forward(self, obj_count_bn: torch.Tensor, H: int, W: int) -> Tuple[torch.Tensor, torch.Tensor]:
-        # obj_count_bn: (b,n)
-        x = torch.tanh(torch.log1p(obj_count_bn.clamp(min=0.0)) * 0.5)  # 안정화
+        x = torch.tanh(torch.log1p(obj_count_bn.clamp(min=0.0)) * 0.5)  # (b,n)
         s = self.scalar_mlp(x.unsqueeze(-1)).unsqueeze(-1).unsqueeze(-1)  # (b,n,d,1,1)
         s = s.expand(-1, -1, -1, H, W)  # (b,n,d,H,W)
         lb = self.logit_bias(x.unsqueeze(-1)) * self.bias_scale  # (b,n,1)
@@ -149,7 +147,7 @@ class ObjectAwarePE(nn.Module):
 
 
 # -----------------------------
-# Dense Attention (windowed)
+# Attention / CrossWinAttention
 # -----------------------------
 class Attention(nn.Module):
     def __init__(self, dim, dim_head=32, dropout=0., window_size=25):
@@ -187,9 +185,6 @@ class Attention(nn.Module):
         return rearrange(out, 'b h w d -> b d h w')
 
 
-# -----------------------------
-# CrossWinAttention (sparse + dynamic)
-# -----------------------------
 class CrossWinAttention(nn.Module):
     def __init__(
         self,
@@ -220,15 +215,12 @@ class CrossWinAttention(nn.Module):
         self.query_keep_ratio = query_keep_ratio
         self.min_query_keep = min_query_keep
 
-    def add_rel_pos_emb(self, x):
-        return x
-
     @staticmethod
     def _sparse_topk_mask(logits: torch.Tensor, k: int) -> torch.Tensor:
         K = logits.size(-1)
         if k >= K:
             return torch.ones_like(logits, dtype=torch.bool)
-        topk = torch.topk(logits, k=k, dim=-1).indices  # (B,L,Q,k)
+        topk = torch.topk(logits, k=k, dim=-1).indices
         mask = torch.zeros_like(logits, dtype=torch.bool)
         mask.scatter_(-1, topk, True)
         return mask
@@ -276,7 +268,7 @@ class CrossWinAttention(nn.Module):
         logits = torch.einsum('b l q d, b l k d -> b l q k', q_scaled, k)
 
         if logit_additive_bias is not None:
-            lb = logit_additive_bias.mean(dim=1, keepdim=True)  # (b,1,1,1)
+            lb = logit_additive_bias.mean(dim=1, keepdim=True)
             lb = lb.repeat(1, logits.size(1), logits.size(2), logits.size(3))
             times = logits.size(0) // b
             lb = lb.repeat(times, 1, 1, 1)
@@ -339,7 +331,7 @@ class CrossViewSwapAttention(nn.Module):
         self.feature_linear = nn.Sequential(
             nn.BatchNorm2d(feat_dim),
             nn.ReLU(),
-            nn.Conv2d(feat_dim, dim, 1, bias=False),
+            nn.Conv2d(feat_dim, dim, 1, bias=False)
         )
 
         if no_image_features:
@@ -348,7 +340,7 @@ class CrossViewSwapAttention(nn.Module):
             self.feature_proj = nn.Sequential(
                 nn.BatchNorm2d(feat_dim),
                 nn.ReLU(),
-                nn.Conv2d(feat_dim, dim, 1, bias=False),
+                nn.Conv2d(feat_dim, dim, 1, bias=False)
             )
 
         self.bev_embed_flag = bev_embedding_flag[index]
@@ -435,7 +427,7 @@ class CrossViewSwapAttention(nn.Module):
             world = bev.grid3[:2]
 
         if self.bev_embed_flag:
-            w_embed = self.bev_embed(world[None])
+            w_embed = self.bev_embed(world[None])  # 1,d,H,W
             bev_embed = w_embed - c_embed
             bev_embed = bev_embed / (bev_embed.norm(dim=1, keepdim=True) + 1e-7)
             query_pos = rearrange(bev_embed, '(b n) ... -> b n ...', b=b, n=n)
@@ -459,7 +451,6 @@ class CrossViewSwapAttention(nn.Module):
         key = self.pad_divisble(key, self.feat_win_size[0], self.feat_win_size[1])
         val = self.pad_divisble(val, self.feat_win_size[0], self.feat_win_size[1])
 
-        # local-to-local
         query_w = rearrange(query, 'b n d (x w1) (y w2) -> b n x y w1 w2 d',
                             w1=self.q_win_size[0], w2=self.q_win_size[1])
         key_w = rearrange(key, 'b n d (x w1) (y w2) -> b n x y w1 w2 d',
@@ -511,7 +502,7 @@ class CrossViewSwapAttention(nn.Module):
 
 
 # -----------------------------
-# PyramidAxialEncoder
+# PyramidAxialEncoder (reg 제거)
 # -----------------------------
 class PyramidAxialEncoder(nn.Module):
     def __init__(
@@ -524,7 +515,6 @@ class PyramidAxialEncoder(nn.Module):
         dim: list,
         middle: List[int] = [2, 2],
         scale: float = 1.0,
-        reg_coeff: float = 1e-6,  # 아주 작은 계수로 DDP unused parameter 방지
     ):
         super().__init__()
 
@@ -568,7 +558,6 @@ class PyramidAxialEncoder(nn.Module):
         self.cross_views = nn.ModuleList(cross_views)
         self.layers = nn.ModuleList(layers)
         self.downsample_layers = nn.ModuleList(downsample_layers)
-        self.reg_coeff = float(reg_coeff)
 
     def forward(self, batch):
         b, n, _, _, _ = batch['image'].shape
@@ -591,24 +580,11 @@ class PyramidAxialEncoder(nn.Module):
             if i < len(features) - 1:
                 x = self.downsample_layers[i](x)
 
-        # ----------------------------
-        # DDP-safe tiny regularizer: 모든 파라미터에 대해 아주 작은 스칼라 기여를 만들어
-        # "unused parameter" 문제를 방지합니다.
-        # ----------------------------
-        if self.reg_coeff > 0.0:
-            device = next(self.parameters()).device
-            reg_scalar = torch.tensor(0.0, device=device)
-            for p in self.parameters():
-                if p.requires_grad:
-                    reg_scalar = reg_scalar + p.pow(2).sum()
-            reg = reg_scalar * self.reg_coeff  # scalar tensor
-            x = x + reg  # 브로드캐스트 적용
-
         return x
 
 
 # -----------------------------
-# Optional smoke test (로컬 검사용)
+# (Optional) quick smoke test at script run
 # -----------------------------
 if __name__ == "__main__":
     import os
@@ -633,13 +609,12 @@ if __name__ == "__main__":
             param = eval(param["yaml_parser"])(param)
         return param
 
-    # 간단 모형 테스트 (실제 환경에서는 config에 맞춰 초기화)
+    # 간단 shape 테스트 (실제 config로 바꿔 사용하세요)
     B, N = 2, 6
     d_in = 128
     Hq, Wq = 25, 25
     hf, wf = 28, 60
 
-    # 더미 백본 (테스트용)
     class DummyBackbone(nn.Module):
         def __init__(self):
             super().__init__()
@@ -667,7 +642,7 @@ if __name__ == "__main__":
         'image': torch.rand(B, N, 3, hf, wf),
         'intrinsics': torch.eye(3).view(1,1,3,3).repeat(B,N,1,1),
         'extrinsics': torch.eye(4).view(1,1,4,4).repeat(B,N,1,1),
-        'object_count': torch.tensor([3, 1]).repeat_interleave(N)  # 예시
+        'object_count': torch.tensor([3]).repeat(B*N)  # 샘플용
     }
     out = enc(batch)
     print('encoder out shape:', out.shape)
