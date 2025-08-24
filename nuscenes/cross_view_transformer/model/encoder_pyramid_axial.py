@@ -6,12 +6,9 @@ import torch.nn.functional as F
 from torch import einsum
 from einops import rearrange, repeat, reduce
 from torchvision.models.resnet import Bottleneck
-from typing import List
+from typing import List, Optional
+
 from .decoder import DecoderBlock
-
-from typing import Optional
-
-
 
 ResNetBottleNeck = lambda c: Bottleneck(c, c // 4)
 
@@ -21,8 +18,8 @@ def generate_grid(height: int, width: int):
     ys = torch.linspace(0, 1, height)
 
     indices = torch.stack(torch.meshgrid((xs, ys), indexing='xy'), 0)      # 2 h w
-    indices = F.pad(indices, (0, 0, 0, 0, 0, 1), value=1)              # 3 h w
-    indices = indices[None]                                             # 1 3 h w
+    indices = F.pad(indices, (0, 0, 0, 0, 0, 1), value=1)                # 3 h w
+    indices = indices[None]                                               # 1 3 h w
 
     return indices
 
@@ -68,6 +65,7 @@ class RandomCos(nn.Module):
     def forward(self, x):
         return torch.cos(F.conv2d(x, self.weight, self.bias, **self.kwargs))
 
+
 # +++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++
 # +++++++++++++++++++++++++++++++ NEW MODULE START ++++++++++++++++++++++++++++++++++
 # +++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++
@@ -76,6 +74,9 @@ class ObjectCountAdapter(nn.Module):
     Takes object_count per view and generates a gating weight.
     The gate is sigmoid-activated and scaled by 2, allowing it to suppress (0),
     pass-through (1), or amplify (2) features.
+
+    Expects object_count input shape: (b, n). The encoder ensures the input is (b,n).
+    Returns: (b, n, 1)
     """
     def __init__(self, in_features=1, hidden_features=32, out_features=1):
         super().__init__()
@@ -89,18 +90,17 @@ class ObjectCountAdapter(nn.Module):
         # object_count: (b, n)
         # We want to process each count independently.
         b, n = object_count.shape
-        
+
         # Reshape for MLP: (b * n, 1)
-        # The count is a single feature
-        object_count = object_count.float().reshape(-1, 1)
-        
+        oc = object_count.float().reshape(-1, 1)
+
         # Get weights from MLP
-        gate_weights = self.mlp(object_count)
-        
-        # Reshape back to (b, n, 1) for broadcasting
+        gate_weights = self.mlp(oc)  # (b*n, out_features)
+
+        # Reshape back to (b, n, out_features) for broadcasting
         gate_weights = gate_weights.reshape(b, n, -1)
-        
-        # Apply scaled sigmoid activation
+
+        # Apply scaled sigmoid activation to keep gate in (0,2)
         return torch.sigmoid(gate_weights) * 2.0
 # +++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++
 # ++++++++++++++++++++++++++++++++ NEW MODULE END +++++++++++++++++++++++++++++++++++
@@ -119,17 +119,6 @@ class BEVEmbedding(nn.Module):
             offset: int,
             upsample_scales: list,
     ):
-        """
-        Only real arguments are:
-
-        dim: embedding size
-        sigma: scale for initializing embedding
-
-        The rest of the arguments are used for constructing the view matrix.
-
-        In hindsight we should have just specified the view matrix in config
-        and passed in the view matrix...
-        """
         super().__init__()
 
         # map from bev coordinates to ego frame
@@ -152,7 +141,6 @@ class BEVEmbedding(nn.Module):
             # egocentric frame
             self.register_buffer('grid%d'%i, grid, persistent=False)
 
-            # 3 h w
         self.learned_features = nn.Parameter(
             sigma * torch.randn(dim,
                                 bev_height//upsample_scales[0],
@@ -296,7 +284,6 @@ class CrossWinAttention(nn.Module):
 
         # Dot product attention along cameras
         dot = self.scale * torch.einsum('b l Q d, b l K d -> b l Q K', q, k)  # b (X Y) (n W1 W2) (n w1 w2)
-        # dot = rearrange(dot, 'b l n Q K -> b l Q (n K)')  # b (X Y) (W1 W2) (n w1 w2)
 
         if self.rel_pos_emb:
             dot = self.add_rel_pos_emb(dot)
@@ -376,7 +363,6 @@ class CrossViewSwapAttention(nn.Module):
         self.cross_win_attend_1 = CrossWinAttention(dim, heads[index], dim_head[index], qkv_bias)
         self.cross_win_attend_2 = CrossWinAttention(dim, heads[index], dim_head[index], qkv_bias)
         self.skip = skip
-        # self.proj = nn.Linear(2 * dim, dim)
 
         self.prenorm_1 = norm(dim)
         self.prenorm_2 = norm(dim)
@@ -392,7 +378,6 @@ class CrossViewSwapAttention(nn.Module):
         padw = w_pad - w if w % win_w != 0 else 0
         return F.pad(x, (0, padw, 0, padh), value=0)
 
-    
     def forward(
         self,
         index: int,
@@ -470,9 +455,8 @@ class CrossViewSwapAttention(nn.Module):
         # +++++++++++++++++++++++++ ADAPTIVE FEATURE GATING START +++++++++++++++++++++++++++
         # +++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++
         if gate_weights is not None:
-            # Reshape gate_weights from (b, n, 1) to (b, n, 1, 1, 1) for broadcasting
-            # This allows element-wise multiplication with `val` of shape (b, n, d, h, w)
-            gated_val = val * gate_weights.unsqueeze(-1).unsqueeze(-1)
+            # gate_weights expected (b, n, 1) -> broadcast to (b, n, 1, 1, 1)
+            gated_val = val * gate_weights.unsqueeze(-1).unsqueeze(-1)  # (b,n,d,h,w) * (b,n,1,1,1)
         else:
             gated_val = val
         # +++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++
@@ -491,7 +475,7 @@ class CrossViewSwapAttention(nn.Module):
                           w1=self.feat_win_size[0], w2=self.feat_win_size[1])  # window partition
         val_win = rearrange(gated_val, 'b n d (x w1) (y w2) -> b n x y w1 w2 d',
                             w1=self.feat_win_size[0], w2=self.feat_win_size[1])  # window partition
-        
+
         query = rearrange(self.cross_win_attend_1(query, key, val_win,
                                                 skip=rearrange(x,
                                                                 'b d (x w1) (y w2) -> b x y w1 w2 d',
@@ -512,7 +496,7 @@ class CrossViewSwapAttention(nn.Module):
         val_grid = rearrange(gated_val, 'b n x y w1 w2 d -> b n (x w1) (y w2) d')  # reverse window to feature
         val_grid = rearrange(val_grid, 'b n (w1 x) (w2 y) d -> b n x y w1 w2 d',
                        w1=self.feat_win_size[0], w2=self.feat_win_size[1])  # grid partition
-        
+
         query = rearrange(self.cross_win_attend_2(query,
                                                   key,
                                                   val_grid,
@@ -530,6 +514,7 @@ class CrossViewSwapAttention(nn.Module):
         query = rearrange(query, 'b H W d -> b d H W')
 
         return query
+
 
 class PyramidAxialEncoder(nn.Module):
     def __init__(
@@ -588,44 +573,98 @@ class PyramidAxialEncoder(nn.Module):
         self.cross_views = nn.ModuleList(cross_views)
         self.layers = nn.ModuleList(layers)
         self.downsample_layers = nn.ModuleList(downsample_layers)
-        
-        # +++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++
-        # +++++++++++++++++++++++++++++++ ADAPTER INIT START ++++++++++++++++++++++++++++++++
-        # +++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++
-        # Initialize the adapter module
-        self.adapter = ObjectCountAdapter()
-        # +++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++
-        # ++++++++++++++++++++++++++++++++ ADAPTER INIT END +++++++++++++++++++++++++++++++++
-        # +++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++
 
-        # self.self_attn = Attention(dim[-1], **self_attn)
+        # adapter init
+        self.adapter = ObjectCountAdapter()
+
+    def _normalize_object_count(self, object_count: Optional[torch.Tensor], b: int, n: int, device: torch.device):
+        """
+        Normalize various incoming object_count shapes into (b, n) on `device`.
+        Accepted inputs:
+          - None -> returns None
+          - scalar / 0-d -> expand to zeros (fallback)
+          - 1D tensor of length b      -> (b,1) -> expand to (b,n)
+          - 1D tensor of length n      -> (1,n) -> expand to (b,n)
+          - 1D tensor of length b*n    -> (b,n)
+          - 2D tensor (b,n)            -> unchanged
+          - 2D tensor (b,1) or (1,n)  -> expanded as needed
+        Fallback: zeros(b,n) if incompatible
+        """
+        if object_count is None:
+            return None
+
+        oc = object_count
+        # move to device
+        if not torch.is_tensor(oc):
+            oc = torch.tensor(oc, device=device)
+        else:
+            oc = oc.to(device)
+
+        # handle 0-d
+        if oc.dim() == 0:
+            # treat as single scalar: expand to (b,n)
+            return oc.view(1, 1).expand(b, n).float()
+
+        # 1-d cases
+        if oc.dim() == 1:
+            L = oc.numel()
+            if L == b * n:
+                return oc.view(b, n).float()
+            if L == b:
+                return oc.view(b, 1).expand(b, n).float()
+            if L == n:
+                return oc.view(1, n).expand(b, n).float()
+            # try best effort: if divisible by n
+            if L % n == 0 and (L // n) == b:
+                return oc.view(b, n).float()
+            # fallback: zeros
+            return torch.zeros(b, n, device=device, dtype=torch.float32)
+
+        # 2-d cases
+        if oc.dim() == 2:
+            r, c = oc.shape
+            if r == b and c == n:
+                return oc.float()
+            if r == b and c == 1:
+                return oc.expand(b, n).float()
+            if r == 1 and c == n:
+                return oc.expand(b, n).float()
+            if oc.numel() == b * n:
+                return oc.reshape(b, n).float()
+            # otherwise fallback slice/pad
+            out = torch.zeros(b, n, device=device, dtype=torch.float32)
+            rr = min(r, b)
+            cc = min(c, n)
+            out[:rr, :cc] = oc[:rr, :cc].float().to(device)
+            return out
+
+        # higher dims: fallback zeros
+        return torch.zeros(b, n, device=device, dtype=torch.float32)
 
     def forward(self, batch):
         b, n, _, _, _ = batch['image'].shape
 
-        image = batch['image'].flatten(0, 1)        # b n c h w
+        image = batch['image'].flatten(0, 1)        # b*n, c, h, w
         I_inv = batch['intrinsics'].inverse()       # b n 3 3
         E_inv = batch['extrinsics'].inverse()       # b n 4 4
 
-        # Get object_count from the batch
+        # Get object_count from the batch (can be flexible-shaped)
         object_count = batch.get('object_count', None)
+
+        # normalize object_count to (b,n) if present
+        device = image.device
+        norm_obj = self._normalize_object_count(object_count, b, n, device) if object_count is not None else None
+
+        # convert to gate weights via adapter if provided
+        gate_weights = None
+        if norm_obj is not None:
+            gate_weights = self.adapter(norm_obj)  # (b, n, 1)
 
         features = [self.down(y) for y in self.backbone(self.norm(image))]
 
         x = self.bev_embedding.get_prior()          # d H W
         x = repeat(x, '... -> b ...', b=b)          # b d H W
 
-        # +++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++
-        # ++++++++++++++++++++++++++++ ADAPTER FORWARD START ++++++++++++++++++++++++++++++++
-        # +++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++
-        gate_weights = None
-        if object_count is not None:
-            # Pass object_count through the adapter to get gating weights
-            gate_weights = self.adapter(object_count)
-        # +++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++
-        # +++++++++++++++++++++++++++++ ADAPTER FORWARD END +++++++++++++++++++++++++++++++++
-        # +++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++
-        
         for i, (cross_view, feature, layer) in \
                 enumerate(zip(self.cross_views, features, self.layers)):
             feature = rearrange(feature, '(b n) ... -> b n ...', b=b, n=n)
@@ -667,9 +706,9 @@ if __name__ == "__main__":
     os.environ['CUDA_VISIBLE_DEVICES'] = '0,1'
 
     block = CrossWinAttention(dim=128,
-                                heads=4,
-                                dim_head=32,
-                                qkv_bias=True,)
+                              heads=4,
+                              dim_head=32,
+                              qkv_bias=True,)
     block.cuda()
     test_q = torch.rand(1, 6, 5, 5, 5, 5, 128)
     test_k = test_v = torch.rand(1, 6, 5, 5, 6, 12, 128)
@@ -677,47 +716,5 @@ if __name__ == "__main__":
     test_k = test_k.cuda()
     test_v = test_v.cuda()
 
-    # test pad divisible
-    # output = block.pad_divisble(x=test_data, win_h=6, win_w=12)
     output = block(test_q, test_k, test_v)
     print(output.shape)
-
-    # block = CrossViewSwapAttention(
-    #     feat_height=28,
-    #     feat_width=60,
-    #     feat_dim=128,
-    #     dim=128,
-    #     index=0,
-    #     image_height=25,
-    #     image_width=25,
-    #     qkv_bias=True,
-    #     q_win_size=[5, 5],
-    #     feat_win_size=[6, 12],
-    #     heads=[4,],
-    #     dim_head=[32,],
-    #     qkv_bias=True,)
-
-    image = torch.rand(1, 6, 128, 28, 60)        # b n c h w
-    I_inv = torch.rand(1, 6, 3, 3)          # b n 3 3
-    E_inv = torch.rand(1, 6, 4, 4)          # b n 4 4
-
-    feature = torch.rand(1, 6, 128, 25, 25)
-
-    x = torch.rand(1, 128, 25, 25)                # b d H W
-
-    # output = block(0, x, self.bev_embedding, feature, I_inv, E_inv)
-    block.cuda()
-
-    ##### EncoderSwap
-    params = load_yaml('config/model/cvt_pyramid_swap.yaml')
-
-    print(params)
-
-    batch = {}
-    batch['image'] = image
-    batch['intrinsics'] = I_inv
-    batch['extrinsics'] = E_inv
-
-    out = encoder(batch)
-
-    print(out.shape)
