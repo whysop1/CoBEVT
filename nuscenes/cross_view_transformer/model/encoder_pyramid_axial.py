@@ -8,7 +8,6 @@ from einops import rearrange, repeat, reduce
 from torchvision.models.resnet import Bottleneck
 from typing import List, Optional
 
-# decoder 임포트는 보통 상대 경로이므로, 환경에 따라 수정이 필요할 수 있습니다.
 # from .decoder import DecoderBlock
 
 ResNetBottleNeck = lambda c: Bottleneck(c, c // 4)
@@ -75,9 +74,6 @@ class ObjectCountAdapter(nn.Module):
     Takes object_count per view and generates a gating weight.
     The gate is sigmoid-activated and scaled by 2, allowing it to suppress (0),
     pass-through (1), or amplify (2) features.
-
-    Expects object_count input shape: (b, n). The encoder ensures the input is (b,n).
-    Returns: (b, n, 1)
     """
     def __init__(self, in_features=1, hidden_features=32, out_features=1):
         super().__init__()
@@ -89,19 +85,10 @@ class ObjectCountAdapter(nn.Module):
 
     def forward(self, object_count):
         # object_count: (b, n)
-        # We want to process each count independently.
         b, n = object_count.shape
-
-        # Reshape for MLP: (b * n, 1)
         oc = object_count.float().reshape(-1, 1)
-
-        # Get weights from MLP
-        gate_weights = self.mlp(oc)  # (b*n, out_features)
-
-        # Reshape back to (b, n, out_features) for broadcasting
+        gate_weights = self.mlp(oc)
         gate_weights = gate_weights.reshape(b, n, -1)
-
-        # Apply scaled sigmoid activation to keep gate in (0,2)
         return torch.sigmoid(gate_weights) * 2.0
 # +++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++
 # ++++++++++++++++++++++++++++++++ NEW MODULE END +++++++++++++++++++++++++++++++++++
@@ -122,119 +109,25 @@ class BEVEmbedding(nn.Module):
     ):
         super().__init__()
 
-        # map from bev coordinates to ego frame
-        V = get_view_matrix(bev_height, bev_width, h_meters, w_meters,
-                            offset)  # 3 3
-        V_inv = torch.FloatTensor(V).inverse()  # 3 3
+        V = get_view_matrix(bev_height, bev_width, h_meters, w_meters, offset)
+        V_inv = torch.FloatTensor(V).inverse()
 
         for i, scale in enumerate(upsample_scales):
-            # each decoder block upsamples the bev embedding by a factor of 2
             h = bev_height // scale
             w = bev_width // scale
-
-            # bev coordinates
             grid = generate_grid(h, w).squeeze(0)
             grid[0] = bev_width * grid[0]
             grid[1] = bev_height * grid[1]
-
-            grid = V_inv @ rearrange(grid, 'd h w -> d (h w)')  # 3 (h w)
-            grid = rearrange(grid, 'd (h w) -> d h w', h=h, w=w)  # 3 h w
-            # egocentric frame
-            self.register_buffer('grid%d'%i, grid, persistent=False)
+            grid = V_inv @ rearrange(grid, 'd h w -> d (h w)')
+            grid = rearrange(grid, 'd (h w) -> d h w', h=h, w=w)
+            self.register_buffer(f'grid{i}', grid, persistent=False)
 
         self.learned_features = nn.Parameter(
-            sigma * torch.randn(dim,
-                                bev_height//upsample_scales[0],
-                                bev_width//upsample_scales[0]))  # d h w
+            sigma * torch.randn(dim, bev_height // upsample_scales[0], bev_width // upsample_scales[0])
+        )
 
     def get_prior(self):
         return self.learned_features
-
-
-class Attention(nn.Module):
-    def __init__(
-        self,
-        dim,
-        dim_head = 32,
-        dropout = 0.,
-        window_size = 25
-    ):
-        super().__init__()
-        assert (dim % dim_head) == 0, 'dimension should be divisible by dimension per head'
-
-        self.heads = dim // dim_head
-        self.scale = dim_head ** -0.5
-
-        self.to_qkv = nn.Linear(dim, dim * 3, bias = False)
-
-        self.attend = nn.Sequential(
-            nn.Softmax(dim = -1),
-            nn.Dropout(dropout)
-        )
-
-        self.to_out = nn.Sequential(
-            nn.Linear(dim, dim, bias = False),
-            nn.Dropout(dropout)
-        )
-
-        # relative positional bias
-
-        self.rel_pos_bias = nn.Embedding((2 * window_size - 1) ** 2, self.heads)
-
-        pos = torch.arange(window_size)
-        grid = torch.stack(torch.meshgrid(pos, pos, indexing = 'ij'))
-        grid = rearrange(grid, 'c i j -> (i j) c')
-        rel_pos = rearrange(grid, 'i ... -> i 1 ...') - rearrange(grid, 'j ... -> 1 j ...')
-        rel_pos += window_size - 1
-        rel_pos_indices = (rel_pos * torch.tensor([2 * window_size - 1, 1])).sum(dim = -1)
-
-        self.register_buffer('rel_pos_indices', rel_pos_indices, persistent = False)
-
-    def forward(self, x):
-        batch, _, height, width, device, h = *x.shape, x.device, self.heads
-
-        # flatten
-
-        x = rearrange(x, 'b d h w -> b (h w) d')
-
-        # project for queries, keys, values
-
-        q, k, v = self.to_qkv(x).chunk(3, dim = -1)
-
-        # split heads
-
-        q, k, v = map(lambda t: rearrange(t, 'b n (h d ) -> b h n d', h = h), (q, k, v))
-
-        # scale
-
-        q = q * self.scale
-
-        # sim
-
-        sim = einsum('b h i d, b h j d -> b h i j', q, k)
-
-        # add positional bias
-
-        bias = self.rel_pos_bias(self.rel_pos_indices)
-        sim = sim + rearrange(bias, 'i j h -> h i j')
-
-        # attention
-
-        attn = self.attend(sim)
-
-        # aggregate
-
-        out = einsum('b h i j, b h j d -> b h i d', attn, v)
-
-        # merge heads
-
-        out = rearrange(out, 'b m (h w) d -> b h w (m d)',
-                        h = height, w = width)
-
-        # combine heads out
-
-        out = self.to_out(out)
-        return rearrange(out, 'b h w d -> b d h w')
 
 
 class CrossWinAttention(nn.Module):
@@ -242,10 +135,8 @@ class CrossWinAttention(nn.Module):
         super().__init__()
 
         self.scale = dim_head ** -0.5
-
         self.heads = heads
         self.dim_head = dim_head
-        self.rel_pos_emb = rel_pos_emb
 
         self.to_q = nn.Sequential(norm(dim), nn.Linear(dim, heads * dim_head, bias=qkv_bias))
         self.to_k = nn.Sequential(norm(dim), nn.Linear(dim, heads * dim_head, bias=qkv_bias))
@@ -253,103 +144,80 @@ class CrossWinAttention(nn.Module):
 
         self.proj = nn.Linear(heads * dim_head, dim)
 
-    def add_rel_pos_emb(self, x):
-        return x
-
     def forward(self, q, k, v, skip=None):
         """
-        q: (b n X Y W1 W2 d)
-        k: (b n x y w1 w2 d)
-        v: (b n x y w1 w2 d)
-        return: (b X Y W1 W2 d)
+        q, k, v: (b, n, num_patches_h, num_patches_w, patch_h, patch_w, d)
+        return: (b, num_patches_h, num_patches_w, patch_h, patch_w, d)
         """
-        assert k.shape == v.shape
-        _, view_size, q_height, q_width, q_win_height, q_win_width, _ = q.shape
+        assert k.shape == v.shape, "Key and Value shapes must match"
+        _, _, q_height, q_width, _, _, _ = q.shape
         _, _, kv_height, kv_width, _, _, _ = k.shape
-        assert q_height * q_width == kv_height * kv_width
+        assert q_height * q_width == kv_height * kv_width, \
+            f"Query and Key must have the same number of patches. Got Q={q_height*q_width}, K={kv_height*kv_width}"
 
-        # flattening
+        # Flatten patches
         q = rearrange(q, 'b n x y w1 w2 d -> b (x y) (n w1 w2) d')
         k = rearrange(k, 'b n x y w1 w2 d -> b (x y) (n w1 w2) d')
         v = rearrange(v, 'b n x y w1 w2 d -> b (x y) (n w1 w2) d')
 
-        # Project with multiple heads
-        q = self.to_q(q)                                      # b (X Y) (n W1 W2) (heads dim_head)
-        k = self.to_k(k)                                      # b (X Y) (n w1 w2) (heads dim_head)
-        v = self.to_v(v)                                      # b (X Y) (n w1 w2) (heads dim_head)
+        # Project to queries, keys, values
+        q = self.to_q(q)
+        k = self.to_k(k)
+        v = self.to_v(v)
 
-        # Group the head dim with batch dim
-        q = rearrange(q, 'b ... (m d) -> (b m) ... d', m=self.heads, d=self.dim_head)
-        k = rearrange(k, 'b ... (m d) -> (b m) ... d', m=self.heads, d=self.dim_head)
-        v = rearrange(v, 'b ... (m d) -> (b m) ... d', m=self.heads, d=self.dim_head)
+        # Split heads
+        q = rearrange(q, 'b l T (h d) -> (b h) l T d', h=self.heads)
+        k = rearrange(k, 'b l T (h d) -> (b h) l T d', h=self.heads)
+        v = rearrange(v, 'b l T (h d) -> (b h) l T d', h=self.heads)
 
-        # Dot product attention along cameras
-        dot = self.scale * torch.einsum('b l Q d, b l K d -> b l Q K', q, k)  # b (X Y) (n W1 W2) (n w1 w2)
+        # Attention
+        sim = self.scale * einsum('b l Q d, b l K d -> b l Q K', q, k)
+        attn = sim.softmax(dim=-1)
 
-        if self.rel_pos_emb:
-            dot = self.add_rel_pos_emb(dot)
-        att = dot.softmax(dim=-1)
+        # Aggregate values
+        out = einsum('b l Q K, b l K d -> b l Q d', attn, v)
 
-        # Combine values (image level features).
-        a = torch.einsum('b n Q K, b n K d -> b n Q d', att, v)  # b (X Y) (n W1 W2) d
-        a = rearrange(a, '(b m) ... d -> b ... (m d)', m=self.heads, d=self.dim_head)
-        a = rearrange(a, ' b (x y) (n w1 w2) d -> b n x y w1 w2 d',
-                      x=q_height, y=q_width, w1=q_win_height, w2=q_win_width)
+        # Merge heads
+        out = rearrange(out, '(b h) l T d -> b l T (h d)', h=self.heads)
+        
+        # Project output
+        out = self.proj(out)
 
-        # Combine multiple heads
-        z = self.proj(a)
+        # Un-flatten patches
+        out = rearrange(out, 'b (x y) (n w1 w2) d -> b n x y w1 w2 d',
+                        x=q_height, y=q_width, n=v.shape[2] // (k.shape[-2] * k.shape[-3] if len(k.shape) > 3 else k.shape[-2]))
 
-        # reduce n: (b n X Y W1 W2 d) -> (b X Y W1 W2 d)
-        z = z.mean(1)  # for sequential usage, we cannot reduce it!
+        # Average across views
+        out = out.mean(1)
 
-        # Optional skip connection
         if skip is not None:
-            z = z + skip
-        return z
+            out = out + skip
+        return out
 
 
 class CrossViewSwapAttention(nn.Module):
     def __init__(
-        self,
-        feat_height: int,
-        feat_width: int,
-        feat_dim: int,
-        dim: int,
-        index: int,
-        image_height: int,
-        image_width: int,
-        qkv_bias: bool,
-        q_win_size: list,
-        feat_win_size: list,
-        heads: list,
-        dim_head: list,
-        bev_embedding_flag: list,
-        rel_pos_emb: bool = False,  # to-do
-        no_image_features: bool = False,
-        skip: bool = True,
-        norm=nn.LayerNorm,
+        self, feat_height: int, feat_width: int, feat_dim: int, dim: int, index: int,
+        image_height: int, image_width: int, qkv_bias: bool, q_win_size: list,
+        feat_win_size: list, heads: list, dim_head: list, bev_embedding_flag: list,
+        skip: bool = True, norm=nn.LayerNorm,
+        **kwargs
     ):
         super().__init__()
 
-        # 1 1 3 h w
+        self.dim = dim
+        self.index = index
+        self.skip = skip
+        self.q_win_size = q_win_size[index]
+        self.feat_win_size = feat_win_size[index]
+
         image_plane = generate_grid(feat_height, feat_width)[None]
         image_plane[:, :, 0] *= image_width
         image_plane[:, :, 1] *= image_height
-
         self.register_buffer('image_plane', image_plane, persistent=False)
 
-        self.feature_linear = nn.Sequential(
-            nn.BatchNorm2d(feat_dim),
-            nn.ReLU(),
-            nn.Conv2d(feat_dim, dim, 1, bias=False))
-
-        if no_image_features:
-            self.feature_proj = None
-        else:
-            self.feature_proj = nn.Sequential(
-                nn.BatchNorm2d(feat_dim),
-                nn.ReLU(),
-                nn.Conv2d(feat_dim, dim, 1, bias=False))
+        self.feature_linear = nn.Sequential(nn.BatchNorm2d(feat_dim), nn.ReLU(), nn.Conv2d(feat_dim, dim, 1, bias=False))
+        self.feature_proj = nn.Sequential(nn.BatchNorm2d(feat_dim), nn.ReLU(), nn.Conv2d(feat_dim, dim, 1, bias=False))
 
         self.bev_embed_flag = bev_embedding_flag[index]
         if self.bev_embed_flag:
@@ -357,13 +225,8 @@ class CrossViewSwapAttention(nn.Module):
         self.img_embed = nn.Conv2d(4, dim, 1, bias=False)
         self.cam_embed = nn.Conv2d(4, dim, 1, bias=False)
 
-        self.q_win_size = q_win_size[index]
-        self.feat_win_size = feat_win_size[index]
-        self.rel_pos_emb = rel_pos_emb
-
         self.cross_win_attend_1 = CrossWinAttention(dim, heads[index], dim_head[index], qkv_bias)
         self.cross_win_attend_2 = CrossWinAttention(dim, heads[index], dim_head[index], qkv_bias)
-        self.skip = skip
 
         self.prenorm_1 = norm(dim)
         self.prenorm_2 = norm(dim)
@@ -371,323 +234,162 @@ class CrossViewSwapAttention(nn.Module):
         self.mlp_2 = nn.Sequential(nn.Linear(dim, 2 * dim), nn.GELU(), nn.Linear(2 * dim, dim))
         self.postnorm = norm(dim)
 
-    def pad_divisble(self, x, win_h, win_w):
-        """Pad the x to be divible by window size."""
-        _, _, _, h, w = x.shape
-        h_pad, w_pad = ((h + win_h) // win_h) * win_h, ((w + win_w) // win_w) * win_w
-        padh = h_pad - h if h % win_h != 0 else 0
-        padw = w_pad - w if w % win_w != 0 else 0
-        return F.pad(x, (0, padw, 0, padh), value=0)
+    def pad_divisible(self, x, win_h, win_w):
+        b, n, c, h, w = x.shape
+        pad_h = (win_h - h % win_h) % win_h
+        pad_w = (win_w - w % win_w) % win_w
+        return F.pad(x, (0, pad_w, 0, pad_h))
 
     def forward(
-        self,
-        index: int,
-        x: torch.FloatTensor,
-        bev: BEVEmbedding,
-        feature: torch.FloatTensor,
-        I_inv: torch.FloatTensor,
-        E_inv: torch.FloatTensor,
-        gate_weights: Optional[torch.Tensor] = None, # ADAPTIVE GATING MODIFICATION
+        self, index: int, x: torch.FloatTensor, bev: BEVEmbedding, feature: torch.FloatTensor,
+        I_inv: torch.FloatTensor, E_inv: torch.FloatTensor, gate_weights: Optional[torch.Tensor] = None,
     ):
-        """
-        x: (b, c, H, W)
-        feature: (b, n, dim_in, h, w)
-        I_inv: (b, n, 3, 3)
-        E_inv: (b, n, 4, 4)
-        gate_weights: (b, n, 1) - from ObjectCountAdapter
+        b, n, _, h_feat, w_feat = feature.shape
+        _, _, H, W = x.shape
 
-        Returns: (b, d, H, W)
-        """
-        b, n, _, _, _ = feature.shape
-        _, d, H, W = x.shape
+        pixel = self.image_plane
+        c = E_inv[..., -1:]
+        c_flat = rearrange(c, 'b n ... -> (b n) ...')[..., None]
+        c_embed = self.cam_embed(c_flat)
 
-        pixel = self.image_plane                                                      # b n 3 h w
-        _, _, _, h, w = pixel.shape
+        pixel_flat = rearrange(pixel, '... h w -> ... (h w)')
+        cam = I_inv @ pixel_flat
+        cam = F.pad(cam, (0, 0, 0, 1), value=1)
+        d = E_inv @ cam
+        d_flat = rearrange(d, 'b n d (h w) -> (b n) d h w', h=h_feat, w=w_feat)
+        d_embed = self.img_embed(d_flat)
+        img_embed = d_embed - c_embed
+        img_embed = img_embed / (img_embed.norm(dim=1, keepdim=True) + 1e-7)
 
-        c = E_inv[..., -1:]                                                           # b n 4 1
-        c_flat = rearrange(c, 'b n ... -> (b n) ...')[..., None]                      # (b n) 4 1 1
-        c_embed = self.cam_embed(c_flat)                                              # (b n) d 1 1
-
-        pixel_flat = rearrange(pixel, '... h w -> ... (h w)')                         # 1 1 3 (h w)
-        cam = I_inv @ pixel_flat                                                      # b n 3 (h w)
-        cam = F.pad(cam, (0, 0, 0, 1, 0, 0, 0, 0), value=1)                           # b n 4 (h w)
-        d_cam = E_inv @ cam                                                           # b n 4 (h w)
-        d_flat = rearrange(d_cam, 'b n d (h w) -> (b n) d h w', h=h, w=w)              # (b n) 4 h w
-        d_embed = self.img_embed(d_flat)                                              # (b n) d h w
-
-        img_embed = d_embed - c_embed                                                 # (b n) d h w
-        img_embed = img_embed / (img_embed.norm(dim=1, keepdim=True) + 1e-7)          # (b n) d h w
-
-        # todo: some hard-code for now.
-        if index == 0:
-            world = bev.grid0[:2]
-        elif index == 1:
-            world = bev.grid1[:2]
-        elif index == 2:
-            world = bev.grid2[:2]
-        elif index == 3:
-            world = bev.grid3[:2]
-        else:
-            # Fallback for grids that might not be defined
-            raise ValueError(f"Invalid grid index: {index}")
-
+        grid_name = f'grid{self.index}'
+        world = getattr(bev, grid_name, None)[:2]
+        if world is None:
+            raise AttributeError(f"BEVEmbedding has no attribute {grid_name}")
 
         if self.bev_embed_flag:
-            # 2 H W
-            w_embed = self.bev_embed(world[None])                                     # 1 d H W
-            bev_embed = w_embed - c_embed                                             # (b n) d H W
-            bev_embed = bev_embed / (bev_embed.norm(dim=1, keepdim=True) + 1e-7)      # (b n) d H W
-            query_pos = rearrange(bev_embed, '(b n) ... -> b n ...', b=b, n=n)        # b n d H W
+            w_embed = self.bev_embed(world[None])
+            bev_embed = w_embed - c_embed
+            bev_embed = bev_embed / (bev_embed.norm(dim=1, keepdim=True) + 1e-7)
+            query_pos = rearrange(bev_embed, '(b n) ... -> b n ...', b=b, n=n)
 
-        feature_flat = rearrange(feature, 'b n ... -> (b n) ...')                     # (b n) d h w
+        feature_flat = rearrange(feature, 'b n ... -> (b n) ...')
+        key_flat = img_embed + self.feature_proj(feature_flat)
+        val_flat = self.feature_linear(feature_flat)
 
-        if self.feature_proj is not None:
-            key_flat = img_embed + self.feature_proj(feature_flat)                    # (b n) d h w
-        else:
-            key_flat = img_embed                                                      # (b n) d h w
+        key = rearrange(key_flat, '(b n) ... -> b n ...', b=b, n=n)
+        val = rearrange(val_flat, '(b n) ... -> b n ...', b=b, n=n)
 
-        val_flat = self.feature_linear(feature_flat)                                  # (b n) d h w
-
-        # Expand + refine the BEV embedding
+        query = x[:, None]
         if self.bev_embed_flag:
-            query = query_pos + x[:, None]
-        else:
-            query = x[:, None]  # b n d H W
-        key = rearrange(key_flat, '(b n) ... -> b n ...', b=b, n=n)                   # b n d h w
-        val = rearrange(val_flat, '(b n) ... -> b n ...', b=b, n=n)                   # b n d h w
-
-        # +++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++
-        # +++++++++++++++++++++++++ ADAPTIVE FEATURE GATING START +++++++++++++++++++++++++++
-        # +++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++
+            query = query_pos + query
+        
         if gate_weights is not None:
-            # gate_weights expected (b, n, 1) -> broadcast to (b, n, 1, 1, 1)
-            gated_val = val * gate_weights.unsqueeze(-1).unsqueeze(-1)  # (b,n,d,h,w) * (b,n,1,1,1)
-        else:
-            gated_val = val
-        # +++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++
-        # ++++++++++++++++++++++++++ ADAPTIVE FEATURE GATING END ++++++++++++++++++++++++++++
-        # +++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++
+            val = val * gate_weights.unsqueeze(-1).unsqueeze(-1)
 
-        # pad divisible
-        key = self.pad_divisble(key, self.feat_win_size[0], self.feat_win_size[1])
-        gated_val = self.pad_divisble(gated_val, self.feat_win_size[0], self.feat_win_size[1])
+        key = self.pad_divisible(key, self.feat_win_size[0], self.feat_win_size[1])
+        val = self.pad_divisible(val, self.feat_win_size[0], self.feat_win_size[1])
 
-        # Rearrange d to the last dimension for attention
+        # Dimension `d` to last for partitioning
         query = rearrange(query, 'b n d h w -> b n h w d')
         key = rearrange(key, 'b n d h w -> b n h w d')
-        gated_val = rearrange(gated_val, 'b n d h w -> b n h w d')
+        val = rearrange(val, 'b n d h w -> b n h w d')
+
+        # local-to-local attention
+        query_win = rearrange(query, 'b n (x w1) (y w2) d -> b n x y w1 w2 d', w1=self.q_win_size[0], w2=self.q_win_size[1])
+        key_win = rearrange(key, 'b n (x w1) (y w2) d -> b n x y w1 w2 d', w1=self.feat_win_size[0], w2=self.feat_win_size[1])
+        val_win = rearrange(val, 'b n (x w1) (y w2) d -> b n x y w1 w2 d', w1=self.feat_win_size[0], w2=self.feat_win_size[1])
+
+        x_skip_win = rearrange(rearrange(x, 'b d h w -> b h w d'), 'b (x w1) (y w2) d -> b x y w1 w2 d', w1=self.q_win_size[0], w2=self.q_win_size[1])
         
-        # local-to-local cross-attention
-        query_win = rearrange(query, 'b n (x w1) (y w2) d -> b n x y w1 w2 d',
-                                w1=self.q_win_size[0], w2=self.q_win_size[1])
-        key_win = rearrange(key, 'b n (x w1) (y w2) d -> b n x y w1 w2 d',
-                              w1=self.feat_win_size[0], w2=self.feat_win_size[1])
-        val_win = rearrange(gated_val, 'b n (x w1) (y w2) d -> b n x y w1 w2 d',
-                                w1=self.feat_win_size[0], w2=self.feat_win_size[1])
-
-        # Prepare skip connection with matching dimensions
-        x_rearranged = rearrange(x, 'b d (x w1) (y w2) -> b x y w1 w2 d', w1=self.q_win_size[0], w2=self.q_win_size[1])
-        skip_conn = x_rearranged if self.skip else None
-
-        # Perform attention
-        attended_val = self.cross_win_attend_1(query_win, key_win, val_win, skip=skip_conn)
-        query = rearrange(attended_val, 'b x y w1 w2 d -> b (x w1) (y w2) d')
-
-        query = query + self.mlp_1(self.prenorm_1(query))
-
-        x_skip = query
-        query = repeat(query, 'b h w d -> b n h w d', n=n)
-
-        # local-to-global cross-attention
-        query_win = rearrange(query, 'b n (x w1) (y w2) d -> b n x y w1 w2 d',
-                                w1=self.q_win_size[0], w2=self.q_win_size[1])
+        attended = self.cross_win_attend_1(query_win, key_win, val_win, skip=x_skip_win if self.skip else None)
+        attended = rearrange(attended, 'b x y w1 w2 d -> b (x w1) (y w2) d')
         
-        key_rev = rearrange(key_win, 'b n x y w1 w2 d -> b n (x w1) (y w2) d')
-        key_grid = rearrange(key_rev, 'b n (w1 x) (w2 y) d -> b n x y w1 w2 d',
-                               w1=self.q_win_size[0], w2=self.q_win_size[1])
+        attended = attended + self.mlp_1(self.prenorm_1(attended))
+        x_skip = attended
+
+        # local-to-global attention
+        query = repeat(attended, 'b h w d -> b n h w d', n=n)
         
-        # ERROR FIX: Handle `val` tensor the same way as `key` tensor
-        val_rev = rearrange(val_win, 'b n x y w1 w2 d -> b n (x w1) (y w2) d')
-        val_grid = rearrange(val_rev, 'b n (w1 x) (w2 y) d -> b n x y w1 w2 d',
-                               w1=self.q_win_size[0], w2=self.q_win_size[1])
+        num_patches_h = H // self.q_win_size[0]
+        num_patches_w = W // self.q_win_size[1]
+        
+        query_win = rearrange(query, 'b n (x w1) (y w2) d -> b n x y w1 w2 d', x=num_patches_h, y=num_patches_w)
 
-        x_skip_rearranged = rearrange(x_skip, 'b (x w1) (y w2) d -> b x y w1 w2 d', w1=self.q_win_size[0], w2=self.q_win_size[1])
-        skip_conn_2 = x_skip_rearranged if self.skip else None
+        # Partition key/val to match query's patch count
+        key_grid = rearrange(key, 'b n (p1 h) (p2 w) d -> b n p1 p2 h w d', p1=num_patches_h, p2=num_patches_w)
+        val_grid = rearrange(val, 'b n (p1 h) (p2 w) d -> b n p1 p2 h w d', p1=num_patches_h, p2=num_patches_w)
+        
+        x_skip_win = rearrange(x_skip, 'b (x w1) (y w2) d -> b x y w1 w2 d', w1=self.q_win_size[0], w2=self.q_win_size[1])
+        
+        attended = self.cross_win_attend_2(query_win, key_grid, val_grid, skip=x_skip_win if self.skip else None)
+        attended = rearrange(attended, 'b x y w1 w2 d -> b (x w1) (y w2) d')
 
-        attended_val_2 = self.cross_win_attend_2(query_win, key_grid, val_grid, skip=skip_conn_2)
-        query = rearrange(attended_val_2, 'b x y w1 w2 d -> b (x w1) (y w2) d')
+        attended = attended + self.mlp_2(self.prenorm_2(attended))
+        attended = self.postnorm(attended)
 
-        query = query + self.mlp_2(self.prenorm_2(query))
-
-        query = self.postnorm(query)
-
-        query = rearrange(query, 'b H W d -> b d H W')
-
-        return query
+        return rearrange(attended, 'b H W d -> b d H W')
 
 
 class PyramidAxialEncoder(nn.Module):
     def __init__(
-            self,
-            backbone,
-            cross_view: dict,
-            cross_view_swap: dict,
-            bev_embedding: dict,
-            self_attn: dict,
-            dim: list,
-            middle: List[int] = [2, 2],
-            scale: float = 1.0,
+            self, backbone, cross_view: dict, cross_view_swap: dict, bev_embedding: dict,
+            dim: list, middle: List[int] = [2, 2], scale: float = 1.0, **kwargs
     ):
         super().__init__()
-
         self.norm = Normalize()
         self.backbone = backbone
+        self.down = (lambda x: F.interpolate(x, scale_factor=scale, recompute_scale_factor=False)) if scale < 1.0 else (lambda x: x)
 
-        if scale < 1.0:
-            self.down = lambda x: F.interpolate(x, scale_factor=scale, recompute_scale_factor=False)
-        else:
-            self.down = lambda x: x
-
-        assert len(self.backbone.output_shapes) == len(middle)
-
-        cross_views = list()
-        layers = list()
-        downsample_layers = list()
+        cross_views, layers, downsample_layers = [], [], []
 
         for i, (feat_shape, num_layers) in enumerate(zip(self.backbone.output_shapes, middle)):
             _, feat_dim, feat_height, feat_width = self.down(torch.zeros(1, *feat_shape[1:])).shape
-
             cva = CrossViewSwapAttention(feat_height, feat_width, feat_dim, dim[i], i, **cross_view, **cross_view_swap)
             cross_views.append(cva)
-
-            layer = nn.Sequential(*[ResNetBottleNeck(dim[i]) for _ in range(num_layers)])
-            layers.append(layer)
-
+            layers.append(nn.Sequential(*[ResNetBottleNeck(dim[i]) for _ in range(num_layers)]))
             if i < len(middle) - 1:
-                downsample_layers.append(nn.Sequential(
-                    nn.Sequential(
-                        nn.Conv2d(dim[i], dim[i] * 2, kernel_size=3, stride=2, padding=1, bias=False),
-                        nn.BatchNorm2d(dim[i] * 2),
-                        nn.ReLU(inplace=True),
-                        nn.Conv2d(dim[i] * 2, dim[i+1], kernel_size=1, bias=False),
-                        nn.BatchNorm2d(dim[i+1]),
-                    )))
+                downsample_layers.append(nn.Conv2d(dim[i], dim[i+1], kernel_size=3, stride=2, padding=1))
 
         self.bev_embedding = BEVEmbedding(dim[0], **bev_embedding)
         self.cross_views = nn.ModuleList(cross_views)
         self.layers = nn.ModuleList(layers)
         self.downsample_layers = nn.ModuleList(downsample_layers)
-
-        # adapter init
         self.adapter = ObjectCountAdapter()
 
-    def _normalize_object_count(self, object_count: Optional[torch.Tensor], b: int, n: int, device: torch.device):
-        """
-        Normalize various incoming object_count shapes into (b, n) on `device`.
-        """
-        if object_count is None:
-            return None
+    def _normalize_object_count(self, object_count, b, n, device):
+        if object_count is None: return None
+        oc = object_count if torch.is_tensor(object_count) else torch.tensor(object_count, device=device)
+        oc = oc.to(device)
 
-        oc = object_count
-        if not torch.is_tensor(oc):
-            oc = torch.tensor(oc, device=device)
-        else:
-            oc = oc.to(device)
-
-        if oc.dim() == 0:
-            return oc.view(1, 1).expand(b, n).float()
-        
+        if oc.dim() == 0: return oc.view(1, 1).expand(b, n).float()
         if oc.dim() == 1:
             L = oc.numel()
-            if L == b:
-                return oc.view(b, 1).expand(b, n).float()
-            if L == n:
-                return oc.view(1, n).expand(b, n).float()
-            if L == b * n:
-                return oc.view(b, n).float()
-        
-        if oc.dim() == 2:
-            r, c = oc.shape
-            if r == b and c == n:
-                return oc.float()
-            if r == b and c == 1:
-                return oc.expand(b, n).float()
-            if r == 1 and c == n:
-                return oc.expand(b, n).float()
+            if L == b: return oc.view(b, 1).expand(b, n).float()
+            if L == n: return oc.view(1, n).expand(b, n).float()
+            if L == b * n: return oc.view(b, n).float()
+        if oc.dim() == 2 and oc.shape == (b, n): return oc.float()
 
-        # Fallback for incompatible shapes
-        print(f"Warning: object_count shape {object_count.shape} is not compatible with (b={b}, n={n}). Using zeros.")
+        print(f"Warning: object_count shape {oc.shape} incompatible. Using zeros.")
         return torch.zeros(b, n, device=device, dtype=torch.float32)
 
     def forward(self, batch):
         b, n, _, _, _ = batch['image'].shape
-
-        image = batch['image'].flatten(0, 1)      # b*n, c, h, w
-        I_inv = batch['intrinsics'].inverse()     # b n 3 3
-        E_inv = batch['extrinsics'].inverse()     # b n 4 4
-
+        image = batch['image'].flatten(0, 1)
+        I_inv = batch['intrinsics'].inverse()
+        E_inv = batch['extrinsics'].inverse()
+        
         object_count = batch.get('object_count', None)
-
-        device = image.device
-        norm_obj = self._normalize_object_count(object_count, b, n, device)
-
-        gate_weights = None
-        if norm_obj is not None:
-            gate_weights = self.adapter(norm_obj)  # (b, n, 1)
+        norm_obj = self._normalize_object_count(object_count, b, n, image.device)
+        gate_weights = self.adapter(norm_obj) if norm_obj is not None else None
 
         features = [self.down(y) for y in self.backbone(self.norm(image))]
+        x = repeat(self.bev_embedding.get_prior(), '... -> b ...', b=b)
 
-        x = self.bev_embedding.get_prior()        # d H W
-        x = repeat(x, '... -> b ...', b=b)        # b d H W
-
-        for i, (cross_view, feature, layer) in \
-                enumerate(zip(self.cross_views, features, self.layers)):
+        for i, (cross_view, feature, layer) in enumerate(zip(self.cross_views, features, self.layers)):
             feature = rearrange(feature, '(b n) ... -> b n ...', b=b, n=n)
-
             x = cross_view(i, x, self.bev_embedding, feature, I_inv, E_inv, gate_weights=gate_weights)
             x = layer(x)
-            if i < len(features)-1:
-                down_sample_block = self.downsample_layers[i]
-                x = down_sample_block(x)
+            if i < len(self.downsample_layers):
+                x = self.downsample_layers[i](x)
 
         return x
-
-
-
-if __name__ == "__main__":
-    import os
-    import re
-    import yaml
-    def load_yaml(file):
-        stream = open(file, 'r')
-        loader = yaml.Loader
-        loader.add_implicit_resolver(
-            u'tag:yaml.org,2002:float',
-            re.compile(u'''^(?:
-            [-+]?(?:[0-9][0-9_]*)\\.[0-9_]*(?:[eE][-+]?[0-9]+)?
-            |[-+]?(?:[0-9][0-9_]*)(?:[eE][-+]?[0-9]+)
-            |\\.[0-9_]+(?:[eE][-+][0-9]+)?
-            |[-+]?[0-9][0-9_]*(?::[0-5]?[0-9])+\\.[0-9_]*
-            |[-+]?\\.(?:inf|Inf|INF)
-            |\\.(?:nan|NaN|NAN))$''', re.X),
-            list(u'-+0123456789.'))
-        param = yaml.load(stream, Loader=loader)
-        if "yaml_parser" in param:
-            param = eval(param["yaml_parser"])(param)
-        return param
-
-    os.environ['CUDA_VISIBLE_DEVICES'] = '0,1'
-
-    block = CrossWinAttention(dim=128,
-                              heads=4,
-                              dim_head=32,
-                              qkv_bias=True,)
-    block.cuda()
-    test_q = torch.rand(1, 6, 5, 5, 5, 5, 128)
-    test_k = test_v = torch.rand(1, 6, 5, 5, 6, 12, 128)
-    test_q = test_q.cuda()
-    test_k = test_k.cuda()
-    test_v = test_v.cuda()
-
-    output = block(test_q, test_k, test_v)
-    print(output.shape)
