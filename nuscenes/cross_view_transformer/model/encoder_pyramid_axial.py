@@ -1,13 +1,14 @@
-# encoder_pyramid_axial.py
 import sys
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
 from torch import einsum
-from einops import rearrange, repeat
+from einops import rearrange, repeat, reduce
 from torchvision.models.resnet import Bottleneck
 from typing import List, Optional
+# from .decoder import  DecoderBlock # 원본에 오타가 있어 주석 처리합니다.
+
 
 ResNetBottleNeck = lambda c: Bottleneck(c, c // 4)
 
@@ -16,8 +17,8 @@ def generate_grid(height: int, width: int):
     xs = torch.linspace(0, 1, width)
     ys = torch.linspace(0, 1, height)
 
-    indices = torch.stack(torch.meshgrid((xs, ys), indexing='xy'), 0)       # 2 h w
-    indices = F.pad(indices, (0, 0, 0, 0, 0, 1), value=1)                   # 3 h w
+    indices = torch.stack(torch.meshgrid((xs, ys), indexing='xy'), 0)      # 2 h w
+    indices = F.pad(indices, (0, 0, 0, 0, 0, 1), value=1)                  # 3 h w
     indices = indices[None]                                                 # 1 3 h w
 
     return indices
@@ -31,9 +32,9 @@ def get_view_matrix(h=200, w=200, h_meters=100.0, w_meters=100.0, offset=0.0):
     sw = w / w_meters
 
     return [
-        [ 0., -sw,          w/2.],
+        [ 0., -sw,        w/2.],
         [-sh,  0., h*offset+h/2.],
-        [ 0.,  0.,            1.]
+        [ 0.,  0.,          1.]
     ]
 
 
@@ -243,9 +244,9 @@ class CrossWinAttention(nn.Module):
         v = rearrange(v, 'b n x y w1 w2 d -> b (x y) (n w1 w2) d')
 
         # Project with multiple heads
-        q = self.to_q(q)                                # b (X Y) (n W1 W2) (heads dim_head)
-        k = self.to_k(k)                                # b (X Y) (n w1 w2) (heads dim_head)
-        v = self.to_v(v)                                # b (X Y) (n w1 w2) (heads dim_head)
+        q = self.to_q(q)                                      # b (X Y) (n W1 W2) (heads dim_head)
+        k = self.to_k(k)                                      # b (X Y) (n w1 w2) (heads dim_head)
+        v = self.to_v(v)                                      # b (X Y) (n w1 w2) (heads dim_head)
 
         # Group the head dim with batch dim
         q = rearrange(q, 'b ... (m d) -> (b m) ... d', m=self.heads, d=self.dim_head)
@@ -264,7 +265,7 @@ class CrossWinAttention(nn.Module):
         a = torch.einsum('b n Q K, b n K d -> b n Q d', att, v)  # b (X Y) (n W1 W2) d
         a = rearrange(a, '(b m) ... d -> b ... (m d)', m=self.heads, d=self.dim_head)
         a = rearrange(a, ' b (x y) (n w1 w2) d -> b n x y w1 w2 d',
-            x=q_height, y=q_width, w1=q_win_height, w2=q_win_width)
+                    x=q_height, y=q_width, w1=q_win_height, w2=q_win_width)
 
         # Combine multiple heads
         z = self.proj(a)
@@ -350,7 +351,7 @@ class CrossViewSwapAttention(nn.Module):
         padw = w_pad - w if w % win_w != 0 else 0
         return F.pad(x, (0, padw, 0, padh), value=0)
 
-   
+    
     def forward(
         self,
         index: int,
@@ -371,29 +372,30 @@ class CrossViewSwapAttention(nn.Module):
         """
 
         #디버깅
-        if object_count is not None:
-            # avoid heavy printing in training
-            pass
-
+        # if object_count is not None:
+        #     print(">> object_count(crossviewswapattention):", object_count.shape, object_count)
+        # else:
+        #     print(">> object_count(crossviewswapattention) is None")
+        
         b, n, _, _, _ = feature.shape
         _, _, H, W = x.shape
 
-        pixel = self.image_plane                                                # b n 3 h w
+        pixel = self.image_plane                                                      # b n 3 h w
         _, _, _, h, w = pixel.shape
 
-        c = E_inv[..., -1:]                                                     # b n 4 1
-        c_flat = rearrange(c, 'b n ... -> (b n) ...')[..., None]                # (b n) 4 1 1
-        c_embed = self.cam_embed(c_flat)                                        # (b n) d 1 1
+        c = E_inv[..., -1:]                                                         # b n 4 1
+        c_flat = rearrange(c, 'b n ... -> (b n) ...')[..., None]                    # (b n) 4 1 1
+        c_embed = self.cam_embed(c_flat)                                            # (b n) d 1 1
 
-        pixel_flat = rearrange(pixel, '... h w -> ... (h w)')                   # 1 1 3 (h w)
-        cam = I_inv @ pixel_flat                                                # b n 3 (h w)
-        cam = F.pad(cam, (0, 0, 0, 1, 0, 0, 0, 0), value=1)                     # b n 4 (h w)
-        d = E_inv @ cam                                                         # b n 4 (h w)
-        d_flat = rearrange(d, 'b n d (h w) -> (b n) d h w', h=h, w=w)           # (b n) 4 h w
-        d_embed = self.img_embed(d_flat)                                        # (b n) d h w
+        pixel_flat = rearrange(pixel, '... h w -> ... (h w)')                       # 1 1 3 (h w)
+        cam = I_inv @ pixel_flat                                                    # b n 3 (h w)
+        cam = F.pad(cam, (0, 0, 0, 1, 0, 0, 0, 0), value=1)                         # b n 4 (h w)
+        d = E_inv @ cam                                                             # b n 4 (h w)
+        d_flat = rearrange(d, 'b n d (h w) -> (b n) d h w', h=h, w=w)               # (b n) 4 h w
+        d_embed = self.img_embed(d_flat)                                            # (b n) d h w
 
-        img_embed = d_embed - c_embed                                           # (b n) d h w
-        img_embed = img_embed / (img_embed.norm(dim=1, keepdim=True) + 1e-7)    # (b n) d h w
+        img_embed = d_embed - c_embed                                               # (b n) d h w
+        img_embed = img_embed / (img_embed.norm(dim=1, keepdim=True) + 1e-7)        # (b n) d h w
 
         # todo: some hard-code for now.
         if index == 0:
@@ -407,27 +409,27 @@ class CrossViewSwapAttention(nn.Module):
 
         if self.bev_embed_flag:
             # 2 H W
-            w_embed = self.bev_embed(world[None])                                   # 1 d H W
-            bev_embed = w_embed - c_embed                                           # (b n) d H W
-            bev_embed = bev_embed / (bev_embed.norm(dim=1, keepdim=True) + 1e-7)    # (b n) d H W
-            query_pos = rearrange(bev_embed, '(b n) ... -> b n ...', b=b, n=n)      # b n d H W
+            w_embed = self.bev_embed(world[None])                                     # 1 d H W
+            bev_embed = w_embed - c_embed                                             # (b n) d H W
+            bev_embed = bev_embed / (bev_embed.norm(dim=1, keepdim=True) + 1e-7)      # (b n) d H W
+            query_pos = rearrange(bev_embed, '(b n) ... -> b n ...', b=b, n=n)        # b n d H W
 
-        feature_flat = rearrange(feature, 'b n ... -> (b n) ...')               # (b n) d h w
+        feature_flat = rearrange(feature, 'b n ... -> (b n) ...')                   # (b n) d h w
 
         if self.feature_proj is not None:
-            key_flat = img_embed + self.feature_proj(feature_flat)              # (b n) d h w
+            key_flat = img_embed + self.feature_proj(feature_flat)                  # (b n) d h w
         else:
-            key_flat = img_embed                                                # (b n) d h w
+            key_flat = img_embed                                                      # (b n) d h w
 
-        val_flat = self.feature_linear(feature_flat)                            # (b n) d h w
+        val_flat = self.feature_linear(feature_flat)                                # (b n) d h w
 
         # Expand + refine the BEV embedding
         if self.bev_embed_flag:
             query = query_pos + x[:, None]
         else:
             query = x[:, None]  # b n d H W
-        key = rearrange(key_flat, '(b n) ... -> b n ...', b=b, n=n)             # b n d h w
-        val = rearrange(val_flat, '(b n) ... -> b n ...', b=b, n=n)             # b n d h w
+        key = rearrange(key_flat, '(b n) ... -> b n ...', b=b, n=n)                 # b n d h w
+        val = rearrange(val_flat, '(b n) ... -> b n ...', b=b, n=n)                 # b n d h w
 
         # pad divisible
         key = self.pad_divisble(key, self.feat_win_size[0], self.feat_win_size[1])
@@ -442,14 +444,14 @@ class CrossViewSwapAttention(nn.Module):
                           w1=self.feat_win_size[0], w2=self.feat_win_size[1])  # window partition
         query = rearrange(self.cross_win_attend_1(query, key, val,
                                                 skip=rearrange(x,
-                                                            'b d (x w1) (y w2) -> b x y w1 w2 d',
-                                                             w1=self.q_win_size[0], w2=self.q_win_size[1]) if self.skip else None),
-                       'b x y w1 w2 d  -> b (x w1) (y w2) d')    # reverse window to feature
+                                                                 'b d (x w1) (y w2) -> b x y w1 w2 d',
+                                                                   w1=self.q_win_size[0], w2=self.q_win_size[1]) if self.skip else None),
+                        'b x y w1 w2 d  -> b (x w1) (y w2) d')   # reverse window to feature
 
         query = query + self.mlp_1(self.prenorm_1(query))
 
         x_skip = query
-        query = repeat(query, 'b x y d -> b n x y d', n=n)              # b n x y d
+        query = repeat(query, 'b x y d -> b n x y d', n=n)           # b n x y d
 
         # local-to-global cross-attention
         query = rearrange(query, 'b n (x w1) (y w2) d -> b n x y w1 w2 d',
@@ -464,11 +466,11 @@ class CrossViewSwapAttention(nn.Module):
                                                   key,
                                                   val,
                                                   skip=rearrange(x_skip,
-                                                            'b (x w1) (y w2) d -> b x y w1 w2 d',
-                                                            w1=self.q_win_size[0],
-                                                            w2=self.q_win_size[1])
+                                                                 'b (x w1) (y w2) d -> b x y w1 w2 d',
+                                                                 w1=self.q_win_size[0],
+                                                                 w2=self.q_win_size[1])
                                                   if self.skip else None),
-                       'b x y w1 w2 d  -> b (x w1) (y w2) d')  # reverse grid to feature
+                        'b x y w1 w2 d  -> b (x w1) (y w2) d')  # reverse grid to feature
 
         query = query + self.mlp_2(self.prenorm_2(query))
 
@@ -478,88 +480,6 @@ class CrossViewSwapAttention(nn.Module):
 
         return query
 
-
-
-# -------------------- Temporal fusion modules --------------------
-
-class ConvGRUCell(nn.Module):
-    """
-    Simple ConvGRU cell for BEV temporal fusion.
-    """
-    def __init__(self, dim: int, kernel_size: int = 3):
-        super().__init__()
-        pad = kernel_size // 2
-        self.reset = nn.Conv2d(dim * 2, dim, kernel_size, padding=pad)
-        self.update = nn.Conv2d(dim * 2, dim, kernel_size, padding=pad)
-        self.out = nn.Conv2d(dim * 2, dim, kernel_size, padding=pad)
-
-    def forward(self, x, h):
-        # x, h: (b, dim, H, W)
-        if h is None:
-            h = torch.zeros_like(x)
-        inp = torch.cat([x, h], dim=1)
-        r = torch.sigmoid(self.reset(inp))
-        z = torch.sigmoid(self.update(inp))
-        n = torch.tanh(self.out(torch.cat([x, r * h], dim=1)))
-        h_new = (1 - z) * n + z * h
-        return h_new
-
-
-class TemporalBEVModule(nn.Module):
-    """
-    Temporal fusion wrapper:
-    - optional warp of prev BEV to current coordinates using prev2cur affine (b,2,3)
-    - ConvGRU cell to fuse prev & current
-    - optional gating fusion (learned)
-    """
-    def __init__(self, dim: int):
-        super().__init__()
-        self.gru = ConvGRUCell(dim)
-        # small gating conv to fuse when both present
-        self.gate = nn.Sequential(
-            nn.Conv2d(dim * 2, dim, 1, bias=False),
-            nn.BatchNorm2d(dim),
-            nn.ReLU(inplace=True)
-        )
-
-    @staticmethod
-    def warp_bev(prev: torch.Tensor, A: Optional[torch.Tensor]) -> torch.Tensor:
-        """
-        prev: (b, d, H, W)
-        A: (b, 2, 3) affine transform in normalized coords (prev->cur)
-        If A is None, return prev unchanged.
-        """
-        if A is None:
-            return prev
-        b, d, H, W = prev.shape
-        # F.affine_grid expects theta mapping output coords to input coords; here assume A is that theta
-        grid = F.affine_grid(A, size=(b, d, H, W), align_corners=True)
-        warped = F.grid_sample(prev, grid, align_corners=True)
-        return warped
-
-    def forward(self, cur: torch.Tensor, prev: Optional[torch.Tensor] = None, prev2cur: Optional[torch.Tensor] = None):
-        """
-        cur: (b, d, H, W)
-        prev: (b, d, H, W) or None
-        prev2cur: (b, 2, 3) or None
-        returns: fused (b, d, H, W)
-        """
-        if prev is None:
-            # no temporal info
-            h = self.gru(cur, None)
-            return h
-
-        # warp prev to current
-        prev_warp = self.warp_bev(prev, prev2cur)
-        # optionally refine prev via gate
-        combined = torch.cat([cur, prev_warp], dim=1)
-        gated = self.gate(combined)
-        # GRU: use gated as input, prev_warp as hidden state
-        h = self.gru(gated, prev_warp)
-        return h
-
-
-# -------------------- PyramidAxialEncoder (with temporal fusion) --------------------
 
 class PyramidAxialEncoder(nn.Module):
     def __init__(
@@ -572,6 +492,7 @@ class PyramidAxialEncoder(nn.Module):
             dim: list,
             middle: List[int] = [2, 2],
             scale: float = 1.0,
+            use_temporal_fusion: bool = True, # TEMPORAL FUSION MODIFICATION
     ):
         super().__init__()
 
@@ -590,7 +511,7 @@ class PyramidAxialEncoder(nn.Module):
         downsample_layers = list()
 
         for i, (feat_shape, num_layers) in enumerate(zip(self.backbone.output_shapes, middle)):
-            _, feat_dim, feat_height, feat_width = self.down(torch.zeros(feat_shape)).shape
+            _, feat_dim, feat_height, feat_width = self.down(torch.zeros(1, *feat_shape)).shape
 
             cva = CrossViewSwapAttention(feat_height, feat_width, feat_dim, dim[i], i, **cross_view, **cross_view_swap)
             cross_views.append(cva)
@@ -618,64 +539,103 @@ class PyramidAxialEncoder(nn.Module):
         self.cross_views = nn.ModuleList(cross_views)
         self.layers = nn.ModuleList(layers)
         self.downsample_layers = nn.ModuleList(downsample_layers)
-        # temporal modules per scale
-        self.temporal_modules = nn.ModuleList([TemporalBEVModule(dim[i]) for i in range(len(middle))])
+        
+        # TEMPORAL FUSION MODIFICATION: Add temporal fusion module
+        self.use_temporal_fusion = use_temporal_fusion
+        if self.use_temporal_fusion:
+            # Assumes the final BEV feature dimension is dim[-1]
+            final_bev_dim = dim[-1]
+            self.temporal_fusion = nn.Sequential(
+                nn.Conv2d(final_bev_dim * 2, final_bev_dim, kernel_size=3, padding=1, bias=False),
+                nn.BatchNorm2d(final_bev_dim),
+                nn.ReLU(True),
+            )
+        
         # self.self_attn = Attention(dim[-1], **self_attn)
 
     def forward(self, batch):
+        # TEMPORAL FUSION MODIFICATION: Handle image sequences
+        if self.use_temporal_fusion:
+            return self.forward_temporal(batch)
+        else:
+            return self.forward_single(batch)
+
+    def forward_single(self, batch):
+        """ Original forward method for a single timestamp """
         b, n, _, _, _ = batch['image'].shape
-
-        image = batch['image'].flatten(0, 1)            # (b*n, c, h, w)
-        I_inv = batch['intrinsics'].inverse()           # b n 3 3
-        E_inv = batch['extrinsics'].inverse()           # b n 4 4
-
-        # optional temporal inputs:
-        prev_bev = batch.get('prev_bev', None)          # (b, d, H, W) or None
-        prev2cur = batch.get('prev2cur_bev', None)      # (b, 2, 3) affine or None
-
-        # ✅ 여기서 object_count 가져오기
+        
+        image = batch['image'].flatten(0, 1)      # b n c h w
+        I_inv = batch['intrinsics'].inverse()     # b n 3 3
+        E_inv = batch['extrinsics'].inverse()     # b n 4 4
         object_count = batch.get('object_count', None)
-
+        
         features = [self.down(y) for y in self.backbone(self.norm(image))]
 
-        x = self.bev_embedding.get_prior()              # d H W
-        x = repeat(x, '... -> b ...', b=b)              # b d H W
+        x = self.bev_embedding.get_prior()        # d H W
+        x = repeat(x, '... -> b ...', b=b)        # b d H W
 
-        # iterate scales
         for i, (cross_view, feature, layer) in \
                 enumerate(zip(self.cross_views, features, self.layers)):
             feature = rearrange(feature, '(b n) ... -> b n ...', b=b, n=n)
 
-            # cross-view attention / swap
             x = cross_view(i, x, self.bev_embedding, feature, I_inv, E_inv, object_count)
-            # residual refinement via ResNet blocks
             x = layer(x)
-
-            # temporal fusion at this scale (call module always so its params are used)
-            if prev_bev is not None:
-                try:
-                    # if prev_bev matches shape (b,d,H,W)
-                    if prev_bev.shape == x.shape:
-                        x = self.temporal_modules[i](x, prev_bev, prev2cur)
-                    else:
-                        # if prev_bev provided at a different resolution, resize prev_bev to match current x
-                        prev_resized = F.interpolate(prev_bev, size=x.shape[-2:], mode='bilinear', align_corners=False)
-                        x = self.temporal_modules[i](x, prev_resized, prev2cur)
-                except Exception:
-                    # fallback: if any issue with warping, just run GRU without prev
-                    x = self.temporal_modules[i](x, None, None)
-            else:
-                # ensure module parameters are used (module called) even when no prev
-                x = self.temporal_modules[i](x, None, None)
-
             if i < len(features)-1:
                 down_sample_block = self.downsample_layers[i]
                 x = down_sample_block(x)
 
-        # NOTE: removed the previous 'aux' DDP hack because it caused reentrant-backward issues.
-        # If you see DDP "unused parameter" errors again, enable find_unused_parameters=True in DDP
-        # or provide TORCH_DISTRIBUTED_DEBUG=DETAIL logs so we can locate unused params precisely.
+        return x
 
+    def forward_temporal(self, batch):
+        """ Forward method for handling sequences of images for temporal fusion """
+        # batch['image'] shape: (b, T, n, c, h, w) where T is sequence length
+        b, T, n, c, h, w = batch['image'].shape
+        
+        prev_bev = None
+        
+        for t in range(T):
+            # Extract data for the current timestep
+            image_t = batch['image'][:, t].flatten(0, 1)    # (b*n, c, h, w)
+            I_inv_t = batch['intrinsics'][:, t]             # (b, n, 3, 3)
+            E_inv_t = batch['extrinsics'][:, t].inverse()   # (b, n, 4, 4)
+            object_count = batch.get('object_count', None) # Assuming object_count is not time-dependent for now
+            
+            # --- 1. Compute BEV features for the current frame ---
+            features = [self.down(y) for y in self.backbone(self.norm(image_t))]
+
+            x = self.bev_embedding.get_prior()
+            x = repeat(x, '... -> b ...', b=b)
+
+            for i, (cross_view, feature, layer) in \
+                    enumerate(zip(self.cross_views, features, self.layers)):
+                feature = rearrange(feature, '(b n) ... -> b n ...', b=b, n=n)
+                x = cross_view(i, x, self.bev_embedding, feature, I_inv_t, E_inv_t, object_count)
+                x = layer(x)
+                if i < len(features)-1:
+                    down_sample_block = self.downsample_layers[i]
+                    x = down_sample_block(x)
+            
+            # --- 2. Fuse with previous BEV features ---
+            if prev_bev is not None:
+                # Get transformation from previous frame to current frame
+                # This matrix should transform points from prev frame's ego-coords to current frame's ego-coords
+                transform_matrix = batch['transform_matrix'][:, t] # (b, 4, 4)
+                
+                # Warp previous BEV to align with the current frame
+                # Extract 2x3 affine matrix for the BEV plane (X-Y)
+                # Note: The indices [0, 1, 3] are for extracting R_xx, R_xy, T_x and R_yx, R_yy, T_y
+                affine_matrix = transform_matrix[:, :2, [0, 1, 3]]
+                
+                grid = F.affine_grid(affine_matrix, prev_bev.size(), align_corners=False)
+                warped_prev_bev = F.grid_sample(prev_bev, grid, padding_mode='zeros', align_corners=False)
+                
+                # Concatenate and fuse
+                x = torch.cat([x, warped_prev_bev], dim=1)
+                x = self.temporal_fusion(x)
+                
+            # Update previous BEV for the next timestep
+            prev_bev = x
+            
         return x
 
 
@@ -702,44 +662,29 @@ if __name__ == "__main__":
         return param
 
     os.environ['CUDA_VISIBLE_DEVICES'] = '0,1'
-
+    
+    # Note: The test code below needs to be updated to test the new temporal functionality.
+    # The batch dictionary now expects tensors with a time dimension (T) and a 'transform_matrix'.
+    
+    print("Original test code for CrossWinAttention:")
     block = CrossWinAttention(dim=128,
                               heads=4,
                               dim_head=32,
                               qkv_bias=True,)
     block.cuda()
-    test_q = torch.rand(1, 6, 5, 5, 5, 5, 128)
-    test_k = test_v = torch.rand(1, 6, 5, 5, 6, 12, 128)
-    test_q = test_q.cuda()
-    test_k = test_k.cuda()
-    test_v = test_v.cuda()
-
-    # test pad divisible
-    # output = block.pad_divisble(x=test_data, win_h=6, win_w=12)
+    test_q = torch.rand(1, 6, 5, 5, 5, 5, 128).cuda()
+    test_k = test_v = torch.rand(1, 6, 5, 5, 6, 12, 128).cuda()
     output = block(test_q, test_k, test_v)
-    print(output.shape)
-
-    image = torch.rand(1, 6, 128, 28, 60)            # b n c h w
-    I_inv = torch.rand(1, 6, 3, 3)           # b n 3 3
-    E_inv = torch.rand(1, 6, 4, 4)           # b n 4 4
-
-    feature = torch.rand(1, 6, 128, 25, 25)
-
-    x = torch.rand(1, 128, 25, 25)                     # b d H W
-
-    # block = CrossViewSwapAttention(...)
-    block.cuda()
-
-    ##### EncoderSwap
-    params = load_yaml('config/model/cvt_pyramid_swap.yaml')
-
-    print(params)
-
-    batch = {}
-    batch['image'] = image
-    batch['intrinsics'] = I_inv
-    batch['extrinsics'] = E_inv
-
-    out = encoder(batch)
-
-    print(out.shape)
+    print("CrossWinAttention output shape:", output.shape)
+    
+    # The following test for PyramidAxialEncoder is now outdated due to temporal fusion changes.
+    # To test, you would need to:
+    # 1. Create a dummy backbone.
+    # 2. Instantiate PyramidAxialEncoder with a config.
+    # 3. Create a batch dictionary with shapes like:
+    #    'image': (B, T, N, C, H, W)
+    #    'intrinsics': (B, T, N, 3, 3)
+    #    'extrinsics': (B, T, N, 4, 4)
+    #    'transform_matrix': (B, T, 4, 4) - Note: T-1 transforms for T frames
+    
+    print("\nNOTE: The main test block for PyramidAxialEncoder needs to be updated to support the new temporal input format.")
