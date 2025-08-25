@@ -1,4 +1,4 @@
-# encoder_pyramid_axial.py (수정된 전체 파일)
+# encoder_pyramid_axial.py (에러 수정 전체 파일)
 import sys
 import torch
 import torch.nn as nn
@@ -90,8 +90,6 @@ class BEVEmbedding(nn.Module):
     def get_prior(self):
         return self.learned_features
 
-
-# ---------------- Depth-aware modules ----------------
 
 class DepthHead(nn.Module):
     def __init__(self, in_dim: int, n_bins: int = 64):
@@ -192,8 +190,6 @@ class LiftSplatBEV(nn.Module):
         return bev
 
 
-# ---------------- Deformable cross-attention (simplified, robust) ----------------
-
 class DeformableCrossAttention(nn.Module):
     def __init__(self, dim: int, heads: int = 8, dim_head: int = 32, n_points: int = 8, qkv_bias: bool = True):
         super().__init__()
@@ -206,7 +202,6 @@ class DeformableCrossAttention(nn.Module):
         self.to_q = nn.Linear(dim, inner, bias=qkv_bias)
         self.to_kv = nn.Conv2d(dim, 2 * inner, 1, bias=qkv_bias)
 
-        # offsets predicted from BEV queries (per BEV cell), normalized ([-1,1])
         self.offset_mlp = nn.Sequential(
             nn.Conv2d(dim, dim, 1, bias=True),
             nn.ReLU(inplace=True),
@@ -232,91 +227,71 @@ class DeformableCrossAttention(nn.Module):
         return uv
 
     def forward(self, bev: torch.Tensor, img_feats: torch.Tensor, K: torch.Tensor, E: torch.Tensor, world_xy: torch.Tensor):
-        # bev: (b, d, H, W)
-        # img_feats: (b, n, d_img, h, w)
         b, d, H, W = bev.shape
-        b2, n, d_img, h, w = img_feats.shape
-        assert b2 == b
+        _, n, d_img, h, w = img_feats.shape
 
-        # project BEV centers to image pixel coords normalized grid
-        world_xy_bn = world_xy[None, None, ...].expand(b, n, -1, -1, -1)   # b n 2 H W
-        uv = self._project_bev_to_image(world_xy_bn, K, E)                 # b n 2 H W
-        grid = normalize_grid_uv(rearrange(uv, 'b n c h w -> b n h w c'), h, w)  # b n H W 2
+        world_xy_bn = world_xy[None, None, ...].expand(b, n, -1, -1, -1)
+        uv = self._project_bev_to_image(world_xy_bn, K, E)
+        grid = normalize_grid_uv(rearrange(uv, 'b n c h w -> b n h w c'), h, w)
 
-        # kv projection
         kv = rearrange(img_feats, 'b n d h w -> (b n) d h w')
-        kv = self.to_kv(kv)  # (b*n, 2*inner, h, w)
-        k_proj, v_proj = torch.chunk(kv, 2, dim=1)  # each: (b*n, inner, h, w)
-        # reshape to (b, n, inner, h, w)
+        kv = self.to_kv(kv)
+        k_proj, v_proj = torch.chunk(kv, 2, dim=1)
         k_proj = rearrange(k_proj, '(b n) c h w -> b n c h w', b=b, n=n)
         v_proj = rearrange(v_proj, '(b n) c h w -> b n c h w', b=b, n=n)
 
-        # offsets predicted from BEV queries
-        # bev -> offset maps shape (b, 2*p, H, W) -> (b, p, H, W, 2) -> expand to (b, n, p, H, W, 2)
-        offset_raw = self.offset_mlp(bev)  # (b, 2*p, H, W)
+        offset_raw = self.offset_mlp(bev)
         p = self.n_points
         offset_raw = offset_raw.view(b, p, 2, H, W)
-        offset_raw = rearrange(offset_raw, 'b p c H W -> b p H W c')  # (b, p, H, W, 2)
-        offset_raw = offset_raw[:, None, ...].expand(-1, n, -1, -1, -1, -1)  # (b, n, p, H, W, 2)
+        offset_raw = rearrange(offset_raw, 'b p c H W -> b p H W c')
+        offset_raw = offset_raw[:, None, ...].expand(-1, n, -1, -1, -1, -1)
 
-        # normalized base grid for each BEV cell in image feature coords
-        grid_rep = grid[:, :, None, ...].expand(-1, -1, p, -1, -1, -1)  # (b, n, p, H, W, 2)
-        samp_grid = (grid_rep + offset_raw).clamp(-1, 1)  # normalized in [-1,1]
+        grid_rep = grid[:, :, None, ...].expand(-1, -1, p, -1, -1, -1)
+        samp_grid = (grid_rep + offset_raw).clamp(-1, 1)
 
-        # sample k and v for each p using grid_sample (loop over p)
-        bn = b * n
         k_proj_flat = rearrange(k_proj, 'b n c h w -> (b n) c h w')
         v_proj_flat = rearrange(v_proj, 'b n c h w -> (b n) c h w')
 
         samp_grid_flat = rearrange(samp_grid, 'b n p H W c -> (b n) p H W c')
-        # We'll loop over p points (p small like 4~16)
+
         k_samples = []
         v_samples = []
         for pi in range(p):
-            gpi = samp_grid_flat[:, pi, ...]  # (b*n, H, W, 2)
-            out_k = F.grid_sample(k_proj_flat, gpi, align_corners=True)  # (b*n, inner, H, W)
+            gpi = samp_grid_flat[:, pi, ...]
+            out_k = F.grid_sample(k_proj_flat, gpi, align_corners=True)
             out_v = F.grid_sample(v_proj_flat, gpi, align_corners=True)
             k_samples.append(out_k)
             v_samples.append(out_v)
-        # stack -> (b*n, p, inner, H, W)
-        k_stack = torch.stack(k_samples, dim=1)
+
+        k_stack = torch.stack(k_samples, dim=1)  # (b*n, p, inner, H, W)
         v_stack = torch.stack(v_samples, dim=1)
-        # reshape to (b, n, p, inner, H, W)
         k_stack = rearrange(k_stack, '(b n) p c H W -> b n p c H W', b=b, n=n)
         v_stack = rearrange(v_stack, '(b n) p c H W -> b n p c H W', b=b, n=n)
 
-        # split inner -> heads * dim_head
         inner = self.heads * self.dim_head
         k_heads = rearrange(k_stack, 'b n p (m d) H W -> b m n p d H W', m=self.heads, d=self.dim_head)
         v_heads = rearrange(v_stack, 'b n p (m d) H W -> b m n p d H W', m=self.heads, d=self.dim_head)
 
-        # q: (b, heads, HW, dim_head)
         q = self.to_q(rearrange(bev, 'b d H W -> b (H W) d'))  # (b, HW, inner)
-        q = rearrange(q, 'b (H W) (m d) -> b m (H W) d', m=self.heads, d=self.dim_head)
+        HW = H * W
+        # SAFE reshape without relying on einops to infer H,W
+        q = q.view(b, HW, self.heads, self.dim_head).permute(0, 2, 1, 3)  # b, m, HW, d
 
-        # compute similarity: (b, m, n, p, HW)
-        # reshape k_heads to (b, m, n, p, d, HW)
+        # prepare for dot product
+        q_hw = q.permute(0, 1, 3, 2)  # b, m, d, HW
         k_hw = rearrange(k_heads, 'b m n p d H W -> b m n p d (H W)')
-        q_hw = rearrange(q, 'b m (H W) d -> b m d (H W)')
-        sim = torch.einsum('b m d q, b m n p d q -> b m n p q', q_hw, k_hw)  # b m n p HW
+        # sim: b m n p HW  (einsum simpler)
+        sim = torch.einsum('b m d q, b m n p d q -> b m n p q', q_hw, k_hw)
+        att = sim.softmax(dim=3)
 
-        # softmax over p
-        att = sim.softmax(dim=3)  # softmax on p dimension
-
-        # weighted sum of v: v_heads -> b m n p d (HW)
         v_hw = rearrange(v_heads, 'b m n p d H W -> b m n p d (H W)')
-        # multiply att (b m n p HW) with v_hw (b m n p d HW) -> sum over p to get (b m n d HW)
         weighted = (att.unsqueeze(4) * v_hw).sum(dim=3)  # b m n d HW
-        # average over cameras
-        weighted = weighted.mean(dim=2)  # b m d HW
+        weighted = weighted.mean(dim=2)  # mean over cameras -> b m d HW
 
-        # merge heads and project
         out = rearrange(weighted, 'b m d (H W) -> b (m d) (H W)', H=H, W=W)
         out = rearrange(self.proj(rearrange(out, 'b c (H W) -> b (H W) c', H=H, W=W)), 'b (H W) c -> b c H W', H=H, W=W)
         return out
 
-
-# ---------------- CrossView block combining Deformable + Depth lift ----------------
 
 class CrossViewDeformableBlock(nn.Module):
     def __init__(
@@ -423,8 +398,6 @@ class CrossViewDeformableBlock(nn.Module):
         return fused
 
 
-# ---------------- Temporal fusion ----------------
-
 class ConvGRUCell(nn.Module):
     def __init__(self, dim: int, kernel_size: int = 3):
         super().__init__()
@@ -463,8 +436,6 @@ class TemporalBEVGRU(nn.Module):
         h = self.cell(x, prev)
         return h
 
-
-# ---------------- PyramidAxialEncoder combining everything ----------------
 
 class PyramidAxialEncoder(nn.Module):
     def __init__(
@@ -539,7 +510,6 @@ class PyramidAxialEncoder(nn.Module):
             feature = rearrange(feature, '(b n) ... -> b n ...', b=b, n=n)
             x = cross_view(i, x, self.bev_embedding, feature, K, E, I_inv, E_inv, batch.get('object_count', None))
             x = layer(x)
-            # apply temporal fusion at stage 0 (you can expand to multiple stages)
             x = self.temporal[i](x, prev=prev_bev if i == 0 else None, prev2cur=prev2cur if i == 0 else None)
             if i < len(features) - 1:
                 x = self.downsample_layers[i](x)
@@ -547,7 +517,6 @@ class PyramidAxialEncoder(nn.Module):
         return x
 
 
-# ---------------- quick shape sanity test ----------------
 if __name__ == "__main__":
     import os, re, yaml
 
