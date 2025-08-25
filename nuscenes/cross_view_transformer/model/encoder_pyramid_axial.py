@@ -492,7 +492,7 @@ class PyramidAxialEncoder(nn.Module):
             dim: list,
             middle: List[int] = [2, 2],
             scale: float = 1.0,
-            use_temporal_fusion: bool = True, # TEMPORAL FUSION MODIFICATION
+            use_temporal_fusion: bool = True,
     ):
         super().__init__()
 
@@ -511,7 +511,17 @@ class PyramidAxialEncoder(nn.Module):
         downsample_layers = list()
 
         for i, (feat_shape, num_layers) in enumerate(zip(self.backbone.output_shapes, middle)):
-            _, feat_dim, feat_height, feat_width = self.down(torch.zeros(1, *feat_shape)).shape
+            # ERROR FIX: Create a dummy tensor that is guaranteed to be 4D
+            # This handles cases where feat_shape might already include a batch dimension.
+            dummy_feat = torch.zeros(feat_shape)
+            if dummy_feat.dim() == 3: # If shape is (C, H, W)
+                dummy_feat = dummy_feat.unsqueeze(0) # Add batch dim -> (1, C, H, W)
+            
+            # Now, dummy_feat is guaranteed to be 4D. Apply downsampling.
+            down_feat_shape = self.down(dummy_feat).shape
+            
+            # Unpack the shape of the downsampled feature map
+            _, feat_dim, feat_height, feat_width = down_feat_shape
 
             cva = CrossViewSwapAttention(feat_height, feat_width, feat_dim, dim[i], i, **cross_view, **cross_view_swap)
             cross_views.append(cva)
