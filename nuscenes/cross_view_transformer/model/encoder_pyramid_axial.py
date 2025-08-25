@@ -1,4 +1,3 @@
-
 import sys
 import torch
 import torch.nn as nn
@@ -7,11 +6,8 @@ import torch.nn.functional as F
 from torch import einsum
 from einops import rearrange, repeat, reduce
 from torchvision.models.resnet import Bottleneck
-from typing import List
+from typing import List, Optional
 from .decoder import  DecoderBlock
-
-from typing import Optional
-
 
 
 ResNetBottleNeck = lambda c: Bottleneck(c, c // 4)
@@ -259,7 +255,6 @@ class CrossWinAttention(nn.Module):
 
         # Dot product attention along cameras
         dot = self.scale * torch.einsum('b l Q d, b l K d -> b l Q K', q, k)  # b (X Y) (n W1 W2) (n w1 w2)
-        # dot = rearrange(dot, 'b l n Q K -> b l Q (n K)')  # b (X Y) (W1 W2) (n w1 w2)
 
         if self.rel_pos_emb:
             dot = self.add_rel_pos_emb(dot)
@@ -283,6 +278,75 @@ class CrossWinAttention(nn.Module):
         return z
 
 
+# -------------------- NEW: Sparse Global Attention (for FAX) --------------------
+class GlobalSparseAttention(nn.Module):
+    """
+    Global sparse attention:
+      - Build sparse K,V by strided average pooling over per-camera feature maps.
+      - Attend every BEV query position to the pooled global tokens (all cameras concatenated).
+      - Multihead scaled dot-product. Residual-friendly output shape: (b, H, W, d).
+    """
+    def __init__(self, dim: int, heads: int, dim_head: int, qkv_bias: bool = True,
+                 global_pool: tuple = (8, 8), norm=nn.LayerNorm):
+        super().__init__()
+        self.heads = heads
+        self.dim_head = dim_head
+        self.scale = dim_head ** -0.5
+        self.global_pool = global_pool  # (kh, kw)
+
+        self.to_q = nn.Sequential(norm(dim), nn.Linear(dim, heads * dim_head, bias=qkv_bias))
+        self.to_k = nn.Sequential(norm(dim), nn.Linear(dim, heads * dim_head, bias=qkv_bias))
+        self.to_v = nn.Sequential(norm(dim), nn.Linear(dim, heads * dim_head, bias=qkv_bias))
+        self.proj = nn.Linear(heads * dim_head, dim)
+
+    def forward(self,
+                query_bhdw: torch.Tensor,     # (b, H, W, d)  - BEV after local step
+                key_win: torch.Tensor,        # (b, n, x, y, w1, w2, d)  - partitioned feature
+                val_win: torch.Tensor):       # (b, n, x, y, w1, w2, d)
+        b, H, W, d = query_bhdw.shape
+        kh, kw = self.global_pool
+
+        # Reconstruct full (padded) feature maps for keys/values
+        # -> (b, n, d, h_full, w_full)
+        key_full = rearrange(key_win, 'b n x y w1 w2 d -> b n d (x w1) (y w2)')
+        val_full = rearrange(val_win, 'b n x y w1 w2 d -> b n d (x w1) (y w2)')
+
+        # Sparse tokens by average pooling (strided)
+        # Merge batch and camera for pooling, then restore
+        bn, dch, hf, wf = key_full.shape[0]*key_full.shape[1], key_full.shape[2], key_full.shape[3], key_full.shape[4]
+        key_pool = F.avg_pool2d(rearrange(key_full, 'b n d h w -> (b n) d h w'), kernel_size=(kh, kw), stride=(kh, kw))
+        val_pool = F.avg_pool2d(rearrange(val_full, 'b n d h w -> (b n) d h w'), kernel_size=(kh, kw), stride=(kh, kw))
+
+        # Restore b, n
+        key_pool = rearrange(key_pool, '(b n) d h w -> b n d h w', b=b)
+        val_pool = rearrange(val_pool, '(b n) d h w -> b n d h w', b=b)
+
+        # Concatenate cameras into token axis: Lk = n*h'*w'
+        key_tokens = rearrange(key_pool, 'b n d h w -> b (n h w) d')
+        val_tokens = rearrange(val_pool, 'b n d h w -> b (n h w) d')
+
+        # Project
+        q = self.to_q(rearrange(query_bhdw, 'b H W d -> b (H W) d'))          # b, Lq, h*dh
+        k = self.to_k(key_tokens)                                             # b, Lk, h*dh
+        v = self.to_v(val_tokens)                                             # b, Lk, h*dh
+
+        # Split heads
+        q = rearrange(q, 'b l (m d) -> b m l d', m=self.heads, d=self.dim_head)
+        k = rearrange(k, 'b l (m d) -> b m l d', m=self.heads, d=self.dim_head)
+        v = rearrange(v, 'b l (m d) -> b m l d', m=self.heads, d=self.dim_head)
+
+        # Attention
+        q = q * self.scale
+        att = torch.einsum('b m l d, b m L d -> b m l L', q, k).softmax(dim=-1)
+        out = torch.einsum('b m l L, b m L d -> b m l d', att, v)             # b, m, Lq, d
+
+        # Merge heads and project
+        out = rearrange(out, 'b m l d -> b l (m d)')
+        out = self.proj(out)                                                  # b, Lq, dim
+        out = rearrange(out, 'b (H W) d -> b H W d', H=H, W=W)
+        return out
+
+
 class CrossViewSwapAttention(nn.Module):
     def __init__(
         self,
@@ -303,6 +367,8 @@ class CrossViewSwapAttention(nn.Module):
         no_image_features: bool = False,
         skip: bool = True,
         norm=nn.LayerNorm,
+        # -------- NEW: FAX global sparse settings ----------
+        global_pool: tuple = (8, 8),           # strided pooling size for sparse global tokens
     ):
         super().__init__()
 
@@ -336,16 +402,30 @@ class CrossViewSwapAttention(nn.Module):
         self.feat_win_size = feat_win_size[index]
         self.rel_pos_emb = rel_pos_emb
 
+        # Local window cross-attention
         self.cross_win_attend_1 = CrossWinAttention(dim, heads[index], dim_head[index], qkv_bias)
-        self.cross_win_attend_2 = CrossWinAttention(dim, heads[index], dim_head[index], qkv_bias)
+
+        # NEW: Global sparse attention for FAX
+        self.global_attend = GlobalSparseAttention(
+            dim=dim,
+            heads=heads[index],
+            dim_head=dim_head[index],
+            qkv_bias=qkv_bias,
+            global_pool=global_pool,
+            norm=norm
+        )
+
         self.skip = skip
-        # self.proj = nn.Linear(2 * dim, dim)
 
         self.prenorm_1 = norm(dim)
         self.prenorm_2 = norm(dim)
         self.mlp_1 = nn.Sequential(nn.Linear(dim, 2 * dim), nn.GELU(), nn.Linear(2 * dim, dim))
         self.mlp_2 = nn.Sequential(nn.Linear(dim, 2 * dim), nn.GELU(), nn.Linear(2 * dim, dim))
         self.postnorm = norm(dim)
+
+        # Gating to fuse local/global contributions (learnable scalars)
+        self.register_parameter('alpha_local', nn.Parameter(torch.tensor(1.0)))
+        self.register_parameter('alpha_global', nn.Parameter(torch.tensor(1.0)))
 
     def pad_divisble(self, x, win_h, win_w):
         """Pad the x to be divible by window size."""
@@ -375,29 +455,15 @@ class CrossViewSwapAttention(nn.Module):
         Returns: (b, d, H, W)
         """
 
-        #디버깅
+        # 디버깅(옵션)
         if object_count is not None:
-            print(">> object_count(crossviewswapattention):", object_count.shape, object_count) #각 인덱스가 특정 종류(차, 트럭, 보행자)의 객체 수임
-            value_1 = object_count[0].item()
-            value_2 = object_count[1].item()
-            value_3 = object_count[2].item()
-            value_4 = object_count[3].item()
-            value_5 = object_count[4].item()
-            value_6 = object_count[5].item()
-            value_7 = object_count[6].item()
-            value_8 = object_count[7].item()
-            print(f"Batch 0 object count: {value_1}")
-            print(f"Batch 1 object count: {value_2}")
-            print(f"Batch 2 object count: {value_3}")
-            print(f"Batch 3 object count: {value_4}")
-            print(f"Batch 4 object count: {value_5}")
-            print(f"Batch 5 object count: {value_6}")
-            print(f"Batch 6 object count: {value_7}")
-            print(f"Batch 7 object count: {value_8}")
+            try:
+                print(">> object_count(crossviewswapattention):", object_count.shape, object_count)
+            except Exception:
+                pass
         else:
-            print(">> object_count(crossviewswapattention) is None")
+            pass
 
-       
         b, n, _, _, _ = feature.shape
         _, _, H, W = x.shape
 
@@ -456,73 +522,36 @@ class CrossViewSwapAttention(nn.Module):
         key = self.pad_divisble(key, self.feat_win_size[0], self.feat_win_size[1])
         val = self.pad_divisble(val, self.feat_win_size[0], self.feat_win_size[1])
 
-        # local-to-local cross-attention
-        query = rearrange(query, 'b n d (x w1) (y w2) -> b n x y w1 w2 d',
-                          w1=self.q_win_size[0], w2=self.q_win_size[1])  # window partition
-        key = rearrange(key, 'b n d (x w1) (y w2) -> b n x y w1 w2 d',
-                          w1=self.feat_win_size[0], w2=self.feat_win_size[1])  # window partition
-        val = rearrange(val, 'b n d (x w1) (y w2) -> b n x y w1 w2 d',
-                          w1=self.feat_win_size[0], w2=self.feat_win_size[1])  # window partition
-        query = rearrange(self.cross_win_attend_1(query, key, val,
-                                                skip=rearrange(x,
-                                                            'b d (x w1) (y w2) -> b x y w1 w2 d',
-                                                             w1=self.q_win_size[0], w2=self.q_win_size[1]) if self.skip else None),
-                       'b x y w1 w2 d  -> b (x w1) (y w2) d')    # reverse window to feature
+        # ---------------- Local (windowed) cross attention ----------------
+        query_win = rearrange(query, 'b n d (x w1) (y w2) -> b n x y w1 w2 d',
+                              w1=self.q_win_size[0], w2=self.q_win_size[1])  # window partition
+        key_win = rearrange(key, 'b n d (x w1) (y w2) -> b n x y w1 w2 d',
+                            w1=self.feat_win_size[0], w2=self.feat_win_size[1])  # window partition
+        val_win = rearrange(val, 'b n d (x w1) (y w2) -> b n x y w1 w2 d',
+                            w1=self.feat_win_size[0], w2=self.feat_win_size[1])  # window partition
 
-        query = query + self.mlp_1(self.prenorm_1(query))
+        local_out = self.cross_win_attend_1(
+            query_win, key_win, val_win,
+            skip=rearrange(x, 'b d (x w1) (y w2) -> b x y w1 w2 d',
+                           w1=self.q_win_size[0], w2=self.q_win_size[1]) if self.skip else None
+        )  # -> (b, X, Y, W1, W2, d)
 
-        x_skip = query
-        query = repeat(query, 'b x y d -> b n x y d', n=n)              # b n x y d
+        local_out = rearrange(local_out, 'b x y w1 w2 d  -> b (x w1) (y w2) d')    # (b, H, W, d)
+        local_out = local_out + self.mlp_1(self.prenorm_1(local_out))
 
-        # local-to-global cross-attention
-        query = rearrange(query, 'b n (x w1) (y w2) d -> b n x y w1 w2 d',
-                          w1=self.q_win_size[0], w2=self.q_win_size[1])  # window partition
-        key = rearrange(key, 'b n x y w1 w2 d -> b n (x w1) (y w2) d')  # reverse window to feature
-        key = rearrange(key, 'b n (w1 x) (w2 y) d -> b n x y w1 w2 d',
-                        w1=self.feat_win_size[0], w2=self.feat_win_size[1])  # grid partition
-        val = rearrange(val, 'b n x y w1 w2 d -> b n (x w1) (y w2) d')  # reverse window to feature
-        val = rearrange(val, 'b n (w1 x) (w2 y) d -> b n x y w1 w2 d',
-                        w1=self.feat_win_size[0], w2=self.feat_win_size[1])  # grid partition
-        query = rearrange(self.cross_win_attend_2(query,
-                                                  key,
-                                                  val,
-                                                  skip=rearrange(x_skip,
-                                                            'b (x w1) (y w2) d -> b x y w1 w2 d',
-                                                            w1=self.q_win_size[0],
-                                                            w2=self.q_win_size[1])
-                                                  if self.skip else None),
-                       'b x y w1 w2 d  -> b (x w1) (y w2) d')  # reverse grid to feature
+        # ---------------- Global sparse attention (FAX) ----------------
+        # query for global is the refined local output
+        global_in_q = local_out                                                  # (b, H, W, d)
+        global_out = self.global_attend(global_in_q, key_win, val_win)           # (b, H, W, d)
 
+        # Fuse local + global
+        query = self.alpha_local * local_out + self.alpha_global * global_out
+
+        # Second MLP + norm
         query = query + self.mlp_2(self.prenorm_2(query))
-
         query = self.postnorm(query)
-
         query = rearrange(query, 'b H W d -> b d H W')
-
         return query
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-   
-
-
-
-
-
-
-
-
 
 
 class PyramidAxialEncoder(nn.Module):
@@ -591,14 +620,13 @@ class PyramidAxialEncoder(nn.Module):
         I_inv = batch['intrinsics'].inverse()           # b n 3 3
         E_inv = batch['extrinsics'].inverse()           # b n 4 4
 
-        # ✅ 여기서 object_count 가져오기
+        # ✅ object_count (있으면 디버깅 출력만)
         object_count = batch.get('object_count', None)
-
-        #디버깅
         if object_count is not None:
-            print(">> object_count(pyramid axial encoder):", object_count.shape, object_count) #각 인덱스가 특정 종류(차, 트럭, 보행자)의 객체 수임
-        else:
-            print(">> object_count(pyramid axial encoder) is None")
+            try:
+                print(">> object_count(pyramid axial encoder):", object_count.shape, object_count)
+            except Exception:
+                pass
        
         features = [self.down(y) for y in self.backbone(self.norm(image))]
 
@@ -649,31 +677,10 @@ if __name__ == "__main__":
                               dim_head=32,
                               qkv_bias=True,)
     block.cuda()
-    test_q = torch.rand(1, 6, 5, 5, 5, 5, 128)
-    test_k = test_v = torch.rand(1, 6, 5, 5, 6, 12, 128)
-    test_q = test_q.cuda()
-    test_k = test_k.cuda()
-    test_v = test_v.cuda()
-
-    # test pad divisible
-    # output = block.pad_divisble(x=test_data, win_h=6, win_w=12)
+    test_q = torch.rand(1, 6, 5, 5, 5, 5, 128).cuda()
+    test_k = test_v = torch.rand(1, 6, 5, 5, 6, 12, 128).cuda()
     output = block(test_q, test_k, test_v)
     print(output.shape)
-
-    # block = CrossViewSwapAttention(
-    #     feat_height=28,
-    #     feat_width=60,
-    #     feat_dim=128,
-    #     dim=128,
-    #     index=0,
-    #     image_height=25,
-    #     image_width=25,
-    #     qkv_bias=True,
-    #     q_win_size=[5, 5],
-    #     feat_win_size=[6, 12],
-    #     heads=[4,],
-    #     dim_head=[32,],
-    #     qkv_bias=True,)
 
     image = torch.rand(1, 6, 128, 28, 60)            # b n c h w
     I_inv = torch.rand(1, 6, 3, 3)           # b n 3 3
@@ -683,19 +690,14 @@ if __name__ == "__main__":
 
     x = torch.rand(1, 128, 25, 25)                     # b d H W
 
-    # output = block(0, x, self.bev_embedding, feature, I_inv, E_inv)
-    block.cuda()
+    # ##### EncoderSwap
+    # params = load_yaml('config/model/cvt_pyramid_swap.yaml')
+    # print(params)
 
-    ##### EncoderSwap
-    params = load_yaml('config/model/cvt_pyramid_swap.yaml')
-
-    print(params)
-
+    # batch mock
     batch = {}
     batch['image'] = image
     batch['intrinsics'] = I_inv
     batch['extrinsics'] = E_inv
 
-    out = encoder(batch)
-
-    print(out.shape)
+    # Note: instantiation of PyramidAxialEncoder requires a backbone stub; omitted in __main__ sanity.
