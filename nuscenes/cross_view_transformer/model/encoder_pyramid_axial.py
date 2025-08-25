@@ -55,7 +55,6 @@ def normalize_grid_uv(uv: torch.Tensor, h: int, w: int) -> torch.Tensor:
     uv: (..., 2) in pixel coords (u=x, v=y) for feature map of size (h,w)
     return: (..., 2) normalized to [-1,1] for grid_sample (x,y)
     """
-    # grid_sample expects x in [-1,1] for width (cols), y for height (rows)
     x = (uv[..., 0] / (w - 1)) * 2 - 1
     y = (uv[..., 1] / (h - 1)) * 2 - 1
     return torch.stack([x, y], dim=-1)
@@ -139,11 +138,10 @@ class DepthHead(nn.Module):
 class LiftSplatBEV(nn.Module):
     """
     Lift camera features to 3D along rays and splat onto ground plane (Z=0) BEV.
-    We use expected depth (soft) and solve for intersection with Z=0 using camera rays.
     """
-    def __init__(self, bev_h: int, bev_w: int, h_m: float, w_m: float, offset: float):
+    def __init__(self, V: torch.Tensor, bev_h: int, bev_w: int):
         super().__init__()
-        V = torch.FloatTensor(get_view_matrix(bev_h, bev_w, h_m, w_m, offset))
+        # Use BEVEmbedding's V to guarantee identical mapping
         self.register_buffer('V', V, persistent=False)
         self.bev_h = bev_h
         self.bev_w = bev_w
@@ -155,7 +153,8 @@ class LiftSplatBEV(nn.Module):
         d_xyz: (..., 3) ray direction in ego (not normalized ok)
         returns XY at Z=0
         """
-        dz = d_xyz[..., 2].clamp(min=1e-6, max=-1e-6) if (d_xyz[..., 2] == 0).any() else d_xyz[..., 2]
+        dz = d_xyz[..., 2].clone()
+        dz[dz.abs() < 1e-6] = 1e-6
         s = (-c_xyz[..., 2]) / dz
         xy = c_xyz[..., :2] + d_xyz[..., :2] * s[..., None]
         return xy
@@ -166,7 +165,6 @@ class LiftSplatBEV(nn.Module):
         depth_prob: torch.Tensor,       # (b*n, D, h, w)
         I_inv: torch.Tensor,            # (b, n, 3, 3)
         E_inv: torch.Tensor,            # (b, n, 4, 4)
-        feat_hw: Tuple[int, int],
         n: int
     ):
         device = feat_bn.device
@@ -192,38 +190,24 @@ class LiftSplatBEV(nn.Module):
         c = E_inv_bn[..., :3, 3]                                       # (b*n, 3)
         c = c[:, None, :].expand(-1, h*w, -1)                          # (b*n, HW, 3)
 
-        # Expected depth (soft) to pick a point along ray: z_expected > 0
-        D = depth_prob.shape[1]
-        z_bins = torch.linspace(1.0, 60.0, D, device=device)           # 1~60m default; tune in config
-        z_exp = (depth_prob * z_bins[None, :, None, None]).sum(dim=1)  # (b*n, h, w)
-        z_exp = rearrange(z_exp, 'bn h w -> bn (h w) 1')               # (b*n, HW, 1)
+        # Depth confidence (max over bins as a soft confidence)
+        conf = depth_prob.max(dim=1).values                             # (b*n, h, w)
+        conf = rearrange(conf, 'bn h w -> bn (h w)')                    # (b*n, HW)
 
-        # scale ray direction to reach z_exp in camera frame is tricky;
-        # here we instead intersect ray with ground-plane using camera->ego ray,
-        # and simply use that XY (ignoring z_exp). For stronger depth use, weight features by confidence at ray depth mode.
+        # Intersect ray with ground plane Z=0
         xy_ego = self._ray_to_ground_intersection(c, d)                # (b*n, HW, 2)
 
         # ego->bev pixel
         bev_xy = ego_to_bev_xy(xy_ego, self.V)                         # (b*n, HW, 2)
 
-        # Normalize to [-1,1] grid for scatter via bilinear splat
-        gx = (bev_xy[..., 0] / (self.bev_w - 1)) * 2 - 1               # (b*n, HW)
-        gy = (bev_xy[..., 1] / (self.bev_h - 1)) * 2 - 1
-        grid = torch.stack([gx, gy], dim=-1)                            # (b*n, HW, 2)
+        # Normalize to pixel coords
+        px = bev_xy[..., 0].clamp(0, self.bev_w - 1e-4)
+        py = bev_xy[..., 1].clamp(0, self.bev_h - 1e-4)
 
-        # Sample weights = depth confidence (use max prob across bins as confidence)
-        conf = depth_prob.max(dim=1).values                             # (b*n, h, w)
-        conf = rearrange(conf, 'bn h w -> bn (h w) 1')                  # (b*n, HW,1)
-
-        # Bilinear splat using scatter-add approximation via manual weighting to 4 neighbors
-        # Convert normalized coords to pixel coords
-        px = (gx + 1) * (self.bev_w - 1) / 2
-        py = (gy + 1) * (self.bev_h - 1) / 2
-
-        x0 = px.floor().clamp(0, self.bev_w - 1)
-        y0 = py.floor().clamp(0, self.bev_h - 1)
-        x1 = (x0 + 1).clamp(0, self.bev_w - 1)
-        y1 = (y0 + 1).clamp(0, self.bev_h - 1)
+        x0 = px.floor()
+        y0 = py.floor()
+        x1 = (x0 + 1).clamp(max=self.bev_w - 1)
+        y1 = (y0 + 1).clamp(max=self.bev_h - 1)
 
         wa = (x1 - px) * (y1 - py)
         wb = (px - x0) * (y1 - py)
@@ -231,12 +215,12 @@ class LiftSplatBEV(nn.Module):
         wd = (px - x0) * (py - y0)
 
         feat_flat = rearrange(feat_bn, 'bn c h w -> bn c (h w)')        # (b*n, C, HW)
-
         bev = torch.zeros(b*n, C, self.bev_h, self.bev_w, device=device)
 
         def add_weighted(ix, iy, wgt):
             idx = (iy.long() * self.bev_w + ix.long())                  # (b*n, HW)
-            wfeat = feat_flat * (wgt * conf).transpose(1, 0).transpose(1, 2)  # (b*n, C, HW)
+            w = (wgt * conf).unsqueeze(1)                               # (b*n, 1, HW)
+            wfeat = feat_flat * w                                       # (b*n, C, HW)
             bev.view(b*n, C, -1).scatter_add_(2, idx[:, None, :], wfeat)
 
         add_weighted(x0, y0, wa)
@@ -265,8 +249,12 @@ class DeformableCrossAttention(nn.Module):
         inner = heads * dim_head
         self.to_q = nn.Linear(dim, inner, bias=qkv_bias)
         self.to_kv = nn.Conv2d(dim, 2 * inner, 1, bias=qkv_bias)
-        self.offset_mlp = nn.Sequential(nn.Conv2d(dim, inner, 1), nn.ReLU(inplace=True), nn.Conv2d(inner, heads * n_points * 2, 1))
-        self.attn_mlp = nn.Sequential(nn.Conv2d(dim, inner, 1), nn.ReLU(inplace=True), nn.Conv2d(inner, heads * n_points, 1))
+        self.offset_mlp = nn.Sequential(
+            nn.Conv2d(dim, inner, 1), nn.ReLU(inplace=True),
+            nn.Conv2d(inner, heads * n_points * 2, 1)
+        )
+        # attention weights from similarity only (stable). If 필요하면 아래 주석 해제 후 사용
+        # self.attn_mlp = nn.Sequential(nn.Conv2d(dim, inner, 1), nn.ReLU(inplace=True), nn.Conv2d(inner, heads * n_points, 1))
 
         self.proj = nn.Linear(inner, dim)
 
@@ -305,65 +293,59 @@ class DeformableCrossAttention(nn.Module):
     ):
         b, d, H, W = bev.shape
         n = img_feats.shape[1]
-        _, _, h, w = img_feats.shape[-3:]
+        h, w = img_feats.shape[-2:]  # FIX: was '_, _, h, w = img_feats.shape[-3:]'
 
         # project BEV cell centers to each camera feature plane
         world_xy_bn = world_xy[None, None, ...].expand(b, n, -1, -1, -1)   # (b,n,2,H,W)
         uv = self._project_bev_to_image(world_xy_bn, K, E)                 # (b,n,2,H,W)
-        grid = normalize_grid_uv(rearrange(uv, 'b n c h w -> b n h w c'), h, w)  # (b,n,H,W,2)
+        base_grid = normalize_grid_uv(rearrange(uv, 'b n c h w -> b n h w c'), h, w)  # (b,n,H,W,2)
 
-        # prepare heads
-        q = rearrange(self.to_q(rearrange(bev, 'b d H W -> b (H W) d')), 'b hw (m d1) -> b m hw d1', m=self.heads, d1=self.dim_head)
+        # prepare q
+        inner = self.heads * self.dim_head
+        q = rearrange(self.to_q(rearrange(bev, 'b d H W -> b (H W) d')), 'b hw (m d1) -> b m d1 hw', m=self.heads, d1=self.dim_head)
+
+        # prepare k,v (split per head for clean sampling)
         kv = rearrange(img_feats, 'b n d h w -> (b n) d h w')
         kv = self.to_kv(kv)                                                # (b*n, 2*inner, h, w)
         k, v = torch.chunk(kv, 2, dim=1)                                   # (b*n, inner, h, w)
+        k = rearrange(k, '(b n) (m d1) h w -> (b n m) d1 h w', b=b, n=n, m=self.heads, d1=self.dim_head)
+        v = rearrange(v, '(b n) (m d1) h w -> (b n m) d1 h w', b=b, n=n, m=self.heads, d1=self.dim_head)
 
-        # offsets & attn weights
-        off = self.offset_mlp(kv)                                          # (b*n, heads*n_points*2, h, w)
-        attw = self.attn_mlp(kv)                                           # (b*n, heads*n_points, h, w)
-        attw = rearrange(attw, '(b n) (m p) h w -> b n m p h w', b=b, n=n, m=self.heads, p=self.n_points)
-        attw = attw.softmax(dim=3)
-
-        # sample k,v at (grid + offsets)
+        # offsets per head & per sample point (predict from kv)
+        off = self.offset_mlp(rearrange(img_feats, 'b n d h w -> (b n) d h w'))   # (b*n, m*p*2, h, w)
         off = rearrange(off, '(b n) (m p c) h w -> b n m p h w c', b=b, n=n, m=self.heads, p=self.n_points, c=2)
-        # normalize offsets to feature grid [-1,1], assume offsets are pixels -> normalize
         off[..., 0] = off[..., 0] / max(w - 1, 1) * 2
         off[..., 1] = off[..., 1] / max(h - 1, 1) * 2
 
-        grid_rep = grid[:, :, None, None, ...].expand(-1, -1, self.heads, self.n_points, -1, -1, -1)  # b n m p H W 2
+        # per-head grids with offsets
+        grid_rep = base_grid[:, :, None, None, ...].expand(-1, -1, self.heads, self.n_points, -1, -1, -1)  # b n m p H W 2
         samp_grid = (grid_rep + off).clamp(-1, 1)                           # b n m p H W 2
 
-        def sample(feat):  # feat: (b*n, inner, h, w)
-            feat = rearrange(feat, '(b n) c h w -> b n c h w', b=b, n=n)
-            feat = feat[:, :, None, ...].expand(-1, -1, self.heads, -1, -1, -1)  # b n m inner h w
-            feat = rearrange(feat, 'b n m c h w -> (b n m) c h w')
-            g = rearrange(samp_grid, 'b n m p H W c -> (b n m) p H W c')
-            out = F.grid_sample(feat, g, align_corners=True)                 # (b*n*m, inner, p, H, W)
-            out = rearrange(out, '(b n m) c p H W -> b n m p c H W', b=b, n=n, m=self.heads)
+        # sample helper: per head / per p -> use batch trick for grid_sample
+        def sample(feat_head):  # (b n m, d1, h, w)
+            g = rearrange(samp_grid, 'b n m p H W c -> (b n m p) H W c')
+            feat_rep = feat_head.repeat_interleave(self.n_points, dim=0)     # (b n m p, d1, h, w)
+            out = F.grid_sample(feat_rep, g, align_corners=True)             # (b n m p, d1, H, W)
+            out = rearrange(out, '(b n m p) d1 H W -> b n m p d1 H W', b=b, n=n, m=self.heads, p=self.n_points)
             return out
 
-        k_s = sample(k)                                                     # b n m p inner H W
-        v_s = sample(v)
+        k_s = sample(k)   # (b, n, m, p, d1, H, W)
+        v_s = sample(v)   # (b, n, m, p, d1, H, W)
 
-        # dot(q,k) over head dims (use scaling)
-        qh = rearrange(q, 'b m hw d1 -> b m d1 hw')                          # (b, m, d1, HW)
-        qh = qh * self.scale
-        k_s = rearrange(k_s, 'b n m p (m2 d1) H W -> b n m p m2 d1 H W', m2=self.heads, d1=self.dim_head)
-        # select diag heads
-        k_s = k_s[..., torch.arange(self.heads), :, :, :]                    # b n m p d1 H W
-        k_s = rearrange(k_s, 'b n m p d1 H W -> b n m d1 p (H W)')
+        # attention: dot(q,k) per head over d1
+        qh = q * self.scale                                         # (b, m, d1, HW)
+        k_s = rearrange(k_s, 'b n m p d1 H W -> b n m p d1 (H W)')
+        qh = rearrange(qh, 'b m d1 (H W) -> b 1 m d1 (H W)', H=H, W=W)
+        sim = (qh * k_s).sum(dim=3)                                 # (b, n, m, p, HW)
+        att = sim.softmax(dim=3)                                    # softmax over p
 
-        qh = rearrange(qh, 'b m d1 (H W) -> b 1 m d1 1 (H W)', H=H, W=W)
-        sim = (qh * k_s).sum(dim=3)                                          # b n m p (H W)
-        att = (sim.softmax(dim=3) * rearrange(attw, 'b n m p H W -> b n m p (H W)'))
+        # weighted sum of v
+        v_s = rearrange(v_s, 'b n m p d1 H W -> b n m p d1 (H W)')
+        out = (att.unsqueeze(3) * v_s).sum(dim=3)                   # (b, n, m, d1, HW)
+        out = out.mean(dim=1)                                       # average over cameras -> (b, m, d1, HW)
 
-        # weighted sum of values
-        v_s = rearrange(v_s, 'b n m p (m2 d1) H W -> b n m p d1 (H W)', m2=self.heads, d1=self.dim_head)
-        v_s = (att.unsqueeze(3) * v_s).sum(dim=3)                             # b n m d1 (H W)
-        v_s = v_s.mean(dim=1)                                                # average over cameras: b m d1 (H W)
-
-        out = rearrange(v_s, 'b m d1 (H W) -> b (m d1) H W', H=H, W=W)
-        out = self.proj(out)                                                 # (b, d, H, W)
+        out = rearrange(out, 'b m d1 (H W) -> b (m d1) H W', H=H, W=W)
+        out = self.proj(out)                                        # (b, d, H, W)
         return out
 
 
@@ -428,13 +410,7 @@ class CrossViewDeformableBlock(nn.Module):
     def build_lift(self, bev: BEVEmbedding):
         # One-time setup with BEV sizes inferred from learned_features
         H, W = bev.learned_features.shape[-2:]
-        self.lift_splat = LiftSplatBEV(
-            bev_h=H,
-            bev_w=W,
-            h_m=float(bev.V_inv[1,2]*2/(-bev.V_inv[1,0]+1e-6)) if torch.is_tensor(bev.V_inv) else 100.0,
-            w_m=float(bev.V_inv[0,2]*2/(-bev.V_inv[0,1]+1e-6)) if torch.is_tensor(bev.V_inv) else 100.0,
-            offset=0.0
-        )
+        self.lift_splat = LiftSplatBEV(bev.V, H, W)
 
     def forward(
         self,
@@ -467,11 +443,11 @@ class CrossViewDeformableBlock(nn.Module):
         # image feature proj
         img_f = rearrange(feature, 'b n c h w -> (b n) c h w')
         img_f_proj = self.img_proj(img_f)                                 # (b*n, d, h, w)
-        img_f_proj = rearrange(img_f_proj, '(b n) d h w -> b n d h w', b=b, n=n)
+        img_f_proj_bn = rearrange(img_f_proj, '(b n) d h w -> b n d h w', b=b, n=n)
 
         # deformable cross-attention (BEV query -> image)
         x_skip = x
-        x = self.deform_attn(x, img_f_proj, K, E, world) + (x_skip if self.skip else 0)
+        x = self.deform_attn(x, img_f_proj_bn, K, E, world) + (x_skip if self.skip else 0)
         x = rearrange(x, 'b d H W -> b (H W) d')
         x = x + self.mlp(self.prenorm(x))
         x = self.postnorm(x)
@@ -479,7 +455,7 @@ class CrossViewDeformableBlock(nn.Module):
 
         # depth-aware lift-splat and fuse
         depth_prob = self.depth_head(img_f)                                # (b*n, D, h, w)
-        lift_bev = self.lift_splat(img_f_proj.reshape(b*n, -1, h, w), depth_prob, I_inv, E_inv, (h, w), n)  # (b, d, H, W)
+        lift_bev = self.lift_splat(img_f_proj, depth_prob, I_inv, E_inv, n)  # (b, d, H, W)
 
         x = self.fuse_gate(torch.cat([x, lift_bev], dim=1))
         return x
@@ -713,4 +689,4 @@ if __name__ == "__main__":
 
     with torch.no_grad():
         out = enc(batch)
-        print('Output:', out.shape)
+        print('Output:', out.shape
