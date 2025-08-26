@@ -106,13 +106,13 @@ class BEVEmbedding(nn.Module):
             grid = V_inv @ rearrange(grid, 'd h w -> d (h w)')  # 3 (h w)
             grid = rearrange(grid, 'd (h w) -> d h w', h=h, w=w)  # 3 h w
             # egocentric frame
-            self.register_buffer('grid%d' % i, grid, persistent=False)
+            self.register_buffer('grid%d'%i, grid, persistent=False)
 
             # 3 h w
         self.learned_features = nn.Parameter(
             sigma * torch.randn(dim,
-                                bev_height // upsample_scales[0],
-                                bev_width // upsample_scales[0]))  # d h w
+                                bev_height//upsample_scales[0],
+                                bev_width//upsample_scales[0]))  # d h w
 
     def get_prior(self):
         return self.learned_features
@@ -341,7 +341,7 @@ class CrossViewSwapAttention(nn.Module):
         self.postnorm = norm(dim)
 
     def pad_divisble(self, x, win_h, win_w):
-        """Pad the x to be divible by window size."""
+        """Pad the x to be divisible by window size."""
         _, _, _, h, w = x.shape
         # corrected ceil-to-multiple calculation
         h_pad = ((h + win_h - 1) // win_h) * win_h
@@ -519,7 +519,7 @@ class PyramidAxialEncoder(nn.Module):
             dim: list,
             middle: List[int] = [2, 2],
             scale: float = 1.0,
-            # --- CHANGES: GRU temporal parameters ---
+            # GRU temporal flag (기본 활성화)
             enable_gru_temporal: bool = True,
     ):
         super().__init__()
@@ -569,21 +569,20 @@ class PyramidAxialEncoder(nn.Module):
         self.downsample_layers = nn.ModuleList(downsample_layers)
         # self.self_attn = Attention(dim[-1], **self_attn)
 
-        # --- CHANGES: GRU temporal state ---
+        # --- GRU temporal ---
         self.enable_gru_temporal = bool(enable_gru_temporal)
-        # GRUCell works per spatial location with hidden size equal to BEV channel dim (dim[0])
         if self.enable_gru_temporal:
+            # GRUCell operates on per-spatial-location vector of size dim[0]
             self.gru_cell = nn.GRUCell(input_size=dim[0], hidden_size=dim[0])
-            # prev bev state (will be initialized on first forward). shape: (b, d, H, W)
+            # prev_bev stored per-model (one per process). Initialized to None.
             self.prev_bev: Optional[torch.Tensor] = None
 
     def reset_temporal_state(self):
-        """Call this at sequence/episode boundaries to clear stored previous BEV."""
+        """Call at sequence boundary to clear prev_bev."""
         if hasattr(self, 'prev_bev'):
             self.prev_bev = None
 
     def _prev_ready(self, x: torch.Tensor) -> bool:
-        """Check if prev_bev exists and is compatible with x (same shape & device)."""
         return (hasattr(self, 'prev_bev') and self.prev_bev is not None
                 and self.prev_bev.shape == x.shape
                 and self.prev_bev.device == x.device
@@ -592,7 +591,7 @@ class PyramidAxialEncoder(nn.Module):
     def forward(self, batch):
         b, n, _, _, _ = batch['image'].shape
 
-        image = batch['image'].flatten(0, 1)            # b*n, c, h, w  (but original code used flatten and backbone handles)
+        image = batch['image'].flatten(0, 1)            # b n c h w -> (b*n) c h w for backbone
         I_inv = batch['intrinsics'].inverse()           # b n 3 3
         E_inv = batch['extrinsics'].inverse()           # b n 4 4
 
@@ -612,29 +611,31 @@ class PyramidAxialEncoder(nn.Module):
 
         features = [self.down(y) for y in self.backbone(self.norm(image))]
 
-        # initial BEV prior (learned)
         x = self.bev_embedding.get_prior()              # d H W
         x = repeat(x, '... -> b ...', b=b)              # b d H W
 
-        # --- CHANGES: GRU temporal fusion BEFORE cross-view attention ---
-        # If we have a stored prev_bev compatible with current x, fuse using GRUCell per spatial location.
-        if self.enable_gru_temporal and self._prev_ready(x):
-            # x: (b, d, H, W)
+        # --- GRU fusion: 항상 GRUCell 호출하도록 변경 (DDP unused param 문제 해결) ---
+        if self.enable_gru_temporal:
             _, d, H, W = x.shape
-            # reshape to (b*H*W, d)
-            x_flat = rearrange(x, 'b d h w -> (b h w) d')  # current as input
-            prev_flat = rearrange(self.prev_bev, 'b d h w -> (b h w) d')  # hidden
-            # move to same device (should be same)
-            x_flat_device = x_flat.device
-            # apply GRUCell: h_new = GRUCell(input, h_prev)
-            h_new = self.gru_cell(x_flat, prev_flat)  # (b*h*w, d)
-            # reshape back to (b, d, H, W)
-            x = rearrange(h_new, '(b h w) d -> b d h w', b=b, h=H, w=W)
-        else:
-            # No prev state: keep x as-is; initialize prev_bev after forward
-            pass
+            # flatten spatial positions into batch dimension for per-location GRUCell
+            x_flat = rearrange(x, 'b d h w -> (b h w) d')  # (b*h*w, d)
+            if self._prev_ready(x):
+                prev_flat = rearrange(self.prev_bev, 'b d h w -> (b h w) d')
+            else:
+                # If no prev state, use zeros of same shape & device/dtype so GRU params are still used.
+                prev_flat = torch.zeros_like(x_flat)
 
-        # Main cross-view + layers pipeline (unchanged)
+            # Ensure tensors on same device/dtype (they should already be)
+            prev_flat = prev_flat.to(x_flat.device, dtype=x_flat.dtype)
+
+            # GRUCell: h_new = GRUCell(input=x_flat, hidden_prev=prev_flat)
+            # This ensures GRU parameters participate in every forward.
+            h_new = self.gru_cell(x_flat, prev_flat)  # (b*h*w, d)
+
+            # reshape back to BEV spatial map
+            x = rearrange(h_new, '(b h w) d -> b d h w', b=b, h=H, w=W)
+
+        # Main pipeline (cross-view + resnet bottlenecks)
         for i, (cross_view, feature, layer) in \
                 enumerate(zip(self.cross_views, features, self.layers)):
             feature = rearrange(feature, '(b n) ... -> b n ...', b=b, n=n)
@@ -647,11 +648,9 @@ class PyramidAxialEncoder(nn.Module):
 
         # x = self.self_attn(x)
 
-        # --- CHANGES: store prev_bev (detached) for next step ---
+        # store prev_bev detached for next forward
         if self.enable_gru_temporal:
-            # store detached copy
             with torch.no_grad():
-                # detach to prevent gradients flowing through time
                 self.prev_bev = x.detach().clone()
 
         return x
@@ -681,7 +680,7 @@ if __name__ == "__main__":
 
     os.environ['CUDA_VISIBLE_DEVICES'] = '0,1'
 
-    # quick shape sanity for CrossWinAttention
+    # Quick sanity test for CrossWinAttention shapes
     block = CrossWinAttention(dim=128,
                               heads=4,
                               dim_head=32,
@@ -693,10 +692,4 @@ if __name__ == "__main__":
     output = block(test_q, test_k, test_v)
     print("CrossWinAttention test output shape:", output.shape)
 
-    # Note: full encoder instantiation requires backbone and config
-    # Example (commented):
-    # params = load_yaml('config/model/cvt_pyramid_axial.yaml')
-    # encoder = PyramidAxialEncoder(backbone, cross_view, cross_view_swap, bev_embedding, self_attn, dim=[128,256], enable_gru_temporal=True)
-    # batch = {'image': image, 'intrinsics': I_inv, 'extrinsics': E_inv}
-    # out = encoder(batch)
-    # print(out.shape)
+    # Note: full encoder instantiation requires the actual 'backbone' and config dicts.
