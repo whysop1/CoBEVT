@@ -6,11 +6,8 @@ import torch.nn.functional as F
 from torch import einsum
 from einops import rearrange, repeat, reduce
 from torchvision.models.resnet import Bottleneck
-from typing import List
-from .decoder import  DecoderBlock
-
-from typing import Optional
-
+from typing import List, Optional
+from .decoder import DecoderBlock
 
 
 ResNetBottleNeck = lambda c: Bottleneck(c, c // 4)
@@ -81,44 +78,27 @@ class BEVEmbedding(nn.Module):
             offset: int,
             upsample_scales: list,
     ):
-        """
-        Only real arguments are:
-
-        dim: embedding size
-        sigma: scale for initializing embedding
-
-        The rest of the arguments are used for constructing the view matrix.
-
-        In hindsight we should have just specified the view matrix in config
-        and passed in the view matrix...
-        """
         super().__init__()
 
-        # map from bev coordinates to ego frame
-        V = get_view_matrix(bev_height, bev_width, h_meters, w_meters,
-                            offset)  # 3 3
-        V_inv = torch.FloatTensor(V).inverse()  # 3 3
+        V = get_view_matrix(bev_height, bev_width, h_meters, w_meters, offset)
+        V_inv = torch.FloatTensor(V).inverse()
 
         for i, scale in enumerate(upsample_scales):
-            # each decoder block upsamples the bev embedding by a factor of 2
             h = bev_height // scale
             w = bev_width // scale
 
-            # bev coordinates
             grid = generate_grid(h, w).squeeze(0)
             grid[0] = bev_width * grid[0]
             grid[1] = bev_height * grid[1]
 
             grid = V_inv @ rearrange(grid, 'd h w -> d (h w)')  # 3 (h w)
-            grid = rearrange(grid, 'd (h w) -> d h w', h=h, w=w)  # 3 h w
-            # egocentric frame
-            self.register_buffer('grid%d'%i, grid, persistent=False)
+            grid = rearrange(grid, 'd (h w) -> d h w', h=h, w=w)
+            self.register_buffer('grid%d' % i, grid, persistent=False)
 
-            # 3 h w
         self.learned_features = nn.Parameter(
             sigma * torch.randn(dim,
-                                bev_height//upsample_scales[0],
-                                bev_width//upsample_scales[0]))  # d h w
+                                bev_height // upsample_scales[0],
+                                bev_width // upsample_scales[0]))  # d h w
 
     def get_prior(self):
         return self.learned_features
@@ -128,9 +108,9 @@ class Attention(nn.Module):
     def __init__(
         self,
         dim,
-        dim_head = 32,
-        dropout = 0.,
-        window_size = 25
+        dim_head=32,
+        dropout=0.,
+        window_size=25
     ):
         super().__init__()
         assert (dim % dim_head) == 0, 'dimension should be divisible by dimension per head'
@@ -138,74 +118,48 @@ class Attention(nn.Module):
         self.heads = dim // dim_head
         self.scale = dim_head ** -0.5
 
-        self.to_qkv = nn.Linear(dim, dim * 3, bias = False)
+        self.to_qkv = nn.Linear(dim, dim * 3, bias=False)
 
         self.attend = nn.Sequential(
-            nn.Softmax(dim = -1),
+            nn.Softmax(dim=-1),
             nn.Dropout(dropout)
         )
 
         self.to_out = nn.Sequential(
-            nn.Linear(dim, dim, bias = False),
+            nn.Linear(dim, dim, bias=False),
             nn.Dropout(dropout)
         )
 
         # relative positional bias
-
         self.rel_pos_bias = nn.Embedding((2 * window_size - 1) ** 2, self.heads)
 
         pos = torch.arange(window_size)
-        grid = torch.stack(torch.meshgrid(pos, pos, indexing = 'ij'))
+        grid = torch.stack(torch.meshgrid(pos, pos, indexing='ij'))
         grid = rearrange(grid, 'c i j -> (i j) c')
         rel_pos = rearrange(grid, 'i ... -> i 1 ...') - rearrange(grid, 'j ... -> 1 j ...')
         rel_pos += window_size - 1
-        rel_pos_indices = (rel_pos * torch.tensor([2 * window_size - 1, 1])).sum(dim = -1)
+        rel_pos_indices = (rel_pos * torch.tensor([2 * window_size - 1, 1])).sum(dim=-1)
 
-        self.register_buffer('rel_pos_indices', rel_pos_indices, persistent = False)
+        self.register_buffer('rel_pos_indices', rel_pos_indices, persistent=False)
 
     def forward(self, x):
         batch, _, height, width, device, h = *x.shape, x.device, self.heads
 
-        # flatten
-
         x = rearrange(x, 'b d h w -> b (h w) d')
 
-        # project for queries, keys, values
-
-        q, k, v = self.to_qkv(x).chunk(3, dim = -1)
-
-        # split heads
-
-        q, k, v = map(lambda t: rearrange(t, 'b n (h d ) -> b h n d', h = h), (q, k, v))
-
-        # scale
-
+        q, k, v = self.to_qkv(x).chunk(3, dim=-1)
+        q, k, v = map(lambda t: rearrange(t, 'b n (h d ) -> b h n d', h=h), (q, k, v))
         q = q * self.scale
 
-        # sim
-
         sim = einsum('b h i d, b h j d -> b h i j', q, k)
-
-        # add positional bias
 
         bias = self.rel_pos_bias(self.rel_pos_indices)
         sim = sim + rearrange(bias, 'i j h -> h i j')
 
-        # attention
-
         attn = self.attend(sim)
-
-        # aggregate
-
         out = einsum('b h i j, b h j d -> b h i d', attn, v)
 
-        # merge heads
-
-        out = rearrange(out, 'b m (h w) d -> b h w (m d)',
-                        h = height, w = width)
-
-        # combine heads out
-
+        out = rearrange(out, 'b m (h w) d -> b h w (m d)', h=height, w=width)
         out = self.to_out(out)
         return rearrange(out, 'b h w d -> b d h w')
 
@@ -230,52 +184,37 @@ class CrossWinAttention(nn.Module):
         return x
 
     def forward(self, q, k, v, skip=None):
-        """
-        q: (b n X Y W1 W2 d)
-        k: (b n x y w1 w2 d)
-        v: (b n x y w1 w2 d)
-        return: (b X Y W1 W2 d)
-        """
         assert k.shape == v.shape
         _, view_size, q_height, q_width, q_win_height, q_win_width, _ = q.shape
         _, _, kv_height, kv_width, _, _, _ = k.shape
         assert q_height * q_width == kv_height * kv_width
 
-        # flattening
         q = rearrange(q, 'b n x y w1 w2 d -> b (x y) (n w1 w2) d')
         k = rearrange(k, 'b n x y w1 w2 d -> b (x y) (n w1 w2) d')
         v = rearrange(v, 'b n x y w1 w2 d -> b (x y) (n w1 w2) d')
 
-        # Project with multiple heads
-        q = self.to_q(q)                                # b (X Y) (n W1 W2) (heads dim_head)
-        k = self.to_k(k)                                # b (X Y) (n w1 w2) (heads dim_head)
-        v = self.to_v(v)                                # b (X Y) (n w1 w2) (heads dim_head)
+        q = self.to_q(q)
+        k = self.to_k(k)
+        v = self.to_v(v)
 
-        # Group the head dim with batch dim
         q = rearrange(q, 'b ... (m d) -> (b m) ... d', m=self.heads, d=self.dim_head)
         k = rearrange(k, 'b ... (m d) -> (b m) ... d', m=self.heads, d=self.dim_head)
         v = rearrange(v, 'b ... (m d) -> (b m) ... d', m=self.heads, d=self.dim_head)
 
-        # Dot product attention along cameras
-        dot = self.scale * torch.einsum('b l Q d, b l K d -> b l Q K', q, k)  # b (X Y) (n W1 W2) (n w1 w2)
+        dot = self.scale * torch.einsum('b l Q d, b l K d -> b l Q K', q, k)
 
         if self.rel_pos_emb:
             dot = self.add_rel_pos_emb(dot)
         att = dot.softmax(dim=-1)
 
-        # Combine values (image level features).
-        a = torch.einsum('b n Q K, b n K d -> b n Q d', att, v)  # b (X Y) (n W1 W2) d
+        a = torch.einsum('b n Q K, b n K d -> b n Q d', att, v)
         a = rearrange(a, '(b m) ... d -> b ... (m d)', m=self.heads, d=self.dim_head)
         a = rearrange(a, ' b (x y) (n w1 w2) d -> b n x y w1 w2 d',
             x=q_height, y=q_width, w1=q_win_height, w2=q_win_width)
 
-        # Combine multiple heads
         z = self.proj(a)
+        z = z.mean(1)
 
-        # reduce n: (b n X Y W1 W2 d) -> (b X Y W1 W2 d)
-        z = z.mean(1)  # for sequential usage, we cannot reduce it!
-
-        # Optional skip connection
         if skip is not None:
             z = z + skip
         return z
@@ -345,14 +284,15 @@ class CrossViewSwapAttention(nn.Module):
         self.postnorm = norm(dim)
 
     def pad_divisble(self, x, win_h, win_w):
-        """Pad the x to be divible by window size."""
+        """Pad the x to be divisible by window size."""
         _, _, _, h, w = x.shape
-        h_pad, w_pad = ((h + win_h) // win_h) * win_h, ((w + win_w) // w) * w
+        # standard ceil-to-multiple
+        h_pad = ((h + win_h - 1) // win_h) * win_h
+        w_pad = ((w + win_w - 1) // win_w) * win_w
         padh = h_pad - h if h % win_h != 0 else 0
         padw = w_pad - w if w % win_w != 0 else 0
         return F.pad(x, (0, padw, 0, padh), value=0)
 
-   
     def forward(
         self,
         index: int,
@@ -372,33 +312,36 @@ class CrossViewSwapAttention(nn.Module):
         Returns: (b, d, H, W)
         """
 
-        #디버깅
+        # Safe debug printing for object_count (avoid fixed indexing)
         if object_count is not None:
-            print(">> object_count(crossviewswapattention):", object_count.shape, object_count) #각 인덱스가 특정 종류(차, 트럭, 보행자)의 객체 수임
-            value_1 = object_count[0].item()
-            value_2 = object_count[1].item()
-            value_3 = object_count[2].item()
-            value_4 = object_count[3].item()
-            value_5 = object_count[4].item()
-            value_6 = object_count[5].item()
-            value_7 = object_count[6].item()
-            value_8 = object_count[7].item()
-            print(f"Batch 0 object count: {value_1}")
-            print(f"Batch 1 object count: {value_2}")
-            print(f"Batch 2 object count: {value_3}")
-            print(f"Batch 3 object count: {value_4}")
-            print(f"Batch 4 object count: {value_5}")
-            print(f"Batch 5 object count: {value_6}")
-            print(f"Batch 6 object count: {value_7}")
-            print(f"Batch 7 object count: {value_8}")
+            try:
+                oc = object_count.detach().cpu()
+                # If batched (b, k) show shape and head
+                if oc.dim() == 2:
+                    b_oc, k_oc = oc.shape
+                    # print sample of first up to 4 batches
+                    to_print = min(4, b_oc)
+                    for bi in range(to_print):
+                        vals = oc[bi].tolist()
+                        print(f">> object_count(crossviewswapattention) batch {bi} (len={k_oc}): {vals}")
+                    if b_oc > to_print:
+                        print(f">> ... (total batches: {b_oc})")
+                else:
+                    numel = oc.numel()
+                    if numel <= 50:
+                        print(f">> object_count(crossviewswapattention): {oc.tolist()}")
+                    else:
+                        print(f">> object_count(crossviewswapattention) shape: {tuple(oc.shape)}")
+            except Exception as e:
+                print(">> object_count present but failed to print safely:", repr(e))
         else:
+            # keep the original informative message
             print(">> object_count(crossviewswapattention) is None")
 
-       
         b, n, _, _, _ = feature.shape
         _, _, H, W = x.shape
 
-        pixel = self.image_plane                                                # b n 3 h w
+        pixel = self.image_plane                                                # 1 1 3 h w
         _, _, _, h, w = pixel.shape
 
         c = E_inv[..., -1:]                                                     # b n 4 1
@@ -424,9 +367,17 @@ class CrossViewSwapAttention(nn.Module):
             world = bev.grid2[:2]
         elif index == 3:
             world = bev.grid3[:2]
+        else:
+            # if more scales exist, clamp to last registered grid
+            # defensive: get last grid registered (gridN)
+            # find keys in bev buffers that start with 'grid' and pick min(index, max)
+            grid_keys = [k for k in bev._buffers.keys() if k and k.startswith('grid')]
+            if len(grid_keys) == 0:
+                raise RuntimeError("No bev.grid found for index lookup")
+            # pick last if index exceeds
+            world = bev._buffers[sorted(grid_keys)[-1]][:2]
 
         if self.bev_embed_flag:
-            # 2 H W
             w_embed = self.bev_embed(world[None])                                   # 1 d H W
             bev_embed = w_embed - c_embed                                           # (b n) d H W
             bev_embed = bev_embed / (bev_embed.norm(dim=1, keepdim=True) + 1e-7)    # (b n) d H W
@@ -499,20 +450,6 @@ class CrossViewSwapAttention(nn.Module):
         return query
 
 
-
-
-
-
-
-
-
-
-
-
-
-
-
-
 class PyramidAxialEncoder(nn.Module):
     def __init__(
             self,
@@ -524,9 +461,9 @@ class PyramidAxialEncoder(nn.Module):
             dim: list,
             middle: List[int] = [2, 2],
             scale: float = 1.0,
-            # --------- EMA Temporal Fusion params ---------
-            ema_fuse_alpha: float = 0.3,   # how strong to fuse previous EMA into current input
-            ema_momentum: float = 0.9      # how slow the EMA updates (higher = slower)
+            # EMA params
+            ema_fuse_alpha: float = 0.3,
+            ema_momentum: float = 0.9
     ):
         super().__init__()
 
@@ -575,14 +512,14 @@ class PyramidAxialEncoder(nn.Module):
         self.downsample_layers = nn.ModuleList(downsample_layers)
         # self.self_attn = Attention(dim[-1], **self_attn)
 
-        # --------- EMA Temporal Fusion state ---------
+        # EMA temporal fusion state
         self.ema_fuse_alpha = float(ema_fuse_alpha)
         self.ema_momentum = float(ema_momentum)
-        self._ema_bev: Optional[torch.Tensor] = None  # (b, d, H, W)
+        self._ema_bev: Optional[torch.Tensor] = None  # stores EMA of BEV (detached)
 
     @torch.no_grad()
     def reset_temporal_state(self):
-        """Call between sequences or at episode boundaries."""
+        """Call this at sequence/episode boundary to clear EMA memory."""
         self._ema_bev = None
 
     def _ema_ready(self, x: torch.Tensor) -> bool:
@@ -598,22 +535,25 @@ class PyramidAxialEncoder(nn.Module):
         I_inv = batch['intrinsics'].inverse()           # b n 3 3
         E_inv = batch['extrinsics'].inverse()           # b n 4 4
 
-        # ✅ 여기서 object_count 가져오기
         object_count = batch.get('object_count', None)
-
-        #디버깅
         if object_count is not None:
-            print(">> object_count(pyramid axial encoder):", object_count.shape, object_count) #각 인덱스가 특정 종류(차, 트럭, 보행자)의 객체 수임
+            try:
+                oc = object_count.detach().cpu()
+                if oc.dim() == 2:
+                    print(f">> object_count(pyramid axial encoder) shape: {tuple(oc.shape)}; first row sample: {oc[0].tolist()}")
+                else:
+                    print(f">> object_count(pyramid axial encoder) shape: {tuple(oc.shape)}")
+            except Exception:
+                print(">> object_count(pyramid axial encoder) present but can't pretty-print")
         else:
             print(">> object_count(pyramid axial encoder) is None")
-       
+
         features = [self.down(y) for y in self.backbone(self.norm(image))]
 
         x = self.bev_embedding.get_prior()              # d H W
         x = repeat(x, '... -> b ...', b=b)              # b d H W
 
-        # --------- EMA Temporal Fusion (pre-cross-view) ---------
-        # If EMA exists and matches shape, fuse previous memory into current initial BEV
+        # EMA fusion before cross-view: fuse previous EMA into initial BEV
         if self._ema_ready(x):
             # fused_x = (1 - alpha) * x + alpha * ema_prev
             x = (1.0 - self.ema_fuse_alpha) * x + self.ema_fuse_alpha * self._ema_bev
@@ -630,12 +570,15 @@ class PyramidAxialEncoder(nn.Module):
 
         # x = self.self_attn(x)
 
-        # --------- Update EMA with current output (detach to stop gradients) ---------
+        # Update EMA (detach to not backprop through EMA)
         with torch.no_grad():
-            if (self._ema_bev is None) or (not self._ema_ready(x)):
+            if self._ema_bev is None or not self._ema_ready(x):
+                # initialize or reinitialize if shape/device changed
                 self._ema_bev = x.detach().clone()
             else:
-                self._ema_bev.mul_(self.ema_momentum).add_(x.detach(), alpha=(1.0 - self.ema_momentum))
+                # ema <- momentum * ema + (1 - momentum) * current
+                self._ema_bev.mul_(self.ema_momentum)
+                self._ema_bev.add_(x.detach(), alpha=(1.0 - self.ema_momentum))
 
         return x
 
@@ -664,45 +607,23 @@ if __name__ == "__main__":
 
     os.environ['CUDA_VISIBLE_DEVICES'] = '0,1'
 
+    # --- quick sanity check for CrossWinAttention shapes (not a full run) ---
     block = CrossWinAttention(dim=128,
                               heads=4,
                               dim_head=32,
                               qkv_bias=True,)
-    block.cuda()
-    test_q = torch.rand(1, 6, 5, 5, 5, 5, 128)
-    test_k = test_v = torch.rand(1, 6, 5, 5, 6, 12, 128)
-    test_q = test_q.cuda()
-    test_k = test_k.cuda()
-    test_v = test_v.cuda()
-
-    # test pad divisible
-    # output = block.pad_divisble(x=test_data, win_h=6, win_w=12)
+    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+    block.to(device)
+    test_q = torch.rand(1, 6, 5, 5, 5, 5, 128, device=device)
+    test_k = test_v = torch.rand(1, 6, 5, 5, 6, 12, 128, device=device)
     output = block(test_q, test_k, test_v)
-    print(output.shape)
+    print("CrossWinAttention test output shape:", output.shape)
 
-    image = torch.rand(1, 6, 128, 28, 60)            # b n c h w
-    I_inv = torch.rand(1, 6, 3, 3)           # b n 3 3
-    E_inv = torch.rand(1, 6, 4, 4)           # b n 4 4
-
-    feature = torch.rand(1, 6, 128, 25, 25)
-
-    x = torch.rand(1, 128, 25, 25)                     # b d H W
-
-    block.cuda()
-
-    ##### EncoderSwap
-    params = load_yaml('config/model/cvt_pyramid_swap.yaml')
-
-    print(params)
-
-    batch = {}
-    batch['image'] = image
-    batch['intrinsics'] = I_inv
-    batch['extrinsics'] = E_inv
-
-    # Example: create an encoder with EMA fusion
-    # encoder = PyramidAxialEncoder(backbone, cross_view, cross_view_swap, bev_embedding, self_attn, dim=[128, 256], ema_fuse_alpha=0.3, ema_momentum=0.9)
-
+    # Note: Full encoder instantiation requires the actual 'backbone' and config dicts.
+    # The following is sample code hint (commented):
+    # params = load_yaml('config/model/cvt_pyramid_swap.yaml')
+    # encoder = PyramidAxialEncoder(backbone, cross_view, cross_view_swap, bev_embedding, self_attn, dim=[128,256])
+    # batch = {'image': image, 'intrinsics': I_inv, 'extrinsics': E_inv}
     # out = encoder(batch)
     # print(out.shape)
 
