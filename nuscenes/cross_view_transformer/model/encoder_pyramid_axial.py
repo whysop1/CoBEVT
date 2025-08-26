@@ -340,14 +340,14 @@ class CrossViewSwapAttention(nn.Module):
         self.postnorm = norm(dim)
 
     def pad_divisble(self, x, win_h, win_w):
-        """Pad the x to be divible by window size."""
+        """Pad the x to be divisible by window size."""
         _, _, _, h, w = x.shape
-        h_pad, w_pad = ((h + win_h) // win_h) * win_h, ((w + win_w) // win_w) * win_w
+        h_pad = ((h + win_h - 1) // win_h) * win_h
+        w_pad = ((w + win_w - 1) // win_w) * win_w
         padh = h_pad - h if h % win_h != 0 else 0
         padw = w_pad - w if w % win_w != 0 else 0
         return F.pad(x, (0, padw, 0, padh), value=0)
 
-   
     def forward(
         self,
         index: int,
@@ -590,31 +590,49 @@ class PyramidAxialEncoder(nn.Module):
                 # pop oldest
                 self.temporal_buffer.pop(0)
 
+    def _align_batch(self, t: torch.Tensor, b: int, device: torch.device, dtype: torch.dtype):
+        """
+        Ensure tensor t has batch-size b. If smaller -> pad zeros at end.
+        If larger -> truncate to first b. Also move to device/dtype.
+        """
+        if t is None:
+            return None
+        t = t.to(device=device, dtype=dtype)
+        tb = t.shape[0]
+        if tb == b:
+            return t
+        elif tb < b:
+            pad = torch.zeros((b - tb, t.shape[1], t.shape[2], t.shape[3]), device=device, dtype=dtype)
+            return torch.cat([t, pad], dim=0)
+        else:
+            return t[:b]
+
     def _make_temporal_sequence(self, current_bev: torch.Tensor, device: torch.device):
         """
         Build a list of length K = self.buffer_size containing tensors (b, d, H, W),
         with older frames first and current_bev last. If insufficient previous frames, pad with zeros at front.
+        Align each previous tensor to current batch size by padding/truncation.
         """
         K = self.buffer_size
         seq = []
-        # take up to (K-1) previous frames from self.temporal_buffer (which were stored as detached tensors),
-        # keep order oldest -> newest (left->right)
+        b, d, H, W = current_bev.shape
         prev_needed = K - 1
-        if prev_needed > 0:
-            # use most recent prev_needed frames from buffer (may be fewer)
+        aligned_prev = []
+
+        if prev_needed > 0 and len(self.temporal_buffer) > 0:
+            # take up to prev_needed last frames, but preserve order oldest -> newest
             available = len(self.temporal_buffer)
             start_idx = max(0, available - prev_needed)
-            seq.extend(self.temporal_buffer[start_idx:available])
-        # append current_bev as last element
-        seq.append(current_bev)
-        # if len(seq) < K, pad front with zeros
-        if len(seq) < K:
-            # build zero tensors with same dtype/device/shape
-            b, d, H, W = current_bev.shape
+            selected = self.temporal_buffer[start_idx:available]
+            for t in selected:
+                aligned_prev.append(self._align_batch(t, b, device, current_bev.dtype))
+
+        # pad zeros at front if not enough previous frames
+        while len(aligned_prev) < prev_needed:
             zeros = torch.zeros((b, d, H, W), device=device, dtype=current_bev.dtype)
-            pad_cnt = K - len(seq)
-            seq = [zeros] * pad_cnt + seq
-        # final length should be K
+            aligned_prev.insert(0, zeros)
+
+        seq = aligned_prev + [current_bev]
         assert len(seq) == K
         return seq
 
@@ -646,29 +664,24 @@ class PyramidAxialEncoder(nn.Module):
         x = repeat(x, '... -> b ...', b=b)              # b d H W
 
         # --- Temporal convolution fusion ---
-        # Build temporal sequence of K frames: last (K-1) from buffer + current x
         device = x.device
         seq = self._make_temporal_sequence(x, device=device)  # list length K, each (b,d,H,W)
-
-        # stack into tensor (K, b, d, H, W) then permute to (b, d, K, H, W)
+        # now safe to stack because every element matched batch size
         stacked = torch.stack(seq, dim=0)  # (K, b, d, H, W)
         stacked = stacked.permute(1, 2, 0, 3, 4)  # (b, d, K, H, W)
 
-        # reshape to (b*H*W, d, K) to feed Conv1d (temporal conv)
         b_, d, K, H, W = stacked.shape
         # move to (b*H*W, d, K)
         stacked = stacked.permute(0, 3, 4, 1, 2).contiguous()  # (b, H, W, d, K)
         stacked = stacked.view(b_ * H * W, d, K)  # (BHW, C, K)
 
-        # ensure temp_conv on same device/dtype
-        self.temp_conv = self.temp_conv.to(device=device, dtype=stacked.dtype)
+        # ensure input dtype matches conv weights dtype (avoid moving module)
+        target_dtype = self.temp_conv.weight.dtype
+        stacked = stacked.to(dtype=target_dtype, device=self.temp_conv.weight.device)
 
         # Apply temporal conv: kernel_size = K, no padding -> output length 1
-        # (if buffer_size==1, temp_conv is kernel=1 and works)
-        fused = self.temp_conv(stacked)  # (BHW, C, L_out) where L_out = K - kernel + 1 = 1
-        # expect L_out == 1
+        fused = self.temp_conv(stacked)  # (BHW, C, L_out) where L_out = 1
         if fused.shape[-1] != 1:
-            # fallback: take last temporal step
             fused = fused[:, :, -1:]
         fused = fused.view(b_, H, W, d, 1)  # (b, H, W, d, 1)
         fused = fused.squeeze(-1).permute(0, 3, 1, 2).contiguous()  # (b, d, H, W)
@@ -724,15 +737,12 @@ if __name__ == "__main__":
                               heads=4,
                               dim_head=32,
                               qkv_bias=True,)
-    block.cuda()
-    test_q = torch.rand(1, 6, 5, 5, 5, 5, 128).cuda()
-    test_k = test_v = torch.rand(1, 6, 5, 5, 6, 12, 128).cuda()
+    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+    block.to(device)
+    test_q = torch.rand(1, 6, 5, 5, 5, 5, 128, device=device)
+    test_k = test_v = torch.rand(1, 6, 5, 5, 6, 12, 128, device=device)
     output = block(test_q, test_k, test_v)
-    print(output.shape)
+    print("CrossWinAttention test output shape:", output.shape)
 
-    # Quick instantiation example (requires real backbone & config)
-    # params = load_yaml('config/model/cvt_pyramid_swap.yaml')
-    # encoder = PyramidAxialEncoder(backbone, cross_view, cross_view_swap, bev_embedding, self_attn, dim=[128,256], buffer_size=3)
-    # batch = {...}
-    # out = encoder(batch)
-    # print(out.shape)
+    # Note: full encoder instantiation requires the actual 'backbone' and config dicts.
+
