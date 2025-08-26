@@ -1,13 +1,17 @@
-# encoder_pyramid_axial.py
 import sys
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
 from torch import einsum
-from einops import rearrange, repeat
+from einops import rearrange, repeat, reduce
 from torchvision.models.resnet import Bottleneck
-from typing import List, Optional
+from typing import List
+from .decoder import  DecoderBlock
+
+from typing import Optional
+
+
 
 ResNetBottleNeck = lambda c: Bottleneck(c, c // 4)
 
@@ -254,7 +258,6 @@ class CrossWinAttention(nn.Module):
 
         # Dot product attention along cameras
         dot = self.scale * torch.einsum('b l Q d, b l K d -> b l Q K', q, k)  # b (X Y) (n W1 W2) (n w1 w2)
-        # dot = rearrange(dot, 'b l n Q K -> b l Q (n K)')  # b (X Y) (W1 W2) (n w1 w2)
 
         if self.rel_pos_emb:
             dot = self.add_rel_pos_emb(dot)
@@ -334,7 +337,6 @@ class CrossViewSwapAttention(nn.Module):
         self.cross_win_attend_1 = CrossWinAttention(dim, heads[index], dim_head[index], qkv_bias)
         self.cross_win_attend_2 = CrossWinAttention(dim, heads[index], dim_head[index], qkv_bias)
         self.skip = skip
-        # self.proj = nn.Linear(2 * dim, dim)
 
         self.prenorm_1 = norm(dim)
         self.prenorm_2 = norm(dim)
@@ -345,7 +347,7 @@ class CrossViewSwapAttention(nn.Module):
     def pad_divisble(self, x, win_h, win_w):
         """Pad the x to be divible by window size."""
         _, _, _, h, w = x.shape
-        h_pad, w_pad = ((h + win_h) // win_h) * win_h, ((w + win_w) // win_w) * win_w
+        h_pad, w_pad = ((h + win_h) // win_h) * win_h, ((w + win_w) // w) * w
         padh = h_pad - h if h % win_h != 0 else 0
         padw = w_pad - w if w % win_w != 0 else 0
         return F.pad(x, (0, padw, 0, padh), value=0)
@@ -372,9 +374,27 @@ class CrossViewSwapAttention(nn.Module):
 
         #디버깅
         if object_count is not None:
-            # avoid heavy printing in training
-            pass
+            print(">> object_count(crossviewswapattention):", object_count.shape, object_count) #각 인덱스가 특정 종류(차, 트럭, 보행자)의 객체 수임
+            value_1 = object_count[0].item()
+            value_2 = object_count[1].item()
+            value_3 = object_count[2].item()
+            value_4 = object_count[3].item()
+            value_5 = object_count[4].item()
+            value_6 = object_count[5].item()
+            value_7 = object_count[6].item()
+            value_8 = object_count[7].item()
+            print(f"Batch 0 object count: {value_1}")
+            print(f"Batch 1 object count: {value_2}")
+            print(f"Batch 2 object count: {value_3}")
+            print(f"Batch 3 object count: {value_4}")
+            print(f"Batch 4 object count: {value_5}")
+            print(f"Batch 5 object count: {value_6}")
+            print(f"Batch 6 object count: {value_7}")
+            print(f"Batch 7 object count: {value_8}")
+        else:
+            print(">> object_count(crossviewswapattention) is None")
 
+       
         b, n, _, _, _ = feature.shape
         _, _, H, W = x.shape
 
@@ -480,86 +500,18 @@ class CrossViewSwapAttention(nn.Module):
 
 
 
-# -------------------- Temporal fusion modules --------------------
-
-class ConvGRUCell(nn.Module):
-    """
-    Simple ConvGRU cell for BEV temporal fusion.
-    """
-    def __init__(self, dim: int, kernel_size: int = 3):
-        super().__init__()
-        pad = kernel_size // 2
-        self.reset = nn.Conv2d(dim * 2, dim, kernel_size, padding=pad)
-        self.update = nn.Conv2d(dim * 2, dim, kernel_size, padding=pad)
-        self.out = nn.Conv2d(dim * 2, dim, kernel_size, padding=pad)
-
-    def forward(self, x, h):
-        # x, h: (b, dim, H, W)
-        if h is None:
-            h = torch.zeros_like(x)
-        inp = torch.cat([x, h], dim=1)
-        r = torch.sigmoid(self.reset(inp))
-        z = torch.sigmoid(self.update(inp))
-        n = torch.tanh(self.out(torch.cat([x, r * h], dim=1)))
-        h_new = (1 - z) * n + z * h
-        return h_new
 
 
-class TemporalBEVModule(nn.Module):
-    """
-    Temporal fusion wrapper:
-    - optional warp of prev BEV to current coordinates using prev2cur affine (b,2,3)
-    - ConvGRU cell to fuse prev & current
-    - optional gating fusion (learned)
-    """
-    def __init__(self, dim: int):
-        super().__init__()
-        self.gru = ConvGRUCell(dim)
-        # small gating conv to fuse when both present
-        self.gate = nn.Sequential(
-            nn.Conv2d(dim * 2, dim, 1, bias=False),
-            nn.BatchNorm2d(dim),
-            nn.ReLU(inplace=True)
-        )
-
-    @staticmethod
-    def warp_bev(prev: torch.Tensor, A: Optional[torch.Tensor]) -> torch.Tensor:
-        """
-        prev: (b, d, H, W)
-        A: (b, 2, 3) affine transform in normalized coords (prev->cur)
-        If A is None, return prev unchanged.
-        """
-        if A is None:
-            return prev
-        b, d, H, W = prev.shape
-        # F.affine_grid expects theta mapping output coords to input coords; here assume A is that theta
-        grid = F.affine_grid(A, size=(b, d, H, W), align_corners=True)
-        warped = F.grid_sample(prev, grid, align_corners=True)
-        return warped
-
-    def forward(self, cur: torch.Tensor, prev: Optional[torch.Tensor] = None, prev2cur: Optional[torch.Tensor] = None):
-        """
-        cur: (b, d, H, W)
-        prev: (b, d, H, W) or None
-        prev2cur: (b, 2, 3) or None
-        returns: fused (b, d, H, W)
-        """
-        if prev is None:
-            # no temporal info
-            h = self.gru(cur, None)
-            return h
-
-        # warp prev to current
-        prev_warp = self.warp_bev(prev, prev2cur)
-        # optionally refine prev via gate
-        combined = torch.cat([cur, prev_warp], dim=1)
-        gated = self.gate(combined)
-        # GRU: use gated as input, prev_warp as hidden state
-        h = self.gru(gated, prev_warp)
-        return h
 
 
-# -------------------- PyramidAxialEncoder (with temporal fusion) --------------------
+
+
+
+
+
+
+
+
 
 class PyramidAxialEncoder(nn.Module):
     def __init__(
@@ -572,6 +524,9 @@ class PyramidAxialEncoder(nn.Module):
             dim: list,
             middle: List[int] = [2, 2],
             scale: float = 1.0,
+            # --------- EMA Temporal Fusion params ---------
+            ema_fuse_alpha: float = 0.3,   # how strong to fuse previous EMA into current input
+            ema_momentum: float = 0.9      # how slow the EMA updates (higher = slower)
     ):
         super().__init__()
 
@@ -618,63 +573,69 @@ class PyramidAxialEncoder(nn.Module):
         self.cross_views = nn.ModuleList(cross_views)
         self.layers = nn.ModuleList(layers)
         self.downsample_layers = nn.ModuleList(downsample_layers)
-        # temporal modules per scale
-        self.temporal_modules = nn.ModuleList([TemporalBEVModule(dim[i]) for i in range(len(middle))])
         # self.self_attn = Attention(dim[-1], **self_attn)
+
+        # --------- EMA Temporal Fusion state ---------
+        self.ema_fuse_alpha = float(ema_fuse_alpha)
+        self.ema_momentum = float(ema_momentum)
+        self._ema_bev: Optional[torch.Tensor] = None  # (b, d, H, W)
+
+    @torch.no_grad()
+    def reset_temporal_state(self):
+        """Call between sequences or at episode boundaries."""
+        self._ema_bev = None
+
+    def _ema_ready(self, x: torch.Tensor) -> bool:
+        return (self._ema_bev is not None
+                and self._ema_bev.shape == x.shape
+                and self._ema_bev.device == x.device
+                and self._ema_bev.dtype == x.dtype)
 
     def forward(self, batch):
         b, n, _, _, _ = batch['image'].shape
 
-        image = batch['image'].flatten(0, 1)            # (b*n, c, h, w)
+        image = batch['image'].flatten(0, 1)            # b n c h w
         I_inv = batch['intrinsics'].inverse()           # b n 3 3
         E_inv = batch['extrinsics'].inverse()           # b n 4 4
-
-        # optional temporal inputs:
-        prev_bev = batch.get('prev_bev', None)          # (b, d, H, W) or None
-        prev2cur = batch.get('prev2cur_bev', None)      # (b, 2, 3) affine or None
 
         # ✅ 여기서 object_count 가져오기
         object_count = batch.get('object_count', None)
 
+        #디버깅
+        if object_count is not None:
+            print(">> object_count(pyramid axial encoder):", object_count.shape, object_count) #각 인덱스가 특정 종류(차, 트럭, 보행자)의 객체 수임
+        else:
+            print(">> object_count(pyramid axial encoder) is None")
+       
         features = [self.down(y) for y in self.backbone(self.norm(image))]
 
         x = self.bev_embedding.get_prior()              # d H W
         x = repeat(x, '... -> b ...', b=b)              # b d H W
 
-        # iterate scales
+        # --------- EMA Temporal Fusion (pre-cross-view) ---------
+        # If EMA exists and matches shape, fuse previous memory into current initial BEV
+        if self._ema_ready(x):
+            # fused_x = (1 - alpha) * x + alpha * ema_prev
+            x = (1.0 - self.ema_fuse_alpha) * x + self.ema_fuse_alpha * self._ema_bev
+
         for i, (cross_view, feature, layer) in \
                 enumerate(zip(self.cross_views, features, self.layers)):
             feature = rearrange(feature, '(b n) ... -> b n ...', b=b, n=n)
 
-            # cross-view attention / swap
             x = cross_view(i, x, self.bev_embedding, feature, I_inv, E_inv, object_count)
-            # residual refinement via ResNet blocks
             x = layer(x)
-
-            # temporal fusion at this scale (call module always so its params are used)
-            if prev_bev is not None:
-                try:
-                    # if prev_bev matches shape (b,d,H,W)
-                    if prev_bev.shape == x.shape:
-                        x = self.temporal_modules[i](x, prev_bev, prev2cur)
-                    else:
-                        # if prev_bev provided at a different resolution, resize prev_bev to match current x
-                        prev_resized = F.interpolate(prev_bev, size=x.shape[-2:], mode='bilinear', align_corners=False)
-                        x = self.temporal_modules[i](x, prev_resized, prev2cur)
-                except Exception:
-                    # fallback: if any issue with warping, just run GRU without prev
-                    x = self.temporal_modules[i](x, None, None)
-            else:
-                # ensure module parameters are used (module called) even when no prev
-                x = self.temporal_modules[i](x, None, None)
-
             if i < len(features)-1:
                 down_sample_block = self.downsample_layers[i]
                 x = down_sample_block(x)
 
-        # NOTE: removed the previous 'aux' DDP hack because it caused reentrant-backward issues.
-        # If you see DDP "unused parameter" errors again, enable find_unused_parameters=True in DDP
-        # or provide TORCH_DISTRIBUTED_DEBUG=DETAIL logs so we can locate unused params precisely.
+        # x = self.self_attn(x)
+
+        # --------- Update EMA with current output (detach to stop gradients) ---------
+        with torch.no_grad():
+            if (self._ema_bev is None) or (not self._ema_ready(x)):
+                self._ema_bev = x.detach().clone()
+            else:
+                self._ema_bev.mul_(self.ema_momentum).add_(x.detach(), alpha=(1.0 - self.ema_momentum))
 
         return x
 
@@ -727,7 +688,6 @@ if __name__ == "__main__":
 
     x = torch.rand(1, 128, 25, 25)                     # b d H W
 
-    # block = CrossViewSwapAttention(...)
     block.cuda()
 
     ##### EncoderSwap
@@ -740,6 +700,9 @@ if __name__ == "__main__":
     batch['intrinsics'] = I_inv
     batch['extrinsics'] = E_inv
 
-    out = encoder(batch)
+    # Example: create an encoder with EMA fusion
+    # encoder = PyramidAxialEncoder(backbone, cross_view, cross_view_swap, bev_embedding, self_attn, dim=[128, 256], ema_fuse_alpha=0.3, ema_momentum=0.9)
 
-    print(out.shape)
+    # out = encoder(batch)
+    # print(out.shape)
+
