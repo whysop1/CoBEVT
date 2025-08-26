@@ -9,7 +9,6 @@ from torchvision.models.resnet import Bottleneck
 from typing import List, Optional
 from .decoder import DecoderBlock
 
-
 ResNetBottleNeck = lambda c: Bottleneck(c, c // 4)
 
 
@@ -106,13 +105,13 @@ class BEVEmbedding(nn.Module):
             grid = V_inv @ rearrange(grid, 'd h w -> d (h w)')  # 3 (h w)
             grid = rearrange(grid, 'd (h w) -> d h w', h=h, w=w)  # 3 h w
             # egocentric frame
-            self.register_buffer('grid%d'%i, grid, persistent=False)
+            self.register_buffer('grid%d' % i, grid, persistent=False)
 
             # 3 h w
         self.learned_features = nn.Parameter(
             sigma * torch.randn(dim,
-                                bev_height//upsample_scales[0],
-                                bev_width//upsample_scales[0]))  # d h w
+                                bev_height // upsample_scales[0],
+                                bev_width // upsample_scales[0]))  # d h w
 
     def get_prior(self):
         return self.learned_features
@@ -341,15 +340,14 @@ class CrossViewSwapAttention(nn.Module):
         self.postnorm = norm(dim)
 
     def pad_divisble(self, x, win_h, win_w):
-        """Pad the x to be divisible by window size."""
+        """Pad the x to be divible by window size."""
         _, _, _, h, w = x.shape
-        # corrected ceil-to-multiple calculation
-        h_pad = ((h + win_h - 1) // win_h) * win_h
-        w_pad = ((w + win_w - 1) // win_w) * win_w
+        h_pad, w_pad = ((h + win_h) // win_h) * win_h, ((w + win_w) // win_w) * win_w
         padh = h_pad - h if h % win_h != 0 else 0
         padw = w_pad - w if w % win_w != 0 else 0
         return F.pad(x, (0, padw, 0, padh), value=0)
 
+   
     def forward(
         self,
         index: int,
@@ -369,24 +367,15 @@ class CrossViewSwapAttention(nn.Module):
         Returns: (b, d, H, W)
         """
 
-        # Safe debug printing for object_count (avoid fixed indexing)
+        # Safe object_count debug printing (avoid fixed indexing which previously caused IndexError)
         if object_count is not None:
             try:
                 oc = object_count.detach().cpu()
                 if oc.dim() == 2:
-                    b_oc, k_oc = oc.shape
-                    to_print = min(4, b_oc)
-                    for bi in range(to_print):
-                        vals = oc[bi].tolist()
-                        print(f">> object_count(crossviewswapattention) batch {bi} (len={k_oc}): {vals}")
-                    if b_oc > to_print:
-                        print(f">> ... (total batches: {b_oc})")
+                    for i in range(min(3, oc.size(0))):
+                        print(f">> object_count(crossviewswapattention) batch {i}:", oc[i].tolist())
                 else:
-                    numel = oc.numel()
-                    if numel <= 50:
-                        print(f">> object_count(crossviewswapattention): {oc.tolist()}")
-                    else:
-                        print(f">> object_count(crossviewswapattention) shape: {tuple(oc.shape)}")
+                    print(">> object_count(crossviewswapattention):", oc.tolist() if oc.numel() < 50 else f"shape {tuple(oc.shape)}")
             except Exception as e:
                 print(">> object_count present but failed to print safely:", repr(e))
         else:
@@ -519,8 +508,8 @@ class PyramidAxialEncoder(nn.Module):
             dim: list,
             middle: List[int] = [2, 2],
             scale: float = 1.0,
-            # GRU temporal flag (기본 활성화)
-            enable_gru_temporal: bool = True,
+            # Temporal convolution buffer parameters
+            buffer_size: int = 3,   # K (use last K frames including current). default 3
     ):
         super().__init__()
 
@@ -569,39 +558,80 @@ class PyramidAxialEncoder(nn.Module):
         self.downsample_layers = nn.ModuleList(downsample_layers)
         # self.self_attn = Attention(dim[-1], **self_attn)
 
-        # --- GRU temporal ---
-        self.enable_gru_temporal = bool(enable_gru_temporal)
-        if self.enable_gru_temporal:
-            # GRUCell operates on per-spatial-location vector of size dim[0]
-            self.gru_cell = nn.GRUCell(input_size=dim[0], hidden_size=dim[0])
-            # prev_bev stored per-model (one per process). Initialized to None.
-            self.prev_bev: Optional[torch.Tensor] = None
+        # --- Temporal convolution buffer ---
+        # buffer_size K (number of frames used including current). Use Conv1d with kernel_size=K.
+        self.buffer_size = int(buffer_size)
+        assert self.buffer_size >= 1, "buffer_size must be >= 1"
 
-    def reset_temporal_state(self):
-        """Call at sequence boundary to clear prev_bev."""
-        if hasattr(self, 'prev_bev'):
-            self.prev_bev = None
+        # Conv1d will be applied over temporal dimension T (kernel_size = buffer_size).
+        # Input to Conv1d will be shaped (B*H*W, C, T). We set in_channels=C, out_channels=C to keep channels same.
+        self.temp_conv = nn.Conv1d(in_channels=dim[0], out_channels=dim[0], kernel_size=self.buffer_size, bias=True)
+        # keep a python list buffer to store previous BEV maps (detached)
+        self.temporal_buffer: List[torch.Tensor] = []
 
-    def _prev_ready(self, x: torch.Tensor) -> bool:
-        return (hasattr(self, 'prev_bev') and self.prev_bev is not None
-                and self.prev_bev.shape == x.shape
-                and self.prev_bev.device == x.device
-                and self.prev_bev.dtype == x.dtype)
+    def reset_temporal_buffer(self):
+        """Call at sequence/episode boundaries to clear stored previous BEV frames."""
+        self.temporal_buffer = []
+
+    def _safe_append_to_buffer(self, bev: torch.Tensor):
+        """Append detached copy of bev to buffer, maintain buffer length <= buffer_size-1 for previous frames.
+           We store previous frames only (not including the current 'bev' - caller decides)."""
+        # keep at most (buffer_size - 1) previous frames
+        max_prev = max(0, self.buffer_size - 1)
+        if max_prev == 0:
+            # nothing to store
+            return
+        with torch.no_grad():
+            t = bev.detach().clone()
+            # append to end (most recent at end)
+            self.temporal_buffer.append(t)
+            # trim older frames
+            if len(self.temporal_buffer) > max_prev:
+                # pop oldest
+                self.temporal_buffer.pop(0)
+
+    def _make_temporal_sequence(self, current_bev: torch.Tensor, device: torch.device):
+        """
+        Build a list of length K = self.buffer_size containing tensors (b, d, H, W),
+        with older frames first and current_bev last. If insufficient previous frames, pad with zeros at front.
+        """
+        K = self.buffer_size
+        seq = []
+        # take up to (K-1) previous frames from self.temporal_buffer (which were stored as detached tensors),
+        # keep order oldest -> newest (left->right)
+        prev_needed = K - 1
+        if prev_needed > 0:
+            # use most recent prev_needed frames from buffer (may be fewer)
+            available = len(self.temporal_buffer)
+            start_idx = max(0, available - prev_needed)
+            seq.extend(self.temporal_buffer[start_idx:available])
+        # append current_bev as last element
+        seq.append(current_bev)
+        # if len(seq) < K, pad front with zeros
+        if len(seq) < K:
+            # build zero tensors with same dtype/device/shape
+            b, d, H, W = current_bev.shape
+            zeros = torch.zeros((b, d, H, W), device=device, dtype=current_bev.dtype)
+            pad_cnt = K - len(seq)
+            seq = [zeros] * pad_cnt + seq
+        # final length should be K
+        assert len(seq) == K
+        return seq
 
     def forward(self, batch):
         b, n, _, _, _ = batch['image'].shape
 
-        image = batch['image'].flatten(0, 1)            # b n c h w -> (b*n) c h w for backbone
+        image = batch['image'].flatten(0, 1)            # b n c h w
         I_inv = batch['intrinsics'].inverse()           # b n 3 3
         E_inv = batch['extrinsics'].inverse()           # b n 4 4
 
-        # object_count (optional)
+        # object_count (optional), safe print
         object_count = batch.get('object_count', None)
         if object_count is not None:
             try:
                 oc = object_count.detach().cpu()
                 if oc.dim() == 2:
-                    print(f">> object_count(pyramid axial encoder) shape: {tuple(oc.shape)}; first row sample: {oc[0].tolist()}")
+                    print(f">> object_count(pyramid axial encoder) shape: {tuple(oc.shape)}; sample row: {oc[0].tolist()}")
                 else:
                     print(f">> object_count(pyramid axial encoder) shape: {tuple(oc.shape)}")
             except Exception:
@@ -611,31 +641,46 @@ class PyramidAxialEncoder(nn.Module):
 
         features = [self.down(y) for y in self.backbone(self.norm(image))]
 
+        # base BEV prior
         x = self.bev_embedding.get_prior()              # d H W
         x = repeat(x, '... -> b ...', b=b)              # b d H W
 
-        # --- GRU fusion: 항상 GRUCell 호출하도록 변경 (DDP unused param 문제 해결) ---
-        if self.enable_gru_temporal:
-            _, d, H, W = x.shape
-            # flatten spatial positions into batch dimension for per-location GRUCell
-            x_flat = rearrange(x, 'b d h w -> (b h w) d')  # (b*h*w, d)
-            if self._prev_ready(x):
-                prev_flat = rearrange(self.prev_bev, 'b d h w -> (b h w) d')
-            else:
-                # If no prev state, use zeros of same shape & device/dtype so GRU params are still used.
-                prev_flat = torch.zeros_like(x_flat)
+        # --- Temporal convolution fusion ---
+        # Build temporal sequence of K frames: last (K-1) from buffer + current x
+        device = x.device
+        seq = self._make_temporal_sequence(x, device=device)  # list length K, each (b,d,H,W)
 
-            # Ensure tensors on same device/dtype (they should already be)
-            prev_flat = prev_flat.to(x_flat.device, dtype=x_flat.dtype)
+        # stack into tensor (K, b, d, H, W) then permute to (b, d, K, H, W)
+        stacked = torch.stack(seq, dim=0)  # (K, b, d, H, W)
+        stacked = stacked.permute(1, 2, 0, 3, 4)  # (b, d, K, H, W)
 
-            # GRUCell: h_new = GRUCell(input=x_flat, hidden_prev=prev_flat)
-            # This ensures GRU parameters participate in every forward.
-            h_new = self.gru_cell(x_flat, prev_flat)  # (b*h*w, d)
+        # reshape to (b*H*W, d, K) to feed Conv1d (temporal conv)
+        b_, d, K, H, W = stacked.shape
+        # move to (b*H*W, d, K)
+        stacked = stacked.permute(0, 3, 4, 1, 2).contiguous()  # (b, H, W, d, K)
+        stacked = stacked.view(b_ * H * W, d, K)  # (BHW, C, K)
 
-            # reshape back to BEV spatial map
-            x = rearrange(h_new, '(b h w) d -> b d h w', b=b, h=H, w=W)
+        # ensure temp_conv on same device/dtype
+        self.temp_conv = self.temp_conv.to(device=device, dtype=stacked.dtype)
 
-        # Main pipeline (cross-view + resnet bottlenecks)
+        # Apply temporal conv: kernel_size = K, no padding -> output length 1
+        # (if buffer_size==1, temp_conv is kernel=1 and works)
+        fused = self.temp_conv(stacked)  # (BHW, C, L_out) where L_out = K - kernel + 1 = 1
+        # expect L_out == 1
+        if fused.shape[-1] != 1:
+            # fallback: take last temporal step
+            fused = fused[:, :, -1:]
+        fused = fused.view(b_, H, W, d, 1)  # (b, H, W, d, 1)
+        fused = fused.squeeze(-1).permute(0, 3, 1, 2).contiguous()  # (b, d, H, W)
+
+        # fused is the temporally-aggregated BEV prior; use it as x for rest of pipeline
+        x = fused
+
+        # After using current x in temporal fusion, append current BEV to buffer for next steps
+        # Note: store detached copy to avoid backprop through long history
+        self._safe_append_to_buffer(x)
+
+        # Main cross-view and bottleneck layers
         for i, (cross_view, feature, layer) in \
                 enumerate(zip(self.cross_views, features, self.layers)):
             feature = rearrange(feature, '(b n) ... -> b n ...', b=b, n=n)
@@ -647,11 +692,6 @@ class PyramidAxialEncoder(nn.Module):
                 x = down_sample_block(x)
 
         # x = self.self_attn(x)
-
-        # store prev_bev detached for next forward
-        if self.enable_gru_temporal:
-            with torch.no_grad():
-                self.prev_bev = x.detach().clone()
 
         return x
 
@@ -680,16 +720,19 @@ if __name__ == "__main__":
 
     os.environ['CUDA_VISIBLE_DEVICES'] = '0,1'
 
-    # Quick sanity test for CrossWinAttention shapes
     block = CrossWinAttention(dim=128,
                               heads=4,
                               dim_head=32,
                               qkv_bias=True,)
-    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-    block.to(device)
-    test_q = torch.rand(1, 6, 5, 5, 5, 5, 128, device=device)
-    test_k = test_v = torch.rand(1, 6, 5, 5, 6, 12, 128, device=device)
+    block.cuda()
+    test_q = torch.rand(1, 6, 5, 5, 5, 5, 128).cuda()
+    test_k = test_v = torch.rand(1, 6, 5, 5, 6, 12, 128).cuda()
     output = block(test_q, test_k, test_v)
-    print("CrossWinAttention test output shape:", output.shape)
+    print(output.shape)
 
-    # Note: full encoder instantiation requires the actual 'backbone' and config dicts.
+    # Quick instantiation example (requires real backbone & config)
+    # params = load_yaml('config/model/cvt_pyramid_swap.yaml')
+    # encoder = PyramidAxialEncoder(backbone, cross_view, cross_view_swap, bev_embedding, self_attn, dim=[128,256], buffer_size=3)
+    # batch = {...}
+    # out = encoder(batch)
+    # print(out.shape)
