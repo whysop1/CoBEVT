@@ -1,5 +1,4 @@
 
-
 import logging
 import pytorch_lightning as pl
 import git
@@ -43,4 +42,3 @@ class GitDiffCallback(pl.Callback):
 
         # 로그 출력
         log.info(TEMPLATE.format(diff=diff, cfg=cfg))
-
