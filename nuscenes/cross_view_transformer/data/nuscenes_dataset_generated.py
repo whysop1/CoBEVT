@@ -1,4 +1,3 @@
-
 import json
 import torch
 import numpy as np
@@ -81,5 +80,3 @@ class NuScenesGeneratedDataset(torch.utils.data.Dataset):
             data = self.transform(data)
 
         return data
-
-
