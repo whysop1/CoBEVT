@@ -259,5 +259,3 @@ class Encoder(nn.Module):
         return x
 
 
-
-
