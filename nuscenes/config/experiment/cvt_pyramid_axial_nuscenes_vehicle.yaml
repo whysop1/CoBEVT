@@ -1,4 +1,3 @@
-
 # @package _global_
 defaults:
   - override /model: cvt_pyramid_axial
@@ -11,17 +10,3 @@ model:
   outputs:
     bev: [0, 1]
     center: [1, 2]
-
-
-#내가 추가함
-
-training:
-  lr: 0.0001  # ✅ 여기에 추가
-model_module:
-  _target_: cross_view_transformer.model.model_module.ModelModule
-  model: ${model.model}
-  loss_func: ${loss}
-  metrics: ${metrics}
-  optimizer_args:
-    lr: ${training.lr}
-  scheduler_args: null
