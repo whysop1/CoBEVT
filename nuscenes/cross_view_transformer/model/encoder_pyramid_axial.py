@@ -517,33 +517,22 @@ if __name__ == "__main__":
     import os
     import re
     import yaml
-
     def load_yaml(file):
         stream = open(file, 'r')
         loader = yaml.Loader
-
-        float_pattern = (
-            r'^('
-            r'[-+]?(?:[0-9][0-9_]*)\.[0-9_]*(?:[eE][-+]?[0-9]+)?'
-            r'|[-+]?(?:[0-9][0-9_]*)(?:[eE][-+]?[0-9]+)'
-            r'|\.[0-9_]+(?:[eE][-+][0-9]+)?'
-            r'|[-+]?[0-9][0-9_]*(?::[0-5]?[0-9])+\.[0-9_]*'
-            r'|[-+]?\.(?:inf|Inf|INF)'
-            r'|\.(?:nan|NaN|NAN)'
-            r')$'
-        )
-
         loader.add_implicit_resolver(
             u'tag:yaml.org,2002:float',
-            re.compile(float_pattern, re.X),
-            list(u'-+0123456789.')
-        )
-
+            re.compile(u'''^(?:
+            [-+]?(?:[0-9][0-9_]*)\\.[0-9_]*(?:[eE][-+]?[0-9]+)?
+            |[-+]?(?:[0-9][0-9_]*)(?:[eE][-+]?[0-9]+)
+            |\\.[0-9_]+(?:[eE][-+][0-9]+)?
+            |[-+]?[0-9][0-9_]*(?::[0-5]?[0-9])+\\.[0-9_]*
+            |[-+]?\\.(?:inf|Inf|INF)
+            |\\.(?:nan|NaN|NAN))$''', re.X),
+            list(u'-+0123456789.'))
         param = yaml.load(stream, Loader=loader)
-
         if "yaml_parser" in param:
             param = eval(param["yaml_parser"])(param)
-
         return param
 
     os.environ['CUDA_VISIBLE_DEVICES'] = '0,1'
@@ -603,5 +592,3 @@ if __name__ == "__main__":
     out = encoder(batch)
 
     print(out.shape)
-
-
