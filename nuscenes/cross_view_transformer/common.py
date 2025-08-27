@@ -88,6 +88,10 @@ def remove_prefix(state_dict: Dict, prefix: str) -> Dict:
         if tokens[0] == prefix:
             tokens = tokens[1:]
 
+        key = '.'.join(tokens)
+        result[key] = v
+
+    return result
 
 
 
