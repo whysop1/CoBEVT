@@ -1,4 +1,3 @@
-#클러스터링하며 내가 직접 새로 추가한 파일
 # tools/cluster_camera_pose.py
 
 import numpy as np
