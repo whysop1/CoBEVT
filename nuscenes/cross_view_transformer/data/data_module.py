@@ -36,5 +36,3 @@ class DataModule(pl.LightningDataModule):
 
     def val_dataloader(self, shuffle=True):
         return self.get_split("val", loader=True, shuffle=shuffle)
-
-
