@@ -1,107 +1,62 @@
-#_target_: cross_view_transformer.model.cvt.CrossViewTransformer
+_target_: cross_view_transformer.model.cvt.CrossViewTransformer
 
-#dim_last: 64
+dim_last: 64
 
-#outputs:
-#  bev: [0, 1]
+outputs:
+  bev: [0, 1]
 
-#encoder:
-#  _target_: cross_view_transformer.model.encoder_pyramid_axial.PyramidAxialEncoder
-
-#  dim: [32, 64, 128]
-#  scale: 1.0
-#  middle: [2, 2, 2]
-
-#  backbone:
-#    _target_: cross_view_transformer.model.backbones.efficientnet.EfficientNetExtractor
-
-#    model_name: efficientnet-b4
-#    layer_names: ['reduction_2', 'reduction_3', 'reduction_4']
-#    image_height: ${data.image.h}
-#    image_width: ${data.image.w}
-
-#  self_attn:
-#    dim_head: 32
-#    dropout: 0.1
-#    window_size: 25
-
-#  cross_view:
-#    heads: [1, 2, 4]
-#    dim_head: [32, 32, 32]
-#    qkv_bias: True
-#    skip: True
-#    no_image_features: False
-
-#    image_height: ${data.image.h}
-#    image_width: ${data.image.w}
-
-#  cross_view_swap:
-#    rel_pos_emb: False
-#    q_win_size: [[ 10, 10 ], [ 10, 10 ], [ 25, 25 ]  ]
-#    feat_win_size: [ [ 6, 12 ], [ 6, 12 ], [ 14, 30 ]]
-#    bev_embedding_flag: [ true, false, false ]
-
-#  bev_embedding:
-#    sigma: 1.0
-
-#    bev_height: ${data.bev.h}
-#    bev_width: ${data.bev.w}
-#    h_meters: ${data.bev.h_meters}
-#    w_meters: ${data.bev.w_meters}
-#    offset: ${data.bev.offset}
-
-#    upsample_scales: [2, 4, 8]
-
-#decoder:
-#  _target_: cross_view_transformer.model.decoder.Decoder
-
-#  dim: 128
-#  blocks: [128, 128, 64]
-#  residual: True
-#  factor: 2
-
-# cvt_pyramid_axial.yaml (수정본 예시)
-
-model:
+encoder:
   _target_: cross_view_transformer.model.encoder_pyramid_axial.PyramidAxialEncoder
 
+  dim: [32, 64, 128]
+  scale: 1.0
+  middle: [2, 2, 2]
+
   backbone:
-    _target_: cross_view_transformer.model.backbones.efficientnet.EfficientNetBackbone
-    arch: efficientnet-b4
-    pretrained: true
+    _target_: cross_view_transformer.model.backbones.efficientnet.EfficientNetExtractor
+
+    model_name: efficientnet-b4
+    layer_names: ['reduction_2', 'reduction_3', 'reduction_4']
+    image_height: ${data.image.h}
+    image_width: ${data.image.w}
+
+  self_attn:
+    dim_head: 32
+    dropout: 0.1
+    window_size: 25
 
   cross_view:
-    heads: [2, 2, 2]            # 원래 8
-    dim_head: [16, 16, 16]      # 원래 64
+    heads: [1, 2, 4]
+    dim_head: [32, 32, 32]
+    qkv_bias: True
+    skip: True
+    no_image_features: False
 
-    q_win_size: [4, 4, 4]  #원래 [8,8] 이었음
-    feat_win_size: [4, 4, 4] #원래 16이었음
-    bev_embedding_flag: [true, true, true]
-    no_image_features: false
+    image_height: ${data.image.h}
+    image_width: ${data.image.w}
 
-  cross_view_swap: {}
+  cross_view_swap:
+    rel_pos_emb: False
+    q_win_size: [[ 10, 10 ], [ 10, 10 ], [ 25, 25 ]  ]
+    feat_win_size: [ [ 6, 12 ], [ 6, 12 ], [ 14, 30 ]]
+    bev_embedding_flag: [ true, false, false ]
 
   bev_embedding:
-    _target_: cross_view_transformer.model.encoder_pyramid_axial.BEVEmbedding
-    bev_size: [102, 102] #원래 200
-    dim: 128
-    sigma: 0.1
-    h_meters: 100
-    w_meters: 100
-    offset: 0
-    upsample_scales: [4, 2, 1]
-    num_clusters: 10
+    sigma: 1.0
 
-  self_attn: null
-  dim: [64, 64, 64]          # 원래 128
-  middle: [2, 2, 2]  #원래 3
-  scale: 1.0
+    bev_height: ${data.bev.h}
+    bev_width: ${data.bev.w}
+    h_meters: ${data.bev.h_meters}
+    w_meters: ${data.bev.w_meters}
+    offset: ${data.bev.offset}
 
-data:
-  dataset_dir: /content/drive/MyDrive/datasets/nuscenes
-  labels_dir: /content/drive/MyDrive/datasets/cvt_labels_nuscenes
+    upsample_scales: [2, 4, 8]
 
-training:
-  batch_size: 1 #원래 8이었음
-  lr: 1e-4
-  epochs: 100 
+decoder:
+  _target_: cross_view_transformer.model.decoder.Decoder
+
+  dim: 128
+  blocks: [128, 128, 64]
+  residual: True
+  factor: 2
+
