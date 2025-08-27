@@ -1,174 +1,82 @@
-
-import pathlib
+import json
 import torch
-import torchvision
 import numpy as np
 
-from PIL import Image
-from .common import encode, decode
-from .augmentations import StrongAug, GeometricAug
+from pathlib import Path
+from .common import get_split
+from .transforms import Sample, LoadDataTransform
+
+# cluster_camera_pose_id.npy 경로 (필요 시 절대 경로로 변경)
+CLUSTER_PATH = 'cluster_camera_pose_id.npy'
+
+# 클러스터 ID 매핑 로드
+if Path(CLUSTER_PATH).exists():
+    CLUSTER_ID_MAP = np.load(CLUSTER_PATH, allow_pickle=True).item()
+else:
+    CLUSTER_ID_MAP = {}  # 없으면 기본값 사용
 
 
-class Sample(dict):
-    def __init__(
-        self,
-        token,
-        scene,
-        intrinsics,
-        extrinsics,
-        images,
-        view,
-        bev,
-        **kwargs
-    ):
-        super().__init__(**kwargs)
+def get_data(
+    dataset_dir,
+    labels_dir,
+    split,
+    version,
+    num_classes,
+    augment='none',
+    image=None,                         # image config
+    dataset='unused',                   # ignore
+    **dataset_kwargs
+):
+    dataset_dir = Path(dataset_dir)
+    labels_dir = Path(labels_dir)
 
-        self.token = token
-        self.scene = scene
-        self.view = view
-        self.bev = bev
-        self.images = images
-        self.intrinsics = intrinsics
-        self.extrinsics = extrinsics
+    # training 아닐 경우 augment 끔
+    augment = 'none' if split != 'train' else augment
+    transform = LoadDataTransform(dataset_dir, labels_dir, image, num_classes, augment)
 
-    def __getattr__(self, key):
-        return super().__getitem__(key)
+    # mini 버전 처리
+    split = f'mini_{split}' if version == 'v1.0-mini' else split
+    split_scenes = get_split(split, 'nuscenes')
 
-    def __setattr__(self, key, val):
-        self[key] = val
-        return super().__setattr__(key, val)
+    return [NuScenesGeneratedDataset(s, labels_dir, transform=transform) for s in split_scenes]
 
 
-class SaveDataTransform:
-    def __init__(self, labels_dir):
-        self.labels_dir = pathlib.Path(labels_dir)
+class NuScenesGeneratedDataset(torch.utils.data.Dataset):
+    """
+    Lightweight dataset wrapper around contents of a JSON file
 
-    def get_cameras(self, batch: Sample):
-        return {
-            'images': batch.images,
-            'intrinsics': batch.intrinsics,
-            'extrinsics': batch.extrinsics
-        }
+    Contains all camera info, image_paths, label_paths ...
+    that are to be loaded in the transform
+    """
+    def __init__(self, scene_name, labels_dir, transform=None):
+        self.samples = json.loads((Path(labels_dir) / f'{scene_name}.json').read_text())
+        self.transform = transform
 
-    def get_bev(self, batch: Sample):
-        result = {
-            'view': batch.view,
-        }
+    def __len__(self):
+        return len(self.samples)
 
-        scene_dir = self.labels_dir / batch.scene
-        scene_dir.mkdir(parents=True, exist_ok=True)
+    def __getitem__(self, idx):
+        data = Sample(**self.samples[idx])
 
-        bev_path = f'bev_{batch.token}.png'
-        Image.fromarray(encode(batch.bev)).save(scene_dir / bev_path)
-        result['bev'] = bev_path
+        # camera_cluster_ids 필드가 없거나 비어 있으면 매핑해서 추가
+        try:
+            camera_cluster_ids = data.camera_cluster_ids
+        except KeyError:
+            camera_cluster_ids = None
 
-        if batch.get('aux') is not None:
-            aux_path = f'aux_{batch.token}.npz'
-            np.savez_compressed(scene_dir / aux_path, aux=batch.aux)
-            result['aux'] = aux_path
+        if not camera_cluster_ids:
+            cluster_ids = []
+            if 'cam_channels' in data:
+                for cam_token in data.cam_channels:
+                    cluster_id = CLUSTER_ID_MAP.get(cam_token, -1)
+                    cluster_ids.append(cluster_id)
+            else:
+                # fallback: 이미지 수만큼 -1 채움
+                cluster_ids = [-1] * len(getattr(data, 'images', []))
 
-        if batch.get('visibility') is not None:
-            visibility_path = f'visibility_{batch.token}.png'
-            Image.fromarray(batch.visibility).save(scene_dir / visibility_path)
-            result['visibility'] = visibility_path
+            data.camera_cluster_ids = cluster_ids
 
-        return result
+        if self.transform is not None:
+            data = self.transform(data)
 
-    def __call__(self, batch):
-        result = {}
-        result.update(self.get_cameras(batch))
-        result.update(self.get_bev(batch))
-        result.update({k: v for k, v in batch.items() if k not in result})
-
-        return result
-
-
-class LoadDataTransform(torchvision.transforms.ToTensor):
-    def __init__(self, dataset_dir, labels_dir, image_config, num_classes, augment='none'):
-        super().__init__()
-
-        self.dataset_dir = pathlib.Path(dataset_dir)
-        self.labels_dir = pathlib.Path(labels_dir)
-        self.image_config = image_config
-        self.num_classes = num_classes
-
-        xform = {
-            'none': [],
-            'strong': [StrongAug()],
-            'geometric': [StrongAug(), GeometricAug()],
-        }[augment] + [torchvision.transforms.ToTensor()]
-
-        self.img_transform = torchvision.transforms.Compose(xform)
-        self.to_tensor = super().__call__
-
-    def get_cameras(self, sample: Sample, h, w, top_crop):
-        images = list()
-        intrinsics = list()
-
-        for image_path, I_original in zip(sample.images, sample.intrinsics):
-            h_resize = h + top_crop
-            w_resize = w
-
-            image = Image.open(self.dataset_dir / image_path)
-            image_new = image.resize((w_resize, h_resize), resample=Image.BILINEAR)
-            image_new = image_new.crop((0, top_crop, image_new.width, image_new.height))
-
-            I = np.float32(I_original)
-            I[0, 0] *= w_resize / image.width
-            I[0, 2] *= w_resize / image.width
-            I[1, 1] *= h_resize / image.height
-            I[1, 2] *= h_resize / image.height
-            I[1, 2] -= top_crop
-
-            images.append(self.img_transform(image_new))
-            intrinsics.append(torch.tensor(I))
-
-        return {
-            'cam_idx': torch.LongTensor(sample.cam_ids),
-            'image': torch.stack(images, 0),
-            'intrinsics': torch.stack(intrinsics, 0),
-            'extrinsics': torch.tensor(np.float32(sample.extrinsics)),
-        }
-
-    def get_bev(self, sample: Sample):
-        scene_dir = self.labels_dir / sample.scene
-        bev = None
-
-        if sample.bev is not None:
-            bev = Image.open(scene_dir / sample.bev)
-            bev = decode(bev, self.num_classes)
-            bev = (255 * bev).astype(np.uint8)
-            bev = self.to_tensor(bev)
-
-        result = {
-            'bev': bev,
-            'view': torch.tensor(sample.view),
-        }
-
-        if 'visibility' in sample:
-            visibility = Image.open(scene_dir / sample.visibility)
-            result['visibility'] = np.array(visibility, dtype=np.uint8)
-
-        if 'aux' in sample:
-            aux = np.load(scene_dir / sample.aux)['aux']
-            result['center'] = self.to_tensor(aux[..., 1])
-
-        if 'pose' in sample:
-            result['pose'] = np.float32(sample['pose'])
-
-        return result
-
-    def __call__(self, batch):
-        if not isinstance(batch, Sample):
-            batch = Sample(**batch)
-
-        result = dict()
-        result.update(self.get_cameras(batch, **self.image_config))
-        result.update(self.get_bev(batch))
-
-        # ✅ Preserve any additional fields, like camera_cluster_ids
-        extra_keys = set(batch.keys()) - set(result.keys())
-        for k in extra_keys:
-            result[k] = batch[k]
-
-        return result
+        return data
