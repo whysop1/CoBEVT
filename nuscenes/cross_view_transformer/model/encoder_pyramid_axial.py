@@ -474,21 +474,46 @@ class CrossViewSwapAttention(nn.Module):
 
 class PyramidAxialEncoder(nn.Module):
     def __init__(
-            self,
-            backbone,
-            cross_view: dict,
-            cross_view_swap: dict,
-            bev_embedding: dict,
-            self_attn: dict,
-            dim: list,
-            middle: List[int] = [2, 2],
-            scale: float = 1.0,
+        self,
+        backbone,
+        cross_view: dict,
+        cross_view_swap: dict,
+        bev_embedding: dict,
+        self_attn: dict,
+        dim: list,
+        middle: List[int] = [2, 2],
+        scale: float = 1.0,
+        high_perf_backbone=None,
+        entropy_threshold: float = 7.93, # <<<<<<< 엔트로피 임계값 추가
+        object_count_threshold: int = 15,
+        object_distribution_var_threshold: int = 10,
+        scene_complexity_threshold: float = 2.90,
+
+        # 새 옵션들:
+        enable_color_correction: bool = True,               # 색보정 사용 여부 (엔트로피 계산에 적용)
+        use_corrected_for_backbone: bool = False,           # 백본 입력에도 보정이미지를 쓸지 여부
     ):
         super().__init__()
 
         self.norm = Normalize()
         self.backbone = backbone
+        self.high_perf_backbone = high_perf_backbone
+        self.entropy_threshold = entropy_threshold # <<<<<<< 임계값 저장
+        self.object_count_threshold = object_count_threshold
+        self.object_distribution_var_threshold = object_distribution_var_threshold
+        self.scene_complexity_threshold = scene_complexity_threshold
 
+        # 색보정 옵션 저장
+        self.enable_color_correction = enable_color_correction
+        self.use_corrected_for_backbone = use_corrected_for_backbone
+
+
+        # ✅ 누적 통계 리스트 추가
+        self.entropy_history = []
+        self.object_count_history = []
+        self.object_dist_var_history = []
+
+        
         if scale < 1.0:
             self.down = lambda x: F.interpolate(x, scale_factor=scale, recompute_scale_factor=False)
         else:
@@ -531,32 +556,259 @@ class PyramidAxialEncoder(nn.Module):
         self.downsample_layers = nn.ModuleList(downsample_layers)
         # self.self_attn = Attention(dim[-1], **self_attn)
 
+
+    def _color_correct_images(self, images: torch.Tensor) -> torch.Tensor:
+        """
+        간단한 저조도 보정:
+            1) 이미지 밝기(휘도) 기반 감마 보정 (저조도면 밝게)
+            2) 각 채널에 대해 히스토그램 평활화(정규화된 CDF 매핑) 적용
+    
+        images: (b, n, c, h, w), float in [0,1] 예상
+        returns: corrected images in same shape, float in [0,1]
+        """
+        device = images.device
+        imgs = images.clone()  # (b, n, c, h, w)
+    
+        b, n, c, h, w = imgs.shape
+        # 1) 휘도(평균 밝기) 계산 (각 카메라별, 샘플별)
+        lum = 0.2989 * imgs[:, :, 0] + 0.5870 * imgs[:, :, 1] + 0.1140 * imgs[:, :, 2]  # (b, n, h, w)
+        mean_lum_per_cam = lum.view(b, n, -1).mean(-1)  # (b, n)
+        # 카메라들 평균 -> 샘플당 평균휘도
+        mean_lum_per_sample = mean_lum_per_cam.mean(dim=1)  # (b,)
+    
+        # 감마 값 결정: 매우 어두우면 더 강하게 밝게 (감마 < 1 -> 밝아짐)
+        # 하이퍼파라미터: 조정 가능
+        gamma = torch.ones(b, device=device, dtype=imgs.dtype)
+
+        gamma = torch.where(mean_lum_per_sample < 0.15,
+                            0.6 * torch.ones_like(gamma),
+                            gamma)
+        
+        gamma = torch.where((mean_lum_per_sample >= 0.15) & (mean_lum_per_sample < 0.35),
+                            0.8 * torch.ones_like(gamma),
+                            gamma)
+        
+        gamma = gamma.view(b, 1, 1, 1, 1)
+
+    
+        # apply gamma per-sample to all cameras
+        imgs = imgs ** gamma  # 브로드캐스트: (b,n,c,h,w)
+    
+        # 2) 채널별 히스토그램 평활화 (작업: 각 (b,n,ch)별로 수행)
+        # 성능상 비용이 있으나 간단한 균등화는 시도해볼 만함.
+        imgs_255 = torch.clamp((imgs * 255.0).round().to(torch.int64), 0, 255)
+    
+        out = torch.empty_like(imgs, dtype=torch.float32, device=device)
+        for bi in range(b):
+            for ni in range(n):
+                for ch in range(3):
+                    vals = imgs_255[bi, ni, ch].flatten()               # (h*w,)
+                    hist = torch.bincount(vals, minlength=256).float()  # (256,)
+                    cdf = torch.cumsum(hist, dim=0)
+                    # 정규화된 CDF
+                    cdf_min = cdf[0]
+                    denom = (cdf[-1] - cdf_min).clamp(min=1.0)
+                    cdf_norm = (cdf - cdf_min) / denom                  # in [0,1]
+                    mapped = cdf_norm[vals].view(h, w)                 # 매핑된 값 (0..1)
+                    out[bi, ni, ch] = mapped
+    
+        # out already in [0,1], float32
+        return out
+    
+        # (원래 _calculate_attention_map_entropy는 남기되, forward에서 호출 시 보정된 이미지를 전달)
+
+    
+
+    def _calculate_attention_map_entropy(self, images: torch.Tensor) -> torch.Tensor:
+        """
+        이미지 배치의 평균 엔트로피를 계산합니다.
+        엔트로피는 이미지의 복잡도를 나타내는 척도로 사용됩니다.
+        
+        images: (b, n, c, h, w) 형태의 텐서
+        returns: 배치 전체의 평균 엔트로피 (스칼라 텐서)
+        """
+        b, n, c, h, w = images.shape
+        
+        # (b, n, c, h, w) -> (b*n, c, h, w)
+        images_reshaped = images.reshape(b * n, c, h, w)
+        
+        # 그레이스케일로 변환: (b*n, h, w)
+        # Y = 0.299R + 0.587G + 0.114B
+        grayscale_images = 0.2989 * images_reshaped[:, 0, :, :] + \
+                           0.5870 * images_reshaped[:, 1, :, :] + \
+                           0.1140 * images_reshaped[:, 2, :, :]
+        
+        # 0-255 범위의 정수 값으로 변환
+        grayscale_images = (grayscale_images * 255).long()
+
+        entropies = []
+        # 각 이미지에 대해 엔트로피 계산
+        for i in range(b * n):
+            # 픽셀 값의 히스토그램 계산
+            hist = torch.bincount(grayscale_images[i].flatten(), minlength=256).float()
+            
+            # 확률 분포 계산
+            prob = hist / (h * w)
+            
+            # log(0)을 피하기 위해 작은 값(epsilon) 추가
+            # 엔트로피 계산: H = -sum(p * log2(p))
+            entropy = -torch.sum(prob * torch.log2(prob + 1e-9))
+            entropies.append(entropy)
+            
+        # 텐서로 변환 후 전체 배치의 평균 엔트로피 계산
+        return torch.stack(entropies).mean()
+
     def forward(self, batch):
         b, n, _, _, _ = batch['image'].shape
 
-        image = batch['image'].flatten(0, 1)            # b n c h w
-        I_inv = batch['intrinsics'].inverse()           # b n 3 3
-        E_inv = batch['extrinsics'].inverse()           # b n 4 4
+        I_inv = batch['intrinsics'].inverse()      # b n 3 3
+        E_inv = batch['extrinsics'].inverse()      # b n 4 4
+        
+        object_count = batch.get('object_count', None)
+        object_distribution_var = batch.get('object_distribution_var', None)
+        
 
-        features = [self.down(y) for y in self.backbone(self.norm(image))]
+        # --- 색보정 적용(옵션) ---
+        if self.enable_color_correction:
+            # corrected_for_entropy: 엔트로피 계산용(항상 사용)
+            corrected_for_entropy = self._color_correct_images(batch['image'])
+        else:
+            corrected_for_entropy = batch['image']
 
-        x = self.bev_embedding.get_prior()              # d H W
-        x = repeat(x, '... -> b ...', b=b)              # b d H W
+        # 1) 배치 전체의 평균 엔트로피 계산 (보정된 영상 사용)
+        avg_entropy = self._calculate_attention_map_entropy(corrected_for_entropy)
+
+        # <<<< 1. 평균 객체 수 계산 로직 추가 >>>>
+        # object_count가 제공되었는지 확인
+        object_count_available = object_count is not None
+        avg_object_count = 0.0 # 기본값 초기화
+        
+        if object_count_available:
+            # 텐서의 평균을 계산 (.float()으로 타입 변환 후 .mean())
+            avg_object_count = object_count.float().mean()
+
+        # <<<< 1-1. 평균 객체 분포 분산 계산 로직 추가 >>>>
+        object_dist_var_available = object_distribution_var is not None
+        avg_object_distribution_var = 0.0
+        if object_dist_var_available:
+            avg_object_distribution_var = object_distribution_var.float().mean()
+
+        # --- 정규화 적용 ---
+        normalized_entropy = avg_entropy / 7.93
+        normalized_object_count = avg_object_count / 22.13
+        normalized_object_distribution = avg_object_distribution_var / 1559.84
+        
+        # --- Scene Complexity 계산 (정규화 값 사용) ---
+        scene_complexity = normalized_entropy + normalized_object_count + normalized_object_distribution
+
+
+        
+        # ✅ 누적 리스트에 저장
+        self.entropy_history.append(avg_entropy.item())
+        self.object_count_history.append(avg_object_count.item())
+        self.object_dist_var_history.append(avg_object_distribution_var.item())
+
+        # ✅ 지금까지의 평균 계산
+        avg_entropy_over_time = sum(self.entropy_history) / len(self.entropy_history)
+        avg_obj_count_over_time = sum(self.object_count_history) / len(self.object_count_history)
+        avg_obj_var_over_time = sum(self.object_dist_var_history) / len(self.object_dist_var_history)
+        avg_scene_complexity_over_time = (
+            avg_entropy_over_time / 7.93 + avg_obj_count_over_time / 22.13 + avg_obj_var_over_time / 1559.84
+        )
+
+        
+
+        # ✅ 디버깅 출력 확장
+        print(
+            f"[현재 배치] "
+            f"Entropy: {avg_entropy:.2f}, ObjectCount: {avg_object_count:.2f}, "
+            f"ObjDistVar: {avg_object_distribution_var:.2f}, SceneComplexity: {scene_complexity:.2f}\n"
+            f"[누적 평균] "
+            f"Entropy: {avg_entropy_over_time:.2f}, ObjectCount: {avg_obj_count_over_time:.2f}, "
+            f"ObjDistVar: {avg_obj_var_over_time:.2f}, SceneComplexity: {avg_scene_complexity_over_time:.2f}"
+        )
+
+
+
+        # 백본 선택 코드 -> 테스트용 기능, 실제 작동 X
+        if self.use_corrected_for_backbone and self.enable_color_correction:
+            images_for_backbone = rearrange(corrected_for_entropy, 'b n c h w -> (b n) c h w')
+        else:
+            images_for_backbone = rearrange(batch['image'], 'b n c h w -> (b n) c h w')
+        
+        
+        # 2. Scene Complexity에 따라 모델 구조 변형
+        if (scene_complexity >= self.scene_complexity_threshold):
+            # [CASE 1] 엔트로피가 높을 때: 개별적으로 백본 처리 (기존 방식)
+            # print(f"High entropy ({avg_entropy:.2f}), processing batch items individually.")
+            num_feature_levels = len(self.backbone.output_shapes)
+            features_per_level = [[] for _ in range(num_feature_levels)]
+
+            for i in range(b):
+                sample_images = batch['image'][i] # (n, c, h, w)
+
+                # object_count에 따라 사용할 백본 선택
+                if self.high_perf_backbone is not None and object_count is not None and object_count[i] >= 30:
+                    backbone_to_use = self.high_perf_backbone
+                else:
+                    backbone_to_use = self.backbone
+
+                sample_features = backbone_to_use(self.norm(sample_images))
+                
+                for level_idx, feat in enumerate(sample_features):
+                    features_per_level[level_idx].append(self.down(feat))
+
+            # 각 레벨의 피처들을 하나로 합침
+            features = [torch.cat(feats, dim=0) for feats in features_per_level]
+
+        else:
+            # [CASE 2] 엔트로피가 낮을 때: 배치 전체를 한번에 백본 처리
+            # print(f"Low entropy ({avg_entropy:.2f}), processing batch as a whole.")
+            
+            # (b, n, c, h, w) -> (b * n, c, h, w)
+            images_flat = rearrange(batch['image'], 'b n c h w -> (b n) c h w')
+            
+            # 배치 전체 처리 시에는 기본 백본을 사용
+            backbone_to_use = self.backbone
+            
+            # 정규화 및 백본 통과
+            features_list = backbone_to_use(self.norm(images_flat))
+            
+            # 각 피처 레벨에 다운샘플링 적용
+            features = [self.down(feat) for feat in features_list]
+        
+
+        
+        
+        
+        
+
+
+
+
+
+
+        # <<<<<<<<<<<<<<<< END: 신규 로직 추가 >>>>>>>>>>>>>>>>
+
+
+        # 이후 로직은 두 경우 모두 동일하게 적용됨
+        x = self.bev_embedding.get_prior()        # d H W
+        x = repeat(x, '... -> b ...', b=b)        # b d H W
 
         for i, (cross_view, feature, layer) in \
                 enumerate(zip(self.cross_views, features, self.layers)):
+            
+            # (b*n, c, h, w) -> (b, n, c, h, w)
             feature = rearrange(feature, '(b n) ... -> b n ...', b=b, n=n)
 
-            x = cross_view(i, x, self.bev_embedding, feature, I_inv, E_inv)
+            x = cross_view(i, x, self.bev_embedding, feature, I_inv, E_inv, object_count)
             x = layer(x)
             if i < len(features)-1:
                 down_sample_block = self.downsample_layers[i]
                 x = down_sample_block(x)
 
         # x = self.self_attn(x)
-
         return x
-
 
 if __name__ == "__main__":
     import os
